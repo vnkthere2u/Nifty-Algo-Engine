@@ -7,13 +7,17 @@ import requests
 from tvDatafeed import TvDatafeed, Interval
 
 # ==========================================
-# 0. TELEGRAM ALERT SETUP
+# 0. TELEGRAM ALERT SETUP (SECURE VAULT)
 # ==========================================
-TELEGRAM_TOKEN = '8780154532:AAHdV__Un1JGVDuJE3bm_W0JhVaQv2xUvUU'
-TELEGRAM_CHAT_ID = '5293682152'
+try:
+    TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
+    TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
+except:
+    TELEGRAM_TOKEN = ""
+    TELEGRAM_CHAT_ID = ""
 
 def send_telegram_alert(message):
-    if TELEGRAM_TOKEN == 'PASTE_YOUR_BOT_TOKEN_HERE':
+    if not TELEGRAM_TOKEN:
         return 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
