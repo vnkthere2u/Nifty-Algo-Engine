@@ -6,8 +6,8 @@ import time
 import requests
 import threading
 import traceback
+import yfinance as yf
 from datetime import datetime, timedelta
-from tvDatafeed import TvDatafeed, Interval
 
 # ==========================================
 # 0. TELEGRAM ALERT SETUP
@@ -57,58 +57,49 @@ def log_error(message):
     except:
         pass 
 
-NIFTY_100 = [
-    'NIFTY', 'BANKNIFTY', 'ABB', 'ADANIENT', 'ADANIGREEN', 'ADANIPORTS', 'ADANIENSOL', 
-    'AMBUJACEM', 'APOLLOHOSP', 'ASIANPAINT', 'ATGL', 'AXISBANK', 'BAJAJ_AUTO', 'BAJFINANCE', 
-    'BAJAJFINSV', 'BAJAJHLDNG', 'BANKBARODA', 'BEL', 'BHARATFORG', 'BHARTIARTL', 'BOSCHLTD', 
-    'BPCL', 'BRITANNIA', 'CANBK', 'CHOLAFIN', 'CIPLA', 'COALINDIA', 'COFORGE', 'COLPAL', 
-    'DIVISLAB', 'DLF', 'DMART', 'DRREDDY', 'EICHERMOT', 'GAIL', 'GODREJCP', 'GRASIM', 
-    'HAL', 'HAVELLS', 'HCLTECH', 'HDFCAMC', 'HDFCBANK', 'HDFCLIFE', 'HEROMOTOCO', 'HINDALCO', 
-    'HINDUNILVR', 'ICICIBANK', 'ICICIGI', 'ICICIPRULI', 'IDFCFIRSTB', 'INDIGO', 'INDUSINDBK', 
-    'INFY', 'IOC', 'IRCTC', 'IRFC', 'ITC', 'JINDALSTEL', 'JIOFIN', 'JSWSTEEL', 'KOTAKBANK', 
-    'LICI', 'LODHA', 'LT', 'LTIM', 'LUPIN', 'M_M', 'MARICO', 'MARUTI', 'MUTHOOTFIN', 'NAUKRI', 
-    'NESTLEIND', 'NTPC', 'ONGC', 'PIDILITIND', 'PNB', 'POLYCAB', 'POWERGRID', 'RECLTD', 
-    'RELIANCE', 'SBILIFE', 'SBIN', 'SCHAEFFLER', 'SHREECEM', 'SIEMENS', 'SRF', 'SUNPHARMA', 
-    'TATACONSUM', 'TATAMOTORS', 'TATASTEEL', 'TCS', 'TECHM', 'TITAN', 'TRENT', 'TVSMOTOR', 
-    'UBL', 'ULTRACEMCO', 'VEDL', 'WIPRO', 'ZOMATO'
-]
+# ULTRA-FOCUSED WATCHLIST + 24/7 BITCOIN
+WATCHLIST = {
+    'NIFTY 50': '^NSEI',
+    'BANK NIFTY': '^NSEBANK',
+    'RELIANCE': 'RELIANCE.NS',
+    'HDFC BANK': 'HDFCBANK.NS',
+    'BITCOIN (24/7)': 'BTC-USD'
+}
 
 # ==========================================
-# 2. AUTO-HEALING DATAFEED LOGIC
+# 2. CORE STRATEGY LOGIC (YAHOO FINANCE)
 # ==========================================
-tv = TvDatafeed()
-
-def fetch_and_analyze(ticker, retries=3):
-    global tv
-    for attempt in range(retries):
-        try:
-            df = tv.get_hist(symbol=ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=200)
-            if df is not None and not df.empty:
-                df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
-                df['EMA5'] = ta.ema(df['Close'], length=5)
-                df['EMA39'] = ta.ema(df['Close'], length=39)
-                df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-                df.dropna(inplace=True)
-                return df
-        except Exception as e:
-            time.sleep(1) 
-            try:
-                tv = TvDatafeed() 
-            except:
-                pass
-    return None
+def fetch_and_analyze(name, yf_ticker):
+    try:
+        # Fetch 5 days of 15m data (Plenty for a 39 EMA to warm up)
+        df = yf.Ticker(yf_ticker).history(interval="15m", period="5d")
+        
+        if df is None or df.empty: return None
+        
+        # Remove timezone info to make timestamps clean
+        df.index = df.index.tz_localize(None)
+        
+        df['EMA5'] = ta.ema(df['Close'], length=5)
+        df['EMA39'] = ta.ema(df['Close'], length=39)
+        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        
+        df.dropna(inplace=True)
+        return df
+    except Exception as e:
+        log_error(f"Data fetch failed for {name}: {e}")
+        return None
 
 def process_market_data():
     conn = get_db_connection()
     c = conn.cursor()
     alerts = []
     
-    for ticker in NIFTY_100:
-        df = fetch_and_analyze(ticker)
+    for name, ticker in WATCHLIST.items():
+        df = fetch_and_analyze(name, ticker)
         if df is None or len(df) < 5: 
             continue
             
-        c.execute("SELECT id, signal_type, sl, tp FROM trades WHERE ticker=? AND status='OPEN'", (ticker,))
+        c.execute("SELECT id, signal_type, sl, tp FROM trades WHERE ticker=? AND status='OPEN'", (name,))
         open_trades = c.fetchall()
         
         current_candle = df.iloc[-1]
@@ -124,17 +115,17 @@ def process_market_data():
             if sig_type == 'long':
                 if high_price >= tp:
                     c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (candle_time, tp, trade_id))
-                    send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{ticker} LONG closed at {round(tp, 2)}")
+                    send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} LONG closed at {round(tp, 2)}")
                 elif low_price <= sl:
                     c.execute("UPDATE trades SET status='SL HIT (LOSS)', exit_time=?, exit_price=? WHERE id=?", (candle_time, sl, trade_id))
-                    send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{ticker} LONG closed at {round(sl, 2)}")
+                    send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{name} LONG closed at {round(sl, 2)}")
             elif sig_type == 'short':
                 if low_price <= tp:
                     c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (candle_time, tp, trade_id))
-                    send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{ticker} SHORT closed at {round(tp, 2)}")
+                    send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} SHORT closed at {round(tp, 2)}")
                 elif high_price >= sl:
                     c.execute("UPDATE trades SET status='SL HIT (LOSS)', exit_time=?, exit_price=? WHERE id=?", (candle_time, sl, trade_id))
-                    send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{ticker} SHORT closed at {round(sl, 2)}")
+                    send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{name} SHORT closed at {round(sl, 2)}")
         conn.commit()
 
         ema5, ema39, atr_val = last_closed['EMA5'], last_closed['EMA39'], last_closed['ATR']
@@ -144,7 +135,7 @@ def process_market_data():
         trend = "🟢 Bullish" if ema5 > ema39 else "🔴 Bearish"
         
         c.execute("INSERT OR REPLACE INTO live_market_data (ticker, last_update, close_price, ema5, ema39, trend, distance_pct) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                  (ticker, candle_time, round(close_p, 2), round(ema5, 2), round(ema39, 2), trend, round(dist_pct, 4)))
+                  (name, candle_time, round(close_p, 2), round(ema5, 2), round(ema39, 2), trend, round(dist_pct, 4)))
         conn.commit()
 
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
@@ -155,8 +146,8 @@ def process_market_data():
                 entry = (high + low) / 2
                 sl, tp = entry - atr_val, entry + (3.0 * atr_val)
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (ticker, 'long', candle_time, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
-                msg = f"🟢 <b>LONG SIGNAL: {ticker}</b>\nTime: {candle_time}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
+                          (name, 'long', candle_time, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
+                msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {candle_time}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
                 alerts.append(msg)
                 send_telegram_alert(msg)
                 
@@ -164,13 +155,13 @@ def process_market_data():
                 entry = (high + low) / 2
                 sl, tp = entry + atr_val, entry - (3.0 * atr_val)
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (ticker, 'short', candle_time, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
-                msg = f"🔴 <b>SHORT SIGNAL: {ticker}</b>\nTime: {candle_time}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
+                          (name, 'short', candle_time, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
+                msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {candle_time}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
                 alerts.append(msg)
                 send_telegram_alert(msg)
                 
         conn.commit()
-        time.sleep(1) 
+        time.sleep(1.0) # Light sleep between fetches to respect API
         
     ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (ist_now.strftime("%I:%M:%S %p (IST)"),))
@@ -181,8 +172,8 @@ def process_market_data():
 # ==========================================
 # 3. STREAMLIT DASHBOARD UI
 # ==========================================
-st.set_page_config(page_title="Live Nifty 100 Engine", layout="wide")
-st.title("⚡ Live Nifty 100 Algo Engine")
+st.set_page_config(page_title="Live Algo Engine", layout="wide")
+st.title("⚡ Live Premium Algo Engine")
 
 ui_conn = get_db_connection()
 ui_c = ui_conn.cursor()
@@ -197,7 +188,6 @@ def start_background_scanner():
             except Exception as e:
                 log_error(f"Loop Crash: {traceback.format_exc()}")
             time.sleep(300)
-            
     thread = threading.Thread(target=background_loop, daemon=True)
     thread.start()
     return True
@@ -223,33 +213,32 @@ if st.sidebar.button("⚠️ Reset/Clear Database"):
     st.rerun()
 
 if st.sidebar.button("Force Manual Scan Now"):
-    with st.spinner("Executing Auto-Healing Scan... (Please wait up to 3 mins)"):
+    with st.spinner("Fetching live data..."):
         process_market_data()
         st.rerun()
 
 # Fetch live data
 live_df = pd.read_sql_query("SELECT ticker as Ticker, close_price as 'Last Price', distance_pct as '% Gap', ema5 as 'EMA 5', ema39 as 'EMA 39', trend as Trend, last_update as 'Time Stamp' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
 
-# --- 1. TOP 10 CLOSEST STOCKS TABLE ---
+# --- 1. CLOSEST STOCKS TABLE ---
 st.markdown("---")
-st.subheader("🔥 Top 10 Stocks Nearing Crossover")
+st.subheader("🔥 Assets Nearing Crossover")
 if not live_df.empty:
-    # Display only top 10 rows to reduce UI load
-    st.dataframe(live_df.head(10), use_container_width=True, hide_index=True)
+    st.dataframe(live_df, use_container_width=True, hide_index=True)
 else:
     st.write("Waiting for the first full scan to complete...")
 
 # --- 2. SPECIFIC STOCK DROPDOWN LOOKUP ---
 st.markdown("---")
-st.subheader("🔍 Specific Stock Lookup")
+st.subheader("🔍 Specific Asset Lookup")
 if not live_df.empty:
-    selected_stock = st.selectbox("Select a stock to view its live details:", ["-- Select a Stock --"] + sorted(live_df['Ticker'].tolist()))
+    selected_stock = st.selectbox("Select an asset to view its live details:", ["-- Select an Asset --"] + sorted(live_df['Ticker'].tolist()))
     
-    if selected_stock != "-- Select a Stock --":
+    if selected_stock != "-- Select an Asset --":
         stock_data = live_df[live_df['Ticker'] == selected_stock].iloc[0]
         
         col1, col2, col3 = st.columns(3)
-        col1.metric("Last Price", f"₹{stock_data['Last Price']}")
+        col1.metric("Last Price", f"{stock_data['Last Price']}")
         col2.metric("% Gap to Cross", f"{stock_data['% Gap']}%")
         col3.metric("Trend", stock_data['Trend'])
         
