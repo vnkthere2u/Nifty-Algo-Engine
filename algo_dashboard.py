@@ -5,6 +5,7 @@ import sqlite3
 import time
 import requests
 import threading
+from datetime import datetime, timedelta
 from tvDatafeed import TvDatafeed, Interval
 
 # ==========================================
@@ -32,7 +33,6 @@ def send_telegram_alert(message):
 # ==========================================
 tv = TvDatafeed()
 
-# check_same_thread=False is critical here so our background thread can use the database
 conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS trades 
@@ -41,6 +41,8 @@ c.execute('''CREATE TABLE IF NOT EXISTS trades
              exit_time TEXT, exit_price REAL)''')
 c.execute('''CREATE TABLE IF NOT EXISTS gating_state 
              (ticker TEXT PRIMARY KEY, last_sig TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS system_status 
+             (key TEXT PRIMARY KEY, value TEXT)''')
 conn.commit()
 
 # Nifty 100 + Major Indices
@@ -75,6 +77,9 @@ def fetch_and_analyze(ticker):
         adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
         df['ADX'] = adx_df['ADX_14'] if adx_df is not None else 0
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+        
+        # Calculate Cumulative Volume for the current trading day
+        df['Cum_Volume'] = df.groupby(df.index.date)['Volume'].cumsum()
         
         df.dropna(inplace=True)
         return df
@@ -122,13 +127,15 @@ def process_market_data():
         adx_val, rsi_val = last_closed['ADX'], last_closed['RSI']
         ema5, ema39, atr_val = last_closed['EMA5'], last_closed['EMA39'], last_closed['ATR']
         high, low = last_closed['High'], last_closed['Low']
-        close_price, volume_val = last_closed['Close'], last_closed['Volume']
+        
+        # Pulling the cumulative volume, not the single candle volume
+        close_price, cum_volume_val = last_closed['Close'], last_closed['Cum_Volume']
         
         if last_sig == "long" and ema5 < ema39: last_sig = "none"
         if last_sig == "short" and ema5 > ema39: last_sig = "none"
             
-        # NEW BASE CONDITIONS: Liquidity + Momentum
-        liquidity_filter = (close_price > 100) and (volume_val > 350000 or ticker in ['NIFTY', 'BANKNIFTY'])
+        # NEW BASE CONDITIONS: Liquidity (Cumulative) + Momentum
+        liquidity_filter = (close_price > 100) and (cum_volume_val > 350000 or ticker in ['NIFTY', 'BANKNIFTY'])
         
         can_long = liquidity_filter and (adx_val >= 20) and (rsi_val >= 60) and (ema5 > ema39)
         can_short = liquidity_filter and (adx_val >= 20) and (rsi_val <= 40) and (ema39 > ema5)
@@ -160,6 +167,12 @@ def process_market_data():
         conn.commit()
         time.sleep(0.5) 
         
+    # Update the heart-beat timestamp when the scan completes
+    ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    scan_time_str = ist_now.strftime("%I:%M:%S %p (IST)")
+    c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (scan_time_str,))
+    conn.commit()
+        
     return alerts
 
 # ==========================================
@@ -173,31 +186,32 @@ signal_placeholder = st.empty()
 
 st.sidebar.header("Control Panel")
 
+# --- UI TIMESTAMPS ---
+c.execute("SELECT value FROM system_status WHERE key='last_scan'")
+last_scan_row = c.fetchone()
+last_scan_time = last_scan_row[0] if last_scan_row else "Initializing..."
+
+st.sidebar.info(f"⏱️ **Last Background Scan:**\n{last_scan_time}")
+
 # --- THE BACKGROUND DAEMON ENGINE ---
 @st.cache_resource
 def start_background_scanner():
     def background_loop():
         while True:
             try:
-                # Run the scanner
                 process_market_data()
             except Exception as e:
                 print(f"Background scan error: {e}")
-            
-            # Sleep for 5 minutes (300 seconds) exactly, independent of the UI
             time.sleep(300)
 
-    # Create a detached thread that runs on the server
     thread = threading.Thread(target=background_loop, daemon=True)
     thread.start()
     return True
 
-# Initialize the background engine the first time the app is opened
 engine_running = start_background_scanner()
 
 if engine_running:
     st.sidebar.success("✅ Background Engine is LIVE.")
-    st.sidebar.info("You can now safely close this browser tab. The server will continue scanning Nifty 100 every 5 minutes and send Telegram alerts.")
 
 if st.sidebar.button("Force Manual Scan Now"):
     with st.spinner("Fetching live data for Nifty 100..."):
@@ -207,6 +221,7 @@ if st.sidebar.button("Force Manual Scan Now"):
                 signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
         else:
             signal_placeholder.info("Manual scan complete. No new signals right now.")
+            st.rerun() # Forces the UI to update the timestamp immediately
 
 st.markdown("---")
 st.subheader("🟢 Live Open Positions")
