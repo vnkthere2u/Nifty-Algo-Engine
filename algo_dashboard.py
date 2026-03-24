@@ -4,6 +4,7 @@ import pandas_ta as ta
 import sqlite3
 import time
 import requests
+import threading
 from tvDatafeed import TvDatafeed, Interval
 
 # ==========================================
@@ -31,6 +32,7 @@ def send_telegram_alert(message):
 # ==========================================
 tv = TvDatafeed()
 
+# check_same_thread=False is critical here so our background thread can use the database
 conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS trades 
@@ -126,7 +128,6 @@ def process_market_data():
         if last_sig == "short" and ema5 > ema39: last_sig = "none"
             
         # NEW BASE CONDITIONS: Liquidity + Momentum
-        # Note: Indices like NIFTY don't have volume data in the same way, so we bypass the volume check for them
         liquidity_filter = (close_price > 100) and (volume_val > 350000 or ticker in ['NIFTY', 'BANKNIFTY'])
         
         can_long = liquidity_filter and (adx_val >= 20) and (rsi_val >= 60) and (ema5 > ema39)
@@ -171,24 +172,41 @@ st.subheader("🔔 Recent Signals (Current Scan)")
 signal_placeholder = st.empty()
 
 st.sidebar.header("Control Panel")
-if st.sidebar.button("Run Live Scanner Now"):
+
+# --- THE BACKGROUND DAEMON ENGINE ---
+@st.cache_resource
+def start_background_scanner():
+    def background_loop():
+        while True:
+            try:
+                # Run the scanner
+                process_market_data()
+            except Exception as e:
+                print(f"Background scan error: {e}")
+            
+            # Sleep for 5 minutes (300 seconds) exactly, independent of the UI
+            time.sleep(300)
+
+    # Create a detached thread that runs on the server
+    thread = threading.Thread(target=background_loop, daemon=True)
+    thread.start()
+    return True
+
+# Initialize the background engine the first time the app is opened
+engine_running = start_background_scanner()
+
+if engine_running:
+    st.sidebar.success("✅ Background Engine is LIVE.")
+    st.sidebar.info("You can now safely close this browser tab. The server will continue scanning Nifty 100 every 5 minutes and send Telegram alerts.")
+
+if st.sidebar.button("Force Manual Scan Now"):
     with st.spinner("Fetching live data for Nifty 100..."):
         new_alerts = process_market_data()
         if new_alerts:
             for alert in new_alerts:
                 signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
         else:
-            signal_placeholder.info("Scan complete. No new signals right now.")
-
-run_live = st.sidebar.checkbox("Start Automated Scanner Loop (5 min)")
-if run_live:
-    st.sidebar.warning("Live loop active. Scanning every 5 minutes...")
-    new_alerts = process_market_data()
-    if new_alerts:
-        for alert in new_alerts:
-            signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
-    time.sleep(300) 
-    st.rerun()
+            signal_placeholder.info("Manual scan complete. No new signals right now.")
 
 st.markdown("---")
 st.subheader("🟢 Live Open Positions")
