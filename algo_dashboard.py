@@ -6,8 +6,8 @@ import time
 import requests
 import threading
 import traceback
-import yfinance as yf
 from datetime import datetime, timedelta
+from tvDatafeed import TvDatafeed, Interval
 
 # ==========================================
 # 0. TELEGRAM ALERT SETUP
@@ -27,23 +27,15 @@ def send_telegram_alert(message):
     except: pass
 
 # ==========================================
-# 1. DATABASE & STEALTH SESSION SETUP
+# 1. DATABASE SETUP
 # ==========================================
-# This disguises the bot as a normal Google Chrome web browser
-yf_session = requests.Session()
-yf_session.headers.update({
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-})
-
 def get_db_connection():
-    conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False, timeout=20.0)
+    conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False, timeout=30.0)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
                  entry_time TEXT, entry_price REAL, sl REAL, tp REAL, status TEXT, 
                  exit_time TEXT, exit_price REAL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS gating_state 
-                 (ticker TEXT PRIMARY KEY, last_sig TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS system_status 
                  (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS system_logs 
@@ -82,32 +74,29 @@ NIFTY_100 = [
 ]
 
 # ==========================================
-# 2. CORE STRATEGY LOGIC
+# 2. AUTO-HEALING DATAFEED LOGIC
 # ==========================================
-def get_yf_ticker(sym):
-    if sym == 'NIFTY': return '^NSEI'
-    if sym == 'BANKNIFTY': return '^NSEBANK'
-    if sym == 'M_M': return 'M&M.NS'
-    if sym == 'BAJAJ_AUTO': return 'BAJAJ-AUTO.NS'
-    return f"{sym}.NS"
+tv = TvDatafeed()
 
-def fetch_and_analyze(ticker):
-    try:
-        yf_ticker = get_yf_ticker(ticker)
-        # Using the stealth session to bypass blocks
-        df = yf.Ticker(yf_ticker, session=yf_session).history(interval="15m", period="1mo")
-        
-        if df is None or df.empty: return None
-        
-        df['EMA5'] = ta.ema(df['Close'], length=5)
-        df['EMA39'] = ta.ema(df['Close'], length=39)
-        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-        
-        df.dropna(inplace=True)
-        return df
-    except Exception as e:
-        log_error(f"YFinance fetch failed for {ticker}: {e}")
-        return None
+def fetch_and_analyze(ticker, retries=3):
+    global tv
+    for attempt in range(retries):
+        try:
+            df = tv.get_hist(symbol=ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=200)
+            if df is not None and not df.empty:
+                df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+                df['EMA5'] = ta.ema(df['Close'], length=5)
+                df['EMA39'] = ta.ema(df['Close'], length=39)
+                df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+                df.dropna(inplace=True)
+                return df
+        except Exception as e:
+            time.sleep(1) 
+            try:
+                tv = TvDatafeed() 
+            except:
+                pass
+    return None
 
 def process_market_data():
     conn = get_db_connection()
@@ -116,7 +105,8 @@ def process_market_data():
     
     for ticker in NIFTY_100:
         df = fetch_and_analyze(ticker)
-        if df is None or len(df) < 5: continue
+        if df is None or len(df) < 5: 
+            continue
             
         c.execute("SELECT id, signal_type, sl, tp FROM trades WHERE ticker=? AND status='OPEN'", (ticker,))
         open_trades = c.fetchall()
@@ -125,7 +115,7 @@ def process_market_data():
         last_closed = df.iloc[-2]
         prev_closed = df.iloc[-3]
         
-        candle_time = str(last_closed.name).split('+')[0]
+        candle_time = str(last_closed.name)
         
         for trade in open_trades:
             trade_id, sig_type, sl, tp = trade
@@ -180,8 +170,7 @@ def process_market_data():
                 send_telegram_alert(msg)
                 
         conn.commit()
-        # Increased speed limit to avoid Yahoo DDoS blocks
-        time.sleep(1.5) 
+        time.sleep(1) 
         
     ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (ist_now.strftime("%I:%M:%S %p (IST)"),))
@@ -195,27 +184,8 @@ def process_market_data():
 st.set_page_config(page_title="Live Nifty 100 Engine", layout="wide")
 st.title("⚡ Live Nifty 100 Algo Engine")
 
-st.subheader("🔔 Recent Signals (Current Scan)")
-signal_placeholder = st.empty()
-
-st.sidebar.header("Control Panel")
-
 ui_conn = get_db_connection()
 ui_c = ui_conn.cursor()
-ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
-last_scan_row = ui_c.fetchone()
-st.sidebar.info(f"⏱️ **Last Background Scan:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
-
-if st.sidebar.button("⚠️ Reset/Clear Database"):
-    ui_c.execute("DROP TABLE IF EXISTS trades")
-    ui_c.execute("DROP TABLE IF EXISTS live_market_data")
-    ui_c.execute("DROP TABLE IF EXISTS system_status")
-    ui_c.execute("DROP TABLE IF EXISTS system_logs")
-    ui_c.execute("DROP TABLE IF EXISTS gating_state")
-    ui_conn.commit()
-    st.sidebar.success("Database fully dropped and rebuilt! Rebooting...")
-    time.sleep(1)
-    st.rerun()
 
 # --- THE BACKGROUND DAEMON ENGINE ---
 @st.cache_resource
@@ -234,49 +204,76 @@ def start_background_scanner():
 
 engine_running = start_background_scanner()
 
+st.sidebar.header("Control Panel")
 if engine_running:
     st.sidebar.success("✅ Background Engine is LIVE.")
 
+ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
+last_scan_row = ui_c.fetchone()
+st.sidebar.info(f"⏱️ **Last Full Scan Completed:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
+
+if st.sidebar.button("⚠️ Reset/Clear Database"):
+    ui_c.execute("DROP TABLE IF EXISTS trades")
+    ui_c.execute("DROP TABLE IF EXISTS live_market_data")
+    ui_c.execute("DROP TABLE IF EXISTS system_status")
+    ui_c.execute("DROP TABLE IF EXISTS system_logs")
+    ui_conn.commit()
+    st.sidebar.success("Database fully dropped and rebuilt! Rebooting...")
+    time.sleep(1)
+    st.rerun()
+
 if st.sidebar.button("Force Manual Scan Now"):
-    with st.spinner("Scanning Nifty 100 stealthily... (This will take ~2.5 minutes)"):
-        new_alerts = process_market_data()
-        if new_alerts:
-            for alert in new_alerts: signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
-        else:
-            signal_placeholder.info("Manual scan complete. No new crossovers found right now.")
+    with st.spinner("Executing Auto-Healing Scan... (Please wait up to 3 mins)"):
+        process_market_data()
         st.rerun()
 
-# --- NEW GLASS-BOX MARKET TRACKER ---
+# Fetch live data
+live_df = pd.read_sql_query("SELECT ticker as Ticker, close_price as 'Last Price', distance_pct as '% Gap', ema5 as 'EMA 5', ema39 as 'EMA 39', trend as Trend, last_update as 'Time Stamp' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
+
+# --- 1. TOP 10 CLOSEST STOCKS TABLE ---
 st.markdown("---")
-st.subheader("📊 Live Market State (Sorted by Distance to Crossover)")
-st.info("Stocks at the top have EMAs that are almost touching. High probability for the next candle.")
-
-live_df = pd.read_sql_query("SELECT ticker as Ticker, trend as Trend, distance_pct as 'Distance (%)', close_price as 'Close Price', ema5 as 'EMA 5', ema39 as 'EMA 39', last_update as 'Candle Time' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
-
+st.subheader("🔥 Top 10 Stocks Nearing Crossover")
 if not live_df.empty:
-    st.dataframe(live_df, use_container_width=True, hide_index=True)
+    # Display only top 10 rows to reduce UI load
+    st.dataframe(live_df.head(10), use_container_width=True, hide_index=True)
 else:
     st.write("Waiting for the first full scan to complete...")
 
+# --- 2. SPECIFIC STOCK DROPDOWN LOOKUP ---
+st.markdown("---")
+st.subheader("🔍 Specific Stock Lookup")
+if not live_df.empty:
+    selected_stock = st.selectbox("Select a stock to view its live details:", ["-- Select a Stock --"] + sorted(live_df['Ticker'].tolist()))
+    
+    if selected_stock != "-- Select a Stock --":
+        stock_data = live_df[live_df['Ticker'] == selected_stock].iloc[0]
+        
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Last Price", f"₹{stock_data['Last Price']}")
+        col2.metric("% Gap to Cross", f"{stock_data['% Gap']}%")
+        col3.metric("Trend", stock_data['Trend'])
+        
+        st.info(f"**EMA 5:** `{stock_data['EMA 5']}` &nbsp;|&nbsp; **EMA 39:** `{stock_data['EMA 39']}` &nbsp;|&nbsp; **Last Candle Time:** `{stock_data['Time Stamp']}`")
+else:
+    st.write("Data loading...")
+
+# --- 3. LIVE OPEN POSITIONS ---
 st.markdown("---")
 st.subheader("🟢 Live Open Positions")
 open_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
 if not open_df.empty: st.dataframe(open_df, use_container_width=True)
 else: st.write("No active trades currently open.")
 
-st.markdown("---")
-st.subheader("📚 Stock-Wise Trade History")
-history_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
+# --- 4. HIDDEN LOGS & HISTORY (To reduce clutter) ---
+with st.expander("📚 View Closed Trade History"):
+    history_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
+    def color_status(val):
+        color = '#004d00' if 'WIN' in str(val) else '#660000' if 'LOSS' in str(val) else ''
+        return f'background-color: {color}'
+    if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['status']), use_container_width=True)
+    else: st.write("No closed trades yet.")
 
-def color_status(val):
-    color = '#004d00' if 'WIN' in str(val) else '#660000' if 'LOSS' in str(val) else ''
-    return f'background-color: {color}'
-
-if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['status']), use_container_width=True)
-else: st.write("No closed trades yet.")
-
-st.markdown("---")
-with st.expander("🛠️ System Debug Logs (Tap to view)"):
+with st.expander("🛠️ System Debug Logs"):
     logs_df = pd.read_sql_query("SELECT timestamp, message FROM system_logs ORDER BY id DESC LIMIT 15", ui_conn)
     if not logs_df.empty: st.dataframe(logs_df, use_container_width=True)
     else: st.write("System operating normally. No errors recorded.")
