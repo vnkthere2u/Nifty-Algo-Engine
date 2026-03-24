@@ -27,8 +27,14 @@ def send_telegram_alert(message):
     except: pass
 
 # ==========================================
-# 1. DATABASE SETUP
+# 1. DATABASE & STEALTH SESSION SETUP
 # ==========================================
+# This disguises the bot as a normal Google Chrome web browser
+yf_session = requests.Session()
+yf_session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+})
+
 def get_db_connection():
     conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False, timeout=20.0)
     c = conn.cursor()
@@ -76,10 +82,9 @@ NIFTY_100 = [
 ]
 
 # ==========================================
-# 2. CORE STRATEGY LOGIC (YAHOO FINANCE ENGINE)
+# 2. CORE STRATEGY LOGIC
 # ==========================================
 def get_yf_ticker(sym):
-    # Yahoo requires .NS for NSE stocks, and specific codes for indices
     if sym == 'NIFTY': return '^NSEI'
     if sym == 'BANKNIFTY': return '^NSEBANK'
     if sym == 'M_M': return 'M&M.NS'
@@ -89,12 +94,11 @@ def get_yf_ticker(sym):
 def fetch_and_analyze(ticker):
     try:
         yf_ticker = get_yf_ticker(ticker)
-        # 1mo of 15m data provides exactly the right amount of history for EMA39
-        df = yf.Ticker(yf_ticker).history(interval="15m", period="1mo")
+        # Using the stealth session to bypass blocks
+        df = yf.Ticker(yf_ticker, session=yf_session).history(interval="15m", period="1mo")
         
         if df is None or df.empty: return None
         
-        # Calculate Indicators
         df['EMA5'] = ta.ema(df['Close'], length=5)
         df['EMA39'] = ta.ema(df['Close'], length=39)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
@@ -121,7 +125,6 @@ def process_market_data():
         last_closed = df.iloc[-2]
         prev_closed = df.iloc[-3]
         
-        # Format the timestamp clearly
         candle_time = str(last_closed.name).split('+')[0]
         
         for trade in open_trades:
@@ -177,7 +180,8 @@ def process_market_data():
                 send_telegram_alert(msg)
                 
         conn.commit()
-        time.sleep(0.5) 
+        # Increased speed limit to avoid Yahoo DDoS blocks
+        time.sleep(1.5) 
         
     ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (ist_now.strftime("%I:%M:%S %p (IST)"),))
@@ -234,7 +238,7 @@ if engine_running:
     st.sidebar.success("✅ Background Engine is LIVE.")
 
 if st.sidebar.button("Force Manual Scan Now"):
-    with st.spinner("Pulling fresh data from Yahoo Finance..."):
+    with st.spinner("Scanning Nifty 100 stealthily... (This will take ~2.5 minutes)"):
         new_alerts = process_market_data()
         if new_alerts:
             for alert in new_alerts: signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
