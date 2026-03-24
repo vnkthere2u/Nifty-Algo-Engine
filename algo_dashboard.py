@@ -6,8 +6,8 @@ import time
 import requests
 import threading
 import traceback
-import yfinance as yf
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from tvDatafeed import TvDatafeed, Interval
 
 # ==========================================
 # 0. TELEGRAM ALERT SETUP
@@ -30,7 +30,7 @@ def send_telegram_alert(message):
 # 1. DATABASE SETUP
 # ==========================================
 def get_db_connection():
-    conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False, timeout=30.0)
+    conn = sqlite3.connect('nifty_live_trades.db', check_same_thread=False, timeout=30.0)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
@@ -38,8 +38,6 @@ def get_db_connection():
                  exit_time TEXT, exit_price REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS system_status 
                  (key TEXT PRIMARY KEY, value TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS system_logs 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS live_market_data 
                  (ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL, ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL)''')
     conn.commit()
@@ -47,55 +45,45 @@ def get_db_connection():
 
 get_db_connection().close()
 
-def log_error(message):
-    try:
-        conn = get_db_connection()
-        ist_now = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
-        conn.cursor().execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (ist_now, str(message)))
-        conn.commit()
-        conn.close()
-    except:
-        pass 
+# THE LIGHTWEIGHT WATCHLIST
+WATCHLIST = [
+    {'name': 'NIFTY 50', 'symbol': 'NIFTY', 'exchange': 'NSE'},
+    {'name': 'BANK NIFTY', 'symbol': 'BANKNIFTY', 'exchange': 'NSE'},
+    {'name': 'BITCOIN (24/7)', 'symbol': 'BTCUSD', 'exchange': 'CRYPTO'}
+]
 
-# ULTRA-FOCUSED WATCHLIST + 24/7 BITCOIN
-WATCHLIST = {
-    'NIFTY 50': '^NSEI',
-    'BANK NIFTY': '^NSEBANK',
-    'RELIANCE': 'RELIANCE.NS',
-    'HDFC BANK': 'HDFCBANK.NS',
-    'BITCOIN (24/7)': 'BTC-USD'
-}
+# Initialize connection ONCE globally to prevent timeouts
+tv = TvDatafeed()
 
 # ==========================================
-# 2. CORE STRATEGY LOGIC (YAHOO FINANCE)
+# 2. CORE STRATEGY LOGIC
 # ==========================================
-def fetch_and_analyze(name, yf_ticker):
+def fetch_and_analyze(item):
+    global tv
     try:
-        # Fetch 5 days of 15m data (Plenty for a 39 EMA to warm up)
-        df = yf.Ticker(yf_ticker).history(interval="15m", period="5d")
-        
-        if df is None or df.empty: return None
-        
-        # Remove timezone info to make timestamps clean
-        df.index = df.index.tz_localize(None)
-        
-        df['EMA5'] = ta.ema(df['Close'], length=5)
-        df['EMA39'] = ta.ema(df['Close'], length=39)
-        df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-        
-        df.dropna(inplace=True)
-        return df
-    except Exception as e:
-        log_error(f"Data fetch failed for {name}: {e}")
-        return None
+        df = tv.get_hist(symbol=item['symbol'], exchange=item['exchange'], interval=Interval.in_15_minute, n_bars=200)
+        if df is not None and not df.empty:
+            df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+            df['EMA5'] = ta.ema(df['Close'], length=5)
+            df['EMA39'] = ta.ema(df['Close'], length=39)
+            df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
+            df.dropna(inplace=True)
+            return df
+    except Exception:
+        # If connection drops, silently recreate it
+        try: tv = TvDatafeed()
+        except: pass
+    return None
 
 def process_market_data():
     conn = get_db_connection()
     c = conn.cursor()
     alerts = []
     
-    for name, ticker in WATCHLIST.items():
-        df = fetch_and_analyze(name, ticker)
+    for item in WATCHLIST:
+        name = item['name']
+        df = fetch_and_analyze(item)
+        
         if df is None or len(df) < 5: 
             continue
             
@@ -161,9 +149,9 @@ def process_market_data():
                 send_telegram_alert(msg)
                 
         conn.commit()
-        time.sleep(1.0) # Light sleep between fetches to respect API
+        time.sleep(1) # Prevent rapid-fire blocks
         
-    ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (ist_now.strftime("%I:%M:%S %p (IST)"),))
     conn.commit()
     conn.close()
@@ -173,20 +161,18 @@ def process_market_data():
 # 3. STREAMLIT DASHBOARD UI
 # ==========================================
 st.set_page_config(page_title="Live Algo Engine", layout="wide")
-st.title("⚡ Live Premium Algo Engine")
+st.title("⚡ Premium Algo Engine (Nifty & BTC)")
 
 ui_conn = get_db_connection()
 ui_c = ui_conn.cursor()
 
-# --- THE BACKGROUND DAEMON ENGINE ---
+# --- BACKGROUND ENGINE ---
 @st.cache_resource
 def start_background_scanner():
     def background_loop():
         while True:
-            try:
-                process_market_data()
-            except Exception as e:
-                log_error(f"Loop Crash: {traceback.format_exc()}")
+            try: process_market_data()
+            except Exception: pass
             time.sleep(300)
     thread = threading.Thread(target=background_loop, daemon=True)
     thread.start()
@@ -196,7 +182,7 @@ engine_running = start_background_scanner()
 
 st.sidebar.header("Control Panel")
 if engine_running:
-    st.sidebar.success("✅ Background Engine is LIVE.")
+    st.sidebar.success("✅ Engine is LIVE (Scanning every 5m).")
 
 ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
 last_scan_row = ui_c.fetchone()
@@ -206,54 +192,49 @@ if st.sidebar.button("⚠️ Reset/Clear Database"):
     ui_c.execute("DROP TABLE IF EXISTS trades")
     ui_c.execute("DROP TABLE IF EXISTS live_market_data")
     ui_c.execute("DROP TABLE IF EXISTS system_status")
-    ui_c.execute("DROP TABLE IF EXISTS system_logs")
     ui_conn.commit()
-    st.sidebar.success("Database fully dropped and rebuilt! Rebooting...")
+    st.sidebar.success("Database dropped and rebuilt! Rebooting...")
     time.sleep(1)
     st.rerun()
 
 if st.sidebar.button("Force Manual Scan Now"):
-    with st.spinner("Fetching live data..."):
+    with st.spinner("Fetching Nifty & BTC data..."):
         process_market_data()
         st.rerun()
 
-# Fetch live data
-live_df = pd.read_sql_query("SELECT ticker as Ticker, close_price as 'Last Price', distance_pct as '% Gap', ema5 as 'EMA 5', ema39 as 'EMA 39', trend as Trend, last_update as 'Time Stamp' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
+# --- LIVE MARKET DATA ---
+live_df = pd.read_sql_query("SELECT ticker as Asset, close_price as 'Last Price', distance_pct as '% Gap', ema5 as 'EMA 5', ema39 as 'EMA 39', trend as Trend, last_update as 'Time Stamp' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
 
-# --- 1. CLOSEST STOCKS TABLE ---
 st.markdown("---")
 st.subheader("🔥 Assets Nearing Crossover")
 if not live_df.empty:
     st.dataframe(live_df, use_container_width=True, hide_index=True)
 else:
-    st.write("Waiting for the first full scan to complete...")
+    st.write("Waiting for the engine to complete its first scan. Click 'Force Manual Scan Now' to start.")
 
-# --- 2. SPECIFIC STOCK DROPDOWN LOOKUP ---
+# --- SPECIFIC ASSET LOOKUP ---
 st.markdown("---")
 st.subheader("🔍 Specific Asset Lookup")
 if not live_df.empty:
-    selected_stock = st.selectbox("Select an asset to view its live details:", ["-- Select an Asset --"] + sorted(live_df['Ticker'].tolist()))
-    
+    selected_stock = st.selectbox("Select an asset to view its live details:", ["-- Select an Asset --"] + sorted(live_df['Asset'].tolist()))
     if selected_stock != "-- Select an Asset --":
-        stock_data = live_df[live_df['Ticker'] == selected_stock].iloc[0]
-        
+        stock_data = live_df[live_df['Asset'] == selected_stock].iloc[0]
         col1, col2, col3 = st.columns(3)
         col1.metric("Last Price", f"{stock_data['Last Price']}")
         col2.metric("% Gap to Cross", f"{stock_data['% Gap']}%")
         col3.metric("Trend", stock_data['Trend'])
-        
         st.info(f"**EMA 5:** `{stock_data['EMA 5']}` &nbsp;|&nbsp; **EMA 39:** `{stock_data['EMA 39']}` &nbsp;|&nbsp; **Last Candle Time:** `{stock_data['Time Stamp']}`")
 else:
     st.write("Data loading...")
 
-# --- 3. LIVE OPEN POSITIONS ---
+# --- LIVE OPEN POSITIONS ---
 st.markdown("---")
 st.subheader("🟢 Live Open Positions")
 open_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
 if not open_df.empty: st.dataframe(open_df, use_container_width=True)
 else: st.write("No active trades currently open.")
 
-# --- 4. HIDDEN LOGS & HISTORY (To reduce clutter) ---
+# --- TRADE HISTORY ---
 with st.expander("📚 View Closed Trade History"):
     history_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
     def color_status(val):
@@ -261,8 +242,3 @@ with st.expander("📚 View Closed Trade History"):
         return f'background-color: {color}'
     if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['status']), use_container_width=True)
     else: st.write("No closed trades yet.")
-
-with st.expander("🛠️ System Debug Logs"):
-    logs_df = pd.read_sql_query("SELECT timestamp, message FROM system_logs ORDER BY id DESC LIMIT 15", ui_conn)
-    if not logs_df.empty: st.dataframe(logs_df, use_container_width=True)
-    else: st.write("System operating normally. No errors recorded.")
