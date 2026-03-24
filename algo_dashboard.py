@@ -154,7 +154,6 @@ def process_market_data():
                     send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{name} SHORT closed at {round(sl, 2)}")
         conn.commit()
 
-        # Update Live Data Table for Dashboard
         latest_price = current_candle['Close']
         ema5_live = current_candle['EMA5']
         ema39_live = current_candle['EMA39']
@@ -166,7 +165,6 @@ def process_market_data():
                   (name, scan_time_str, round(latest_price, 2), round(ema5_live, 2), round(ema39_live, 2), trend, round(dist_pct, 4)))
         conn.commit()
 
-        # Execute Trade Signals based on CLOSED candles
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
         
@@ -229,6 +227,10 @@ if engine_running:
 ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
 last_scan_row = ui_c.fetchone()
 st.sidebar.info(f"⏱️ **Last Database Update:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
+
+if st.sidebar.button("🔔 Send Test Telegram Alert"):
+    send_telegram_alert("🟢 <b>TEST ALERT</b>\nYour Premium Algo Engine is successfully connected to Telegram!")
+    st.sidebar.success("Test alert sent! Please check your Telegram app.")
 
 if st.sidebar.button("Force Manual Scan Now"):
     with st.spinner("Fetching data..."):
