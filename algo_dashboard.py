@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from tvDatafeed import TvDatafeed, Interval
 
 # ==========================================
-# 0. TELEGRAM ALERT SETUP (SECURE VAULT)
+# 0. TELEGRAM ALERT SETUP
 # ==========================================
 try:
     TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
@@ -27,7 +27,7 @@ def send_telegram_alert(message):
     except: pass
 
 # ==========================================
-# 1. TV DATAFEED & DATABASE SETUP
+# 1. DATABASE SETUP
 # ==========================================
 tv = TvDatafeed()
 
@@ -45,7 +45,6 @@ def get_db_connection():
     conn.commit()
     return conn
 
-# Initialize DB structures
 get_db_connection().close()
 
 def log_error(message):
@@ -76,7 +75,8 @@ NIFTY_100 = [
 # ==========================================
 def fetch_and_analyze(ticker):
     try:
-        df = tv.get_hist(symbol=ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=60)
+        # INCREASED TO 500 BARS TO ENSURE FLAWLESS EMA MATH
+        df = tv.get_hist(symbol=ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=500)
         if df is None or df.empty: return None
         df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
         
@@ -102,12 +102,10 @@ def process_market_data():
         c.execute("SELECT id, signal_type, sl, tp FROM trades WHERE ticker=? AND status='OPEN'", (ticker,))
         open_trades = c.fetchall()
         
-        # iloc[-1] = live forming candle, iloc[-2] = last closed candle, iloc[-3] = previous closed candle
         current_candle = df.iloc[-1]
         last_closed = df.iloc[-2]
         prev_closed = df.iloc[-3]
         
-        # Check active trades for TP/SL hits
         for trade in open_trades:
             trade_id, sig_type, sl, tp = trade
             high_price, low_price = current_candle['High'], current_candle['Low']
@@ -128,17 +126,12 @@ def process_market_data():
                     send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{ticker} SHORT closed at {round(sl, 2)}")
         conn.commit()
 
-        # --- TRUE CROSSOVER MATHEMATICS ---
-        # Long Cross: EMA5 was below EMA39, and now it is strictly above it.
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
-        
-        # Short Cross: EMA5 was above EMA39, and now it is strictly below it.
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
         
         atr_val = last_closed['ATR']
         high, low = last_closed['High'], last_closed['Low']
         
-        # Prevent opening a new position if one is already open
         if len(open_trades) == 0:
             if long_cross:
                 entry = (high + low) / 2
@@ -184,6 +177,15 @@ ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
 last_scan_row = ui_c.fetchone()
 st.sidebar.info(f"⏱️ **Last Background Scan:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
 
+if st.sidebar.button("⚠️ Reset/Clear Database"):
+    ui_c.execute("DELETE FROM trades")
+    ui_c.execute("DELETE FROM system_status")
+    ui_c.execute("DELETE FROM system_logs")
+    ui_conn.commit()
+    st.sidebar.success("Database wiped clean! Ready for fresh signals.")
+    time.sleep(1)
+    st.rerun()
+
 # --- THE BACKGROUND DAEMON ENGINE ---
 @st.cache_resource
 def start_background_scanner():
@@ -205,7 +207,7 @@ if engine_running:
     st.sidebar.success("✅ Background Engine is LIVE.")
 
 if st.sidebar.button("Force Manual Scan Now"):
-    with st.spinner("Fetching live data for Nifty 100..."):
+    with st.spinner("Fetching 500 bars of deep historical data for exact EMA matches..."):
         new_alerts = process_market_data()
         if new_alerts:
             for alert in new_alerts: signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
