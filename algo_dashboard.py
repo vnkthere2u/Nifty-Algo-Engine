@@ -27,12 +27,13 @@ def send_telegram_alert(message):
     except: pass
 
 # ==========================================
-# 1. DATABASE SETUP
+# 1. DATABASE SETUP (ANTI-LOCK OPTIMIZED)
 # ==========================================
 tv = TvDatafeed()
 
 def get_db_connection():
-    conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False)
+    # Added timeout=20.0 to prevent database deadlock freezes!
+    conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False, timeout=20.0)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
@@ -44,7 +45,6 @@ def get_db_connection():
                  (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS system_logs 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
-    # ADDED DISTANCE PERCENTAGE COLUMN
     c.execute('''CREATE TABLE IF NOT EXISTS live_market_data 
                  (ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL, ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL)''')
     conn.commit()
@@ -53,11 +53,14 @@ def get_db_connection():
 get_db_connection().close()
 
 def log_error(message):
-    conn = get_db_connection()
-    ist_now = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
-    conn.cursor().execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (ist_now, str(message)))
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db_connection()
+        ist_now = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
+        conn.cursor().execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (ist_now, str(message)))
+        conn.commit()
+        conn.close()
+    except:
+        pass # Fail silently if logging also hits a lock
 
 NIFTY_100 = [
     'NIFTY', 'BANKNIFTY', 'ABB', 'ADANIENT', 'ADANIGREEN', 'ADANIPORTS', 'ADANIENSOL', 
@@ -80,7 +83,8 @@ NIFTY_100 = [
 # ==========================================
 def fetch_and_analyze(ticker):
     try:
-        df = tv.get_hist(symbol=ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=500)
+        # Reduced to 200 bars to prevent RAM overload while maintaining perfect EMA math
+        df = tv.get_hist(symbol=ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=200)
         if df is None or df.empty: return None
         df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
         
@@ -133,10 +137,9 @@ def process_market_data():
         ema5, ema39, atr_val = last_closed['EMA5'], last_closed['EMA39'], last_closed['ATR']
         high, low, close_p = last_closed['High'], last_closed['Low'], last_closed['Close']
         
-        # --- NEW DISTANCE CALCULATION ---
         dist_pct = abs(ema5 - ema39) / ema39 * 100
-        
         trend = "🟢 Bullish" if ema5 > ema39 else "🔴 Bearish"
+        
         c.execute("INSERT OR REPLACE INTO live_market_data (ticker, last_update, close_price, ema5, ema39, trend, distance_pct) VALUES (?, ?, ?, ?, ?, ?, ?)",
                   (ticker, str(last_closed.name), round(close_p, 2), round(ema5, 2), round(ema39, 2), trend, round(dist_pct, 4)))
         conn.commit()
@@ -221,7 +224,7 @@ if engine_running:
     st.sidebar.success("✅ Background Engine is LIVE.")
 
 if st.sidebar.button("Force Manual Scan Now"):
-    with st.spinner("Fetching 500 bars of deep historical data for exact EMA matches..."):
+    with st.spinner("Fetching data and calculating EMAs... Please wait ~60 seconds."):
         new_alerts = process_market_data()
         if new_alerts:
             for alert in new_alerts: signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
@@ -232,14 +235,14 @@ if st.sidebar.button("Force Manual Scan Now"):
 # --- NEW GLASS-BOX MARKET TRACKER ---
 st.markdown("---")
 st.subheader("📊 Live Market State (Sorted by Distance to Crossover)")
-st.info("Watch this table! Stocks at the top have EMAs that are almost touching. They are your highest probability setups for the next 15m candle.")
+st.info("Stocks at the top have EMAs that are almost touching. High probability for the next candle.")
 
 live_df = pd.read_sql_query("SELECT ticker as Ticker, trend as Trend, distance_pct as 'Distance (%)', close_price as 'Close Price', ema5 as 'EMA 5', ema39 as 'EMA 39', last_update as 'Candle Time' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
 
 if not live_df.empty:
     st.dataframe(live_df, use_container_width=True, hide_index=True)
 else:
-    st.write("Waiting for background engine to complete its first scan...")
+    st.write("Waiting for the first full scan to complete...")
 
 st.markdown("---")
 st.subheader("🟢 Live Open Positions")
