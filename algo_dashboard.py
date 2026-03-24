@@ -6,6 +6,7 @@ import time
 import requests
 import threading
 import traceback
+import yfinance as yf
 from datetime import datetime, timedelta, timezone
 from tvDatafeed import TvDatafeed, Interval
 
@@ -38,6 +39,8 @@ def get_db_connection():
                  exit_time TEXT, exit_price REAL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS system_status 
                  (key TEXT PRIMARY KEY, value TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS system_logs 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS live_market_data 
                  (ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL, ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL)''')
     conn.commit()
@@ -45,34 +48,77 @@ def get_db_connection():
 
 get_db_connection().close()
 
-# THE LIGHTWEIGHT WATCHLIST
+def log_error(message):
+    try:
+        conn = get_db_connection()
+        ist_now = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
+        conn.cursor().execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (ist_now, str(message)))
+        conn.commit()
+        conn.close()
+    except:
+        pass 
+
+# WATCHLIST (Mapped for both TradingView and Yahoo Finance)
 WATCHLIST = [
-    {'name': 'NIFTY 50', 'symbol': 'NIFTY', 'exchange': 'NSE'},
-    {'name': 'BANK NIFTY', 'symbol': 'BANKNIFTY', 'exchange': 'NSE'},
-    {'name': 'BITCOIN (24/7)', 'symbol': 'BTCUSD', 'exchange': 'CRYPTO'}
+    {'name': 'NIFTY 50', 'tv_symbol': 'NIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEI'},
+    {'name': 'BANK NIFTY', 'tv_symbol': 'BANKNIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEBANK'},
+    {'name': 'BITCOIN (24/7)', 'tv_symbol': 'BTCUSDT', 'tv_exchange': 'BINANCE', 'yf_symbol': 'BTC-USD'}
 ]
 
-# Initialize connection ONCE globally to prevent timeouts
 tv = TvDatafeed()
 
 # ==========================================
-# 2. CORE STRATEGY LOGIC
+# 2. BULLETPROOF DUAL-ENGINE LOGIC
 # ==========================================
 def fetch_and_analyze(item):
     global tv
+    df = None
+    
+    # ENGINE 1: Attempt TradingView
     try:
-        df = tv.get_hist(symbol=item['symbol'], exchange=item['exchange'], interval=Interval.in_15_minute, n_bars=200)
-        if df is not None and not df.empty:
-            df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+        df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=200)
+        if df_tv is not None and not df_tv.empty:
+            df_tv.columns = [c.capitalize() for c in df_tv.columns]
+            df = df_tv
+    except Exception as e:
+        log_error(f"TradingView failed for {item['name']}: {e}")
+        try: tv = TvDatafeed() # Silently reset broken connection
+        except: pass
+
+    # ENGINE 2: Seamless Fallback to Yahoo Finance
+    if df is None or df.empty:
+        try:
+            df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="5d")
+            if df_yf is not None and not df_yf.empty:
+                df_yf.index = df_yf.index.tz_localize(None)
+                df_yf.columns = [c.capitalize() for c in df_yf.columns]
+                df = df_yf
+        except Exception as e:
+            log_error(f"Yahoo Finance failed for {item['name']}: {e}")
+
+    # MATH PROCESSING & SAFETY ENFORCEMENT
+    if df is not None and not df.empty:
+        try:
+            # Force all numerical columns into safe Floats to prevent pandas_ta crashes
+            for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            df.dropna(subset=['Close', 'High', 'Low'], inplace=True) 
+            
             df['EMA5'] = ta.ema(df['Close'], length=5)
             df['EMA39'] = ta.ema(df['Close'], length=39)
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
             df.dropna(inplace=True)
-            return df
-    except Exception:
-        # If connection drops, silently recreate it
-        try: tv = TvDatafeed()
-        except: pass
+            
+            if len(df) >= 5:
+                return df
+            else:
+                log_error(f"{item['name']} dataframe too short after calculating EMAs.")
+        except Exception as e:
+            log_error(f"Math Error on {item['name']}: {e}")
+            
+    log_error(f"Both Engines completely failed for {item['name']}")
     return None
 
 def process_market_data():
@@ -84,7 +130,7 @@ def process_market_data():
         name = item['name']
         df = fetch_and_analyze(item)
         
-        if df is None or len(df) < 5: 
+        if df is None: 
             continue
             
         c.execute("SELECT id, signal_type, sl, tp FROM trades WHERE ticker=? AND status='OPEN'", (name,))
@@ -94,7 +140,7 @@ def process_market_data():
         last_closed = df.iloc[-2]
         prev_closed = df.iloc[-3]
         
-        candle_time = str(last_closed.name)
+        candle_time = str(last_closed.name).split('.')[0] # Clean timestamp
         
         for trade in open_trades:
             trade_id, sig_type, sl, tp = trade
@@ -149,7 +195,7 @@ def process_market_data():
                 send_telegram_alert(msg)
                 
         conn.commit()
-        time.sleep(1) # Prevent rapid-fire blocks
+        time.sleep(1) 
         
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (ist_now.strftime("%I:%M:%S %p (IST)"),))
@@ -166,7 +212,7 @@ st.title("⚡ Premium Algo Engine (Nifty & BTC)")
 ui_conn = get_db_connection()
 ui_c = ui_conn.cursor()
 
-# --- BACKGROUND ENGINE ---
+# --- THE BACKGROUND DAEMON ENGINE ---
 @st.cache_resource
 def start_background_scanner():
     def background_loop():
@@ -192,13 +238,14 @@ if st.sidebar.button("⚠️ Reset/Clear Database"):
     ui_c.execute("DROP TABLE IF EXISTS trades")
     ui_c.execute("DROP TABLE IF EXISTS live_market_data")
     ui_c.execute("DROP TABLE IF EXISTS system_status")
+    ui_c.execute("DROP TABLE IF EXISTS system_logs")
     ui_conn.commit()
     st.sidebar.success("Database dropped and rebuilt! Rebooting...")
     time.sleep(1)
     st.rerun()
 
 if st.sidebar.button("Force Manual Scan Now"):
-    with st.spinner("Fetching Nifty & BTC data..."):
+    with st.spinner("Fetching data from Primary & Fallback feeds..."):
         process_market_data()
         st.rerun()
 
@@ -242,3 +289,8 @@ with st.expander("📚 View Closed Trade History"):
         return f'background-color: {color}'
     if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['status']), use_container_width=True)
     else: st.write("No closed trades yet.")
+
+with st.expander("🛠️ System Debug Logs"):
+    logs_df = pd.read_sql_query("SELECT timestamp, message FROM system_logs ORDER BY id DESC LIMIT 15", ui_conn)
+    if not logs_df.empty: st.dataframe(logs_df, use_container_width=True)
+    else: st.write("System operating normally. No errors recorded.")
