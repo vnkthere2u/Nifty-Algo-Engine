@@ -38,10 +38,15 @@ def get_db_connection():
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
                  entry_time TEXT, entry_price REAL, sl REAL, tp REAL, status TEXT, 
                  exit_time TEXT, exit_price REAL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS gating_state 
+                 (ticker TEXT PRIMARY KEY, last_sig TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS system_status 
                  (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS system_logs 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
+    # ADDED DISTANCE PERCENTAGE COLUMN
+    c.execute('''CREATE TABLE IF NOT EXISTS live_market_data 
+                 (ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL, ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL)''')
     conn.commit()
     return conn
 
@@ -75,7 +80,6 @@ NIFTY_100 = [
 # ==========================================
 def fetch_and_analyze(ticker):
     try:
-        # INCREASED TO 500 BARS TO ENSURE FLAWLESS EMA MATH
         df = tv.get_hist(symbol=ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=500)
         if df is None or df.empty: return None
         df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
@@ -126,11 +130,19 @@ def process_market_data():
                     send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{ticker} SHORT closed at {round(sl, 2)}")
         conn.commit()
 
+        ema5, ema39, atr_val = last_closed['EMA5'], last_closed['EMA39'], last_closed['ATR']
+        high, low, close_p = last_closed['High'], last_closed['Low'], last_closed['Close']
+        
+        # --- NEW DISTANCE CALCULATION ---
+        dist_pct = abs(ema5 - ema39) / ema39 * 100
+        
+        trend = "🟢 Bullish" if ema5 > ema39 else "🔴 Bearish"
+        c.execute("INSERT OR REPLACE INTO live_market_data (ticker, last_update, close_price, ema5, ema39, trend, distance_pct) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (ticker, str(last_closed.name), round(close_p, 2), round(ema5, 2), round(ema39, 2), trend, round(dist_pct, 4)))
+        conn.commit()
+
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
-        
-        atr_val = last_closed['ATR']
-        high, low = last_closed['High'], last_closed['Low']
         
         if len(open_trades) == 0:
             if long_cross:
@@ -178,11 +190,13 @@ last_scan_row = ui_c.fetchone()
 st.sidebar.info(f"⏱️ **Last Background Scan:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
 
 if st.sidebar.button("⚠️ Reset/Clear Database"):
-    ui_c.execute("DELETE FROM trades")
-    ui_c.execute("DELETE FROM system_status")
-    ui_c.execute("DELETE FROM system_logs")
+    ui_c.execute("DROP TABLE IF EXISTS trades")
+    ui_c.execute("DROP TABLE IF EXISTS live_market_data")
+    ui_c.execute("DROP TABLE IF EXISTS system_status")
+    ui_c.execute("DROP TABLE IF EXISTS system_logs")
+    ui_c.execute("DROP TABLE IF EXISTS gating_state")
     ui_conn.commit()
-    st.sidebar.success("Database wiped clean! Ready for fresh signals.")
+    st.sidebar.success("Database fully dropped and rebuilt! Rebooting...")
     time.sleep(1)
     st.rerun()
 
@@ -214,6 +228,18 @@ if st.sidebar.button("Force Manual Scan Now"):
         else:
             signal_placeholder.info("Manual scan complete. No new crossovers found right now.")
         st.rerun()
+
+# --- NEW GLASS-BOX MARKET TRACKER ---
+st.markdown("---")
+st.subheader("📊 Live Market State (Sorted by Distance to Crossover)")
+st.info("Watch this table! Stocks at the top have EMAs that are almost touching. They are your highest probability setups for the next 15m candle.")
+
+live_df = pd.read_sql_query("SELECT ticker as Ticker, trend as Trend, distance_pct as 'Distance (%)', close_price as 'Close Price', ema5 as 'EMA 5', ema39 as 'EMA 39', last_update as 'Candle Time' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
+
+if not live_df.empty:
+    st.dataframe(live_df, use_container_width=True, hide_index=True)
+else:
+    st.write("Waiting for background engine to complete its first scan...")
 
 st.markdown("---")
 st.subheader("🟢 Live Open Positions")
