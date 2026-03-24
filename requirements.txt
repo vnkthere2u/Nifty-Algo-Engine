@@ -2,4 +2,4 @@ streamlit==1.55.0
 pandas>=2.3.2
 pandas-ta==0.4.71b0
 requests==2.32.3
-tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git
+yfinance==0.2.40
