@@ -71,15 +71,10 @@ def fetch_and_analyze(ticker):
         if df is None or df.empty: return None
         df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
         
+        # Pure EMA crossover strategy + ATR for Stop Loss/Target Profit
         df['EMA5'] = ta.ema(df['Close'], length=5)
         df['EMA39'] = ta.ema(df['Close'], length=39)
-        df['RSI'] = ta.rsi(df['Close'], length=14)
-        adx_df = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-        df['ADX'] = adx_df['ADX_14'] if adx_df is not None else 0
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-        
-        # Calculate Cumulative Volume for the current trading day
-        df['Cum_Volume'] = df.groupby(df.index.date)['Volume'].cumsum()
         
         df.dropna(inplace=True)
         return df
@@ -122,26 +117,18 @@ def process_market_data():
 
         conn.commit()
 
-        # Extract values for the new conditions
+        # Extract values for the pure EMA crossover
         last_closed = df.iloc[-2]
-        adx_val, rsi_val = last_closed['ADX'], last_closed['RSI']
         ema5, ema39, atr_val = last_closed['EMA5'], last_closed['EMA39'], last_closed['ATR']
         high, low = last_closed['High'], last_closed['Low']
         
-        # Pulling the cumulative volume, not the single candle volume
-        close_price, cum_volume_val = last_closed['Close'], last_closed['Cum_Volume']
-        
+        # Reset signal if the trend crosses back over (prevents duplicate signals)
         if last_sig == "long" and ema5 < ema39: last_sig = "none"
         if last_sig == "short" and ema5 > ema39: last_sig = "none"
             
-        # NEW BASE CONDITIONS: Liquidity (Cumulative) + Momentum
-        liquidity_filter = (close_price > 100) and (cum_volume_val > 350000 or ticker in ['NIFTY', 'BANKNIFTY'])
-        
-        can_long = liquidity_filter and (adx_val >= 20) and (rsi_val >= 60) and (ema5 > ema39)
-        can_short = liquidity_filter and (adx_val >= 20) and (rsi_val <= 40) and (ema39 > ema5)
-        
-        long_trigger = can_long and (last_sig != "long")
-        short_trigger = can_short and (last_sig != "short")
+        # PURE EMA CROSSOVER LOGIC
+        long_trigger = (ema5 > ema39) and (last_sig != "long")
+        short_trigger = (ema39 > ema5) and (last_sig != "short")
         
         if long_trigger:
             last_sig = "long"
@@ -221,7 +208,7 @@ if st.sidebar.button("Force Manual Scan Now"):
                 signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
         else:
             signal_placeholder.info("Manual scan complete. No new signals right now.")
-            st.rerun() # Forces the UI to update the timestamp immediately
+            st.rerun() 
 
 st.markdown("---")
 st.subheader("🟢 Live Open Positions")
