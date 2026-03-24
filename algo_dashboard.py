@@ -31,7 +31,7 @@ def send_telegram_alert(message):
 # ==========================================
 tv = TvDatafeed()
 
-conn = sqlite3.connect('nifty50_live_trades.db', check_same_thread=False)
+conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS trades 
              (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
@@ -41,7 +41,22 @@ c.execute('''CREATE TABLE IF NOT EXISTS gating_state
              (ticker TEXT PRIMARY KEY, last_sig TEXT)''')
 conn.commit()
 
-NIFTY_50 = ['NIFTY', 'BANKNIFTY', 'ADANIENT', 'ADANIPORTS', 'APOLLOHOSP', 'ASIANPAINT', 'AXISBANK', 'BAJAJ_AUTO', 'BAJFINANCE', 'BAJAJFINSV', 'BPCL', 'BHARTIARTL', 'BRITANNIA', 'CIPLA', 'COALINDIA', 'DIVISLAB', 'DRREDDY', 'EICHERMOT', 'GRASIM', 'HCLTECH', 'HDFCBANK', 'HDFCLIFE', 'HEROMOTOCO', 'HINDALCO', 'HINDUNILVR', 'ICICIBANK', 'ITC', 'INDUSINDBK', 'INFY', 'JSWSTEEL', 'KOTAKBANK', 'LTIM', 'LT', 'M_M', 'MARUTI', 'NTPC', 'NESTLEIND', 'ONGC', 'POWERGRID', 'RELIANCE', 'SBILIFE', 'SBIN', 'SUNPHARMA', 'TCS', 'TATACONSUM', 'TATAMOTORS', 'TATASTEEL', 'TECHM', 'TITAN', 'ULTRACEMCO', 'WIPRO']
+# Nifty 100 + Major Indices
+NIFTY_100 = [
+    'NIFTY', 'BANKNIFTY', 'ABB', 'ADANIENT', 'ADANIGREEN', 'ADANIPORTS', 'ADANIENSOL', 
+    'AMBUJACEM', 'APOLLOHOSP', 'ASIANPAINT', 'ATGL', 'AXISBANK', 'BAJAJ_AUTO', 'BAJFINANCE', 
+    'BAJAJFINSV', 'BAJAJHLDNG', 'BANKBARODA', 'BEL', 'BHARATFORG', 'BHARTIARTL', 'BOSCHLTD', 
+    'BPCL', 'BRITANNIA', 'CANBK', 'CHOLAFIN', 'CIPLA', 'COALINDIA', 'COFORGE', 'COLPAL', 
+    'DIVISLAB', 'DLF', 'DMART', 'DRREDDY', 'EICHERMOT', 'GAIL', 'GODREJCP', 'GRASIM', 
+    'HAL', 'HAVELLS', 'HCLTECH', 'HDFCAMC', 'HDFCBANK', 'HDFCLIFE', 'HEROMOTOCO', 'HINDALCO', 
+    'HINDUNILVR', 'ICICIBANK', 'ICICIGI', 'ICICIPRULI', 'IDFCFIRSTB', 'INDIGO', 'INDUSINDBK', 
+    'INFY', 'IOC', 'IRCTC', 'IRFC', 'ITC', 'JINDALSTEL', 'JIOFIN', 'JSWSTEEL', 'KOTAKBANK', 
+    'LICI', 'LODHA', 'LT', 'LTIM', 'LUPIN', 'M_M', 'MARICO', 'MARUTI', 'MUTHOOTFIN', 'NAUKRI', 
+    'NESTLEIND', 'NTPC', 'ONGC', 'PIDILITIND', 'PNB', 'POLYCAB', 'POWERGRID', 'RECLTD', 
+    'RELIANCE', 'SBILIFE', 'SBIN', 'SCHAEFFLER', 'SHREECEM', 'SIEMENS', 'SRF', 'SUNPHARMA', 
+    'TATACONSUM', 'TATAMOTORS', 'TATASTEEL', 'TCS', 'TECHM', 'TITAN', 'TRENT', 'TVSMOTOR', 
+    'UBL', 'ULTRACEMCO', 'VEDL', 'WIPRO', 'ZOMATO'
+]
 
 # ==========================================
 # 2. CORE STRATEGY LOGIC
@@ -66,7 +81,7 @@ def fetch_and_analyze(ticker):
 
 def process_market_data():
     alerts = []
-    for ticker in NIFTY_50:
+    for ticker in NIFTY_100:
         df = fetch_and_analyze(ticker)
         if df is None or df.empty: continue
             
@@ -100,15 +115,25 @@ def process_market_data():
 
         conn.commit()
 
+        # Extract values for the new conditions
         last_closed = df.iloc[-2]
-        adx_val, rsi_val, ema5, ema39, atr_val = last_closed['ADX'], last_closed['RSI'], last_closed['EMA5'], last_closed['EMA39'], last_closed['ATR']
+        adx_val, rsi_val = last_closed['ADX'], last_closed['RSI']
+        ema5, ema39, atr_val = last_closed['EMA5'], last_closed['EMA39'], last_closed['ATR']
         high, low = last_closed['High'], last_closed['Low']
+        close_price, volume_val = last_closed['Close'], last_closed['Volume']
         
         if last_sig == "long" and ema5 < ema39: last_sig = "none"
         if last_sig == "short" and ema5 > ema39: last_sig = "none"
             
-        long_trigger = (adx_val > 20) and (rsi_val > 59) and (ema5 > ema39) and (last_sig != "long")
-        short_trigger = (adx_val > 20) and (rsi_val < 41) and (ema39 > ema5) and (last_sig != "short")
+        # NEW BASE CONDITIONS: Liquidity + Momentum
+        # Note: Indices like NIFTY don't have volume data in the same way, so we bypass the volume check for them
+        liquidity_filter = (close_price > 100) and (volume_val > 350000 or ticker in ['NIFTY', 'BANKNIFTY'])
+        
+        can_long = liquidity_filter and (adx_val >= 20) and (rsi_val >= 60) and (ema5 > ema39)
+        can_short = liquidity_filter and (adx_val >= 20) and (rsi_val <= 40) and (ema39 > ema5)
+        
+        long_trigger = can_long and (last_sig != "long")
+        short_trigger = can_short and (last_sig != "short")
         
         if long_trigger:
             last_sig = "long"
@@ -139,15 +164,15 @@ def process_market_data():
 # ==========================================
 # 3. STREAMLIT DASHBOARD UI
 # ==========================================
-st.set_page_config(page_title="Live Nifty 50 Engine", layout="wide")
-st.title("⚡ Live Nifty 50 Algo Engine")
+st.set_page_config(page_title="Live Nifty 100 Engine", layout="wide")
+st.title("⚡ Live Nifty 100 Algo Engine")
 
 st.subheader("🔔 Recent Signals (Current Scan)")
 signal_placeholder = st.empty()
 
 st.sidebar.header("Control Panel")
 if st.sidebar.button("Run Live Scanner Now"):
-    with st.spinner("Fetching live data..."):
+    with st.spinner("Fetching live data for Nifty 100..."):
         new_alerts = process_market_data()
         if new_alerts:
             for alert in new_alerts:
@@ -169,7 +194,7 @@ st.markdown("---")
 st.subheader("🟢 Live Open Positions")
 open_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp FROM trades WHERE status='OPEN' ORDER BY id DESC", conn)
 
-stock_filter_open = st.selectbox("Filter Open Positions by Stock:", ["All"] + NIFTY_50, key="open_filter")
+stock_filter_open = st.selectbox("Filter Open Positions by Stock:", ["All"] + NIFTY_100, key="open_filter")
 if stock_filter_open != "All":
     open_df = open_df[open_df['ticker'] == stock_filter_open]
 
@@ -182,7 +207,7 @@ st.markdown("---")
 st.subheader("📚 Stock-Wise Trade History")
 history_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price FROM trades WHERE status!='OPEN' ORDER BY id DESC", conn)
 
-stock_filter_history = st.selectbox("Filter History by Stock:", ["All"] + NIFTY_50, key="hist_filter")
+stock_filter_history = st.selectbox("Filter History by Stock:", ["All"] + NIFTY_100, key="hist_filter")
 if stock_filter_history != "All":
     history_df = history_df[history_df['ticker'] == stock_filter_history]
 
