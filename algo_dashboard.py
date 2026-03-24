@@ -5,6 +5,7 @@ import sqlite3
 import time
 import requests
 import threading
+import traceback
 from datetime import datetime, timedelta
 from tvDatafeed import TvDatafeed, Interval
 
@@ -19,33 +20,41 @@ except:
     TELEGRAM_CHAT_ID = ""
 
 def send_telegram_alert(message):
-    if not TELEGRAM_TOKEN:
-        return 
+    if not TELEGRAM_TOKEN: return 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
-    try:
-        requests.post(url, data=payload, timeout=5)
-    except Exception as e:
-        print(f"Telegram alert failed: {e}")
+    try: requests.post(url, data=payload, timeout=5)
+    except: pass
 
 # ==========================================
 # 1. TV DATAFEED & DATABASE SETUP
 # ==========================================
 tv = TvDatafeed()
 
-conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS trades 
-             (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
-             entry_time TEXT, entry_price REAL, sl REAL, tp REAL, status TEXT, 
-             exit_time TEXT, exit_price REAL)''')
-c.execute('''CREATE TABLE IF NOT EXISTS gating_state 
-             (ticker TEXT PRIMARY KEY, last_sig TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS system_status 
-             (key TEXT PRIMARY KEY, value TEXT)''')
-conn.commit()
+def get_db_connection():
+    conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS trades 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
+                 entry_time TEXT, entry_price REAL, sl REAL, tp REAL, status TEXT, 
+                 exit_time TEXT, exit_price REAL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS system_status 
+                 (key TEXT PRIMARY KEY, value TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS system_logs 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
+    conn.commit()
+    return conn
 
-# Nifty 100 + Major Indices
+# Initialize DB structures
+get_db_connection().close()
+
+def log_error(message):
+    conn = get_db_connection()
+    ist_now = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %I:%M:%S %p")
+    conn.cursor().execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (ist_now, str(message)))
+    conn.commit()
+    conn.close()
+
 NIFTY_100 = [
     'NIFTY', 'BANKNIFTY', 'ABB', 'ADANIENT', 'ADANIGREEN', 'ADANIPORTS', 'ADANIENSOL', 
     'AMBUJACEM', 'APOLLOHOSP', 'ASIANPAINT', 'ATGL', 'AXISBANK', 'BAJAJ_AUTO', 'BAJFINANCE', 
@@ -69,33 +78,36 @@ def fetch_and_analyze(ticker):
     try:
         df = tv.get_hist(symbol=ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=60)
         if df is None or df.empty: return None
-        df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'}, inplace=True)
+        df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
         
-        # Pure EMA crossover strategy + ATR for Stop Loss/Target Profit
         df['EMA5'] = ta.ema(df['Close'], length=5)
         df['EMA39'] = ta.ema(df['Close'], length=39)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
         
         df.dropna(inplace=True)
         return df
-    except:
+    except Exception as e:
+        log_error(f"Data fetch failed for {ticker}: {e}")
         return None
 
 def process_market_data():
+    conn = get_db_connection()
+    c = conn.cursor()
     alerts = []
+    
     for ticker in NIFTY_100:
         df = fetch_and_analyze(ticker)
-        if df is None or df.empty: continue
+        if df is None or len(df) < 5: continue
             
-        c.execute("SELECT last_sig FROM gating_state WHERE ticker=?", (ticker,))
-        row = c.fetchone()
-        last_sig = row[0] if row else "none"
-        
         c.execute("SELECT id, signal_type, sl, tp FROM trades WHERE ticker=? AND status='OPEN'", (ticker,))
         open_trades = c.fetchall()
         
+        # iloc[-1] = live forming candle, iloc[-2] = last closed candle, iloc[-3] = previous closed candle
         current_candle = df.iloc[-1]
+        last_closed = df.iloc[-2]
+        prev_closed = df.iloc[-3]
         
+        # Check active trades for TP/SL hits
         for trade in open_trades:
             trade_id, sig_type, sl, tp = trade
             high_price, low_price = current_candle['High'], current_candle['Low']
@@ -114,52 +126,45 @@ def process_market_data():
                 elif high_price >= sl:
                     c.execute("UPDATE trades SET status='SL HIT (LOSS)', exit_time=?, exit_price=? WHERE id=?", (str(current_candle.name), sl, trade_id))
                     send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{ticker} SHORT closed at {round(sl, 2)}")
-
         conn.commit()
 
-        # Extract values for the pure EMA crossover
-        last_closed = df.iloc[-2]
-        ema5, ema39, atr_val = last_closed['EMA5'], last_closed['EMA39'], last_closed['ATR']
+        # --- TRUE CROSSOVER MATHEMATICS ---
+        # Long Cross: EMA5 was below EMA39, and now it is strictly above it.
+        long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
+        
+        # Short Cross: EMA5 was above EMA39, and now it is strictly below it.
+        short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
+        
+        atr_val = last_closed['ATR']
         high, low = last_closed['High'], last_closed['Low']
         
-        # Reset signal if the trend crosses back over (prevents duplicate signals)
-        if last_sig == "long" and ema5 < ema39: last_sig = "none"
-        if last_sig == "short" and ema5 > ema39: last_sig = "none"
-            
-        # PURE EMA CROSSOVER LOGIC
-        long_trigger = (ema5 > ema39) and (last_sig != "long")
-        short_trigger = (ema39 > ema5) and (last_sig != "short")
-        
-        if long_trigger:
-            last_sig = "long"
-            entry = (high + low) / 2
-            sl, tp = entry - atr_val, entry + (3.0 * atr_val)
-            c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (ticker, 'long', str(last_closed.name), round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
-            msg = f"🟢 <b>LONG SIGNAL: {ticker}</b>\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
-            alerts.append(msg)
-            send_telegram_alert(msg)
-            
-        elif short_trigger:
-            last_sig = "short"
-            entry = (high + low) / 2
-            sl, tp = entry + atr_val, entry - (3.0 * atr_val)
-            c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                      (ticker, 'short', str(last_closed.name), round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
-            msg = f"🔴 <b>SHORT SIGNAL: {ticker}</b>\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
-            alerts.append(msg)
-            send_telegram_alert(msg)
-
-        c.execute("INSERT OR REPLACE INTO gating_state (ticker, last_sig) VALUES (?, ?)", (ticker, last_sig))
+        # Prevent opening a new position if one is already open
+        if len(open_trades) == 0:
+            if long_cross:
+                entry = (high + low) / 2
+                sl, tp = entry - atr_val, entry + (3.0 * atr_val)
+                c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          (ticker, 'long', str(last_closed.name), round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
+                msg = f"🟢 <b>LONG SIGNAL: {ticker}</b>\nTime: {str(last_closed.name)}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
+                alerts.append(msg)
+                send_telegram_alert(msg)
+                
+            elif short_cross:
+                entry = (high + low) / 2
+                sl, tp = entry + atr_val, entry - (3.0 * atr_val)
+                c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                          (ticker, 'short', str(last_closed.name), round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
+                msg = f"🔴 <b>SHORT SIGNAL: {ticker}</b>\nTime: {str(last_closed.name)}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
+                alerts.append(msg)
+                send_telegram_alert(msg)
+                
         conn.commit()
         time.sleep(0.5) 
         
-    # Update the heart-beat timestamp when the scan completes
     ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    scan_time_str = ist_now.strftime("%I:%M:%S %p (IST)")
-    c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (scan_time_str,))
+    c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (ist_now.strftime("%I:%M:%S %p (IST)"),))
     conn.commit()
-        
+    conn.close()
     return alerts
 
 # ==========================================
@@ -173,12 +178,11 @@ signal_placeholder = st.empty()
 
 st.sidebar.header("Control Panel")
 
-# --- UI TIMESTAMPS ---
-c.execute("SELECT value FROM system_status WHERE key='last_scan'")
-last_scan_row = c.fetchone()
-last_scan_time = last_scan_row[0] if last_scan_row else "Initializing..."
-
-st.sidebar.info(f"⏱️ **Last Background Scan:**\n{last_scan_time}")
+ui_conn = get_db_connection()
+ui_c = ui_conn.cursor()
+ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
+last_scan_row = ui_c.fetchone()
+st.sidebar.info(f"⏱️ **Last Background Scan:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
 
 # --- THE BACKGROUND DAEMON ENGINE ---
 @st.cache_resource
@@ -188,9 +192,9 @@ def start_background_scanner():
             try:
                 process_market_data()
             except Exception as e:
-                print(f"Background scan error: {e}")
+                log_error(f"Loop Crash: {traceback.format_exc()}")
             time.sleep(300)
-
+            
     thread = threading.Thread(target=background_loop, daemon=True)
     thread.start()
     return True
@@ -204,41 +208,30 @@ if st.sidebar.button("Force Manual Scan Now"):
     with st.spinner("Fetching live data for Nifty 100..."):
         new_alerts = process_market_data()
         if new_alerts:
-            for alert in new_alerts:
-                signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
+            for alert in new_alerts: signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
         else:
-            signal_placeholder.info("Manual scan complete. No new signals right now.")
-            st.rerun() 
+            signal_placeholder.info("Manual scan complete. No new crossovers found right now.")
+        st.rerun()
 
 st.markdown("---")
 st.subheader("🟢 Live Open Positions")
-open_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp FROM trades WHERE status='OPEN' ORDER BY id DESC", conn)
-
-stock_filter_open = st.selectbox("Filter Open Positions by Stock:", ["All"] + NIFTY_100, key="open_filter")
-if stock_filter_open != "All":
-    open_df = open_df[open_df['ticker'] == stock_filter_open]
-
-if not open_df.empty:
-    st.dataframe(open_df, use_container_width=True)
-else:
-    st.write("No active trades currently open for this selection.")
+open_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
+if not open_df.empty: st.dataframe(open_df, use_container_width=True)
+else: st.write("No active trades currently open.")
 
 st.markdown("---")
 st.subheader("📚 Stock-Wise Trade History")
-history_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price FROM trades WHERE status!='OPEN' ORDER BY id DESC", conn)
-
-stock_filter_history = st.selectbox("Filter History by Stock:", ["All"] + NIFTY_100, key="hist_filter")
-if stock_filter_history != "All":
-    history_df = history_df[history_df['ticker'] == stock_filter_history]
+history_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
 
 def color_status(val):
     color = '#004d00' if 'WIN' in str(val) else '#660000' if 'LOSS' in str(val) else ''
     return f'background-color: {color}'
 
-if not history_df.empty:
-    try:
-        st.dataframe(history_df.style.map(color_status, subset=['status']), use_container_width=True)
-    except AttributeError:
-        st.dataframe(history_df.style.applymap(color_status, subset=['status']), use_container_width=True)
-else:
-    st.write("No closed trades yet for this selection.")
+if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['status']), use_container_width=True)
+else: st.write("No closed trades yet.")
+
+st.markdown("---")
+with st.expander("🛠️ System Debug Logs (Tap to view)"):
+    logs_df = pd.read_sql_query("SELECT timestamp, message FROM system_logs ORDER BY id DESC LIMIT 15", ui_conn)
+    if not logs_df.empty: st.dataframe(logs_df, use_container_width=True)
+    else: st.write("System operating normally. No errors recorded.")
