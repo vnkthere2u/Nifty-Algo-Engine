@@ -6,8 +6,8 @@ import time
 import requests
 import threading
 import traceback
+import yfinance as yf
 from datetime import datetime, timedelta
-from tvDatafeed import TvDatafeed, Interval
 
 # ==========================================
 # 0. TELEGRAM ALERT SETUP
@@ -27,12 +27,9 @@ def send_telegram_alert(message):
     except: pass
 
 # ==========================================
-# 1. DATABASE SETUP (ANTI-LOCK OPTIMIZED)
+# 1. DATABASE SETUP
 # ==========================================
-tv = TvDatafeed()
-
 def get_db_connection():
-    # Added timeout=20.0 to prevent database deadlock freezes!
     conn = sqlite3.connect('nifty100_live_trades.db', check_same_thread=False, timeout=20.0)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS trades 
@@ -60,7 +57,7 @@ def log_error(message):
         conn.commit()
         conn.close()
     except:
-        pass # Fail silently if logging also hits a lock
+        pass 
 
 NIFTY_100 = [
     'NIFTY', 'BANKNIFTY', 'ABB', 'ADANIENT', 'ADANIGREEN', 'ADANIPORTS', 'ADANIENSOL', 
@@ -79,15 +76,25 @@ NIFTY_100 = [
 ]
 
 # ==========================================
-# 2. CORE STRATEGY LOGIC
+# 2. CORE STRATEGY LOGIC (YAHOO FINANCE ENGINE)
 # ==========================================
+def get_yf_ticker(sym):
+    # Yahoo requires .NS for NSE stocks, and specific codes for indices
+    if sym == 'NIFTY': return '^NSEI'
+    if sym == 'BANKNIFTY': return '^NSEBANK'
+    if sym == 'M_M': return 'M&M.NS'
+    if sym == 'BAJAJ_AUTO': return 'BAJAJ-AUTO.NS'
+    return f"{sym}.NS"
+
 def fetch_and_analyze(ticker):
     try:
-        # Reduced to 200 bars to prevent RAM overload while maintaining perfect EMA math
-        df = tv.get_hist(symbol=ticker, exchange='NSE', interval=Interval.in_15_minute, n_bars=200)
-        if df is None or df.empty: return None
-        df.rename(columns={'open': 'High', 'high': 'High', 'low': 'Low', 'close': 'Close'}, inplace=True)
+        yf_ticker = get_yf_ticker(ticker)
+        # 1mo of 15m data provides exactly the right amount of history for EMA39
+        df = yf.Ticker(yf_ticker).history(interval="15m", period="1mo")
         
+        if df is None or df.empty: return None
+        
+        # Calculate Indicators
         df['EMA5'] = ta.ema(df['Close'], length=5)
         df['EMA39'] = ta.ema(df['Close'], length=39)
         df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
@@ -95,7 +102,7 @@ def fetch_and_analyze(ticker):
         df.dropna(inplace=True)
         return df
     except Exception as e:
-        log_error(f"Data fetch failed for {ticker}: {e}")
+        log_error(f"YFinance fetch failed for {ticker}: {e}")
         return None
 
 def process_market_data():
@@ -114,23 +121,26 @@ def process_market_data():
         last_closed = df.iloc[-2]
         prev_closed = df.iloc[-3]
         
+        # Format the timestamp clearly
+        candle_time = str(last_closed.name).split('+')[0]
+        
         for trade in open_trades:
             trade_id, sig_type, sl, tp = trade
             high_price, low_price = current_candle['High'], current_candle['Low']
             
             if sig_type == 'long':
                 if high_price >= tp:
-                    c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (str(current_candle.name), tp, trade_id))
+                    c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (candle_time, tp, trade_id))
                     send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{ticker} LONG closed at {round(tp, 2)}")
                 elif low_price <= sl:
-                    c.execute("UPDATE trades SET status='SL HIT (LOSS)', exit_time=?, exit_price=? WHERE id=?", (str(current_candle.name), sl, trade_id))
+                    c.execute("UPDATE trades SET status='SL HIT (LOSS)', exit_time=?, exit_price=? WHERE id=?", (candle_time, sl, trade_id))
                     send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{ticker} LONG closed at {round(sl, 2)}")
             elif sig_type == 'short':
                 if low_price <= tp:
-                    c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (str(current_candle.name), tp, trade_id))
+                    c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (candle_time, tp, trade_id))
                     send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{ticker} SHORT closed at {round(tp, 2)}")
                 elif high_price >= sl:
-                    c.execute("UPDATE trades SET status='SL HIT (LOSS)', exit_time=?, exit_price=? WHERE id=?", (str(current_candle.name), sl, trade_id))
+                    c.execute("UPDATE trades SET status='SL HIT (LOSS)', exit_time=?, exit_price=? WHERE id=?", (candle_time, sl, trade_id))
                     send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{ticker} SHORT closed at {round(sl, 2)}")
         conn.commit()
 
@@ -141,7 +151,7 @@ def process_market_data():
         trend = "🟢 Bullish" if ema5 > ema39 else "🔴 Bearish"
         
         c.execute("INSERT OR REPLACE INTO live_market_data (ticker, last_update, close_price, ema5, ema39, trend, distance_pct) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                  (ticker, str(last_closed.name), round(close_p, 2), round(ema5, 2), round(ema39, 2), trend, round(dist_pct, 4)))
+                  (ticker, candle_time, round(close_p, 2), round(ema5, 2), round(ema39, 2), trend, round(dist_pct, 4)))
         conn.commit()
 
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
@@ -152,8 +162,8 @@ def process_market_data():
                 entry = (high + low) / 2
                 sl, tp = entry - atr_val, entry + (3.0 * atr_val)
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (ticker, 'long', str(last_closed.name), round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
-                msg = f"🟢 <b>LONG SIGNAL: {ticker}</b>\nTime: {str(last_closed.name)}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
+                          (ticker, 'long', candle_time, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
+                msg = f"🟢 <b>LONG SIGNAL: {ticker}</b>\nTime: {candle_time}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
                 alerts.append(msg)
                 send_telegram_alert(msg)
                 
@@ -161,8 +171,8 @@ def process_market_data():
                 entry = (high + low) / 2
                 sl, tp = entry + atr_val, entry - (3.0 * atr_val)
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (ticker, 'short', str(last_closed.name), round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
-                msg = f"🔴 <b>SHORT SIGNAL: {ticker}</b>\nTime: {str(last_closed.name)}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
+                          (ticker, 'short', candle_time, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
+                msg = f"🔴 <b>SHORT SIGNAL: {ticker}</b>\nTime: {candle_time}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}"
                 alerts.append(msg)
                 send_telegram_alert(msg)
                 
@@ -224,7 +234,7 @@ if engine_running:
     st.sidebar.success("✅ Background Engine is LIVE.")
 
 if st.sidebar.button("Force Manual Scan Now"):
-    with st.spinner("Fetching data and calculating EMAs... Please wait ~60 seconds."):
+    with st.spinner("Pulling fresh data from Yahoo Finance..."):
         new_alerts = process_market_data()
         if new_alerts:
             for alert in new_alerts: signal_placeholder.success(alert.replace("<b>", "").replace("</b>", ""))
