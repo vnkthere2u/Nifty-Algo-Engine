@@ -296,12 +296,22 @@ def apply_heatmap(val):
     return ''
 
 if not live_df.empty:
-    # UPDATED: width='stretch' to fix Streamlit deprecation warning
     st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), width='stretch', hide_index=True)
 else:
     st.write("Waiting for data sync...")
 
-# --- 3. INTERACTIVE CHARTING MODULE ---
+# --- NEW: EDUCATIONAL NOTES FOR METRICS ---
+st.markdown("""
+**📝 How to use the Advanced Metrics:**
+* **1-Hour Trend:** This shows the broader market direction. 
+    * *Pro Tip:* If your 15m signal says '🟢 Bullish' but the 1H Trend is '🔴 Bearish', you are trading against the larger trend. The safest and most explosive trades occur when the 15m signal and 1H Trend match.
+* **Vol Surge (x):** This compares current trading volume to the 20-candle average.
+    * *~ 1.0x* = Normal, average volume.
+    * *> 1.5x* = Heavy volume. Smart money/institutions are stepping in, making the crossover signal highly reliable.
+    * *< 0.8x* = Low volume. Beware of fake breakouts or market chop.
+""")
+
+# --- 3. INTERACTIVE CHARTING MODULE (GAP FIX APPLIED) ---
 st.markdown("---")
 st.subheader("📈 Institutional Chart Terminal")
 if not live_df.empty:
@@ -317,12 +327,16 @@ if not live_df.empty:
                     chart_df['EMA5'] = ta.ema(chart_df['Close'], length=5)
                     chart_df['EMA39'] = ta.ema(chart_df['Close'], length=39)
                     
+                    # FIXED: Converting datetime to strings forces Plotly to ignore market closed hours and weekends
+                    time_labels = chart_df.index.strftime('%b %d, %H:%M')
+                    
                     fig = go.Figure(data=[go.Candlestick(
-                        x=chart_df.index, open=chart_df['Open'], high=chart_df['High'], 
+                        x=time_labels, open=chart_df['Open'], high=chart_df['High'], 
                         low=chart_df['Low'], close=chart_df['Close'], name="Candles"
                     )])
-                    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'))
-                    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'))
+                    fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'))
+                    fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'))
+                    
                     fig.update_layout(
                         title=f"{selected_stock} | 15m Timeframe",
                         template="plotly_dark",
@@ -330,7 +344,9 @@ if not live_df.empty:
                         margin=dict(l=0, r=0, t=40, b=0),
                         height=500
                     )
-                    # UPDATED: width='stretch' to fix Streamlit deprecation warning
+                    # Tell Plotly to treat x-axis as discrete categories (removes all gaps automatically)
+                    fig.update_xaxes(type='category', nticks=10)
+                    
                     st.plotly_chart(fig, width='stretch')
             except Exception as e:
                 st.error("Chart data unavailable at this exact moment. Please try again in a minute.")
@@ -339,11 +355,8 @@ if not live_df.empty:
 st.markdown("---")
 st.subheader("🟢 Live Open Positions")
 open_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
-if not open_df.empty: 
-    # UPDATED: width='stretch'
-    st.dataframe(open_df, width='stretch')
-else: 
-    st.write("No active trades currently open.")
+if not open_df.empty: st.dataframe(open_df, width='stretch')
+else: st.write("No active trades currently open.")
 
 # --- 5. TRADE HISTORY ---
 with st.expander("📚 View Closed Trade History"):
@@ -352,8 +365,5 @@ with st.expander("📚 View Closed Trade History"):
         if 'WIN' in str(val): return 'background-color: rgba(0, 255, 0, 0.2)'
         elif 'LOSS' in str(val): return 'background-color: rgba(255, 0, 0, 0.2)'
         return ''
-    if not history_df.empty: 
-        # UPDATED: width='stretch'
-        st.dataframe(history_df.style.map(color_status, subset=['status']), width='stretch')
-    else: 
-        st.write("No closed trades yet.")
+    if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['status']), width='stretch')
+    else: st.write("No closed trades yet.")
