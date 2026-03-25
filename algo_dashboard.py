@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import pandas_ta as ta
 import sqlite3
 import time
@@ -117,8 +118,9 @@ def fetch_and_analyze(item):
     global tv
     df = None
     
+    # 1. TradingView Primary Engine
     try:
-        df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=200)
+        df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
         if df_tv is not None and not df_tv.empty:
             df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
             df = df_tv
@@ -126,19 +128,26 @@ def fetch_and_analyze(item):
         try: tv = TvDatafeed() 
         except: pass
 
+    # 2. Yahoo Finance Fallback Engine
     if df is None or df.empty:
         try:
-            df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="5d")
+            # FIX: Pulled 20 days so Indian stocks have > 156 candles for the 1H proxy math
+            df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="20d")
             if df_yf is not None and not df_yf.empty:
                 df_yf.index = df_yf.index.tz_localize(None)
                 df = df_yf
         except Exception:
             pass
 
+    # 3. Mathematical Calculations & Sanitization
     if df is not None and not df.empty:
         try:
+            # Force everything to numbers
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+            # FIX: Forward-fill micro-gaps before math to prevent EMA/ATR crashes
+            df[['Open', 'High', 'Low', 'Close']] = df[['Open', 'High', 'Low', 'Close']].ffill()
             df.dropna(subset=['Close', 'High', 'Low'], inplace=True) 
             
             df['EMA5'] = ta.ema(df['Close'], length=5)
@@ -147,18 +156,23 @@ def fetch_and_analyze(item):
             df['EMA20'] = ta.ema(df['Close'], length=20)
             df['EMA156'] = ta.ema(df['Close'], length=156)
             
-            try:
-                df['ADX'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14']
-            except:
+            # ADX Chop Filter (Sanitized)
+            adx_data = ta.adx(df['High'], df['Low'], df['Close'], length=14)
+            if adx_data is not None and not adx_data.empty:
+                df['ADX'] = adx_data.iloc[:, 0].ffill().fillna(0.0)
+            else:
                 df['ADX'] = 0.0
             
+            # Volume Surge (Vectorized for high speed)
             if 'Volume' in df.columns:
+                df['Volume'] = df['Volume'].fillna(0)
                 df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-                df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20']
+                df['Vol_Ratio'] = np.where(df['Vol_MA20'] > 0, df['Volume'] / df['Vol_MA20'], 1.0)
             else:
                 df['Vol_Ratio'] = 1.0 
                 
-            df.dropna(inplace=True)
+            # Safely drop rows only if the EMAs couldn't calculate
+            df.dropna(subset=['EMA156', 'EMA39', 'EMA5', 'ATR'], inplace=True)
             if len(df) >= 5: return df
         except Exception as e:
             log_error(f"Math Error on {item['name']}: {e}")
@@ -179,9 +193,6 @@ def process_market_data():
         open_trades = c.fetchall()
         
         ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-        # ---------------------------------------------------------------------------------
-        # BUG FIX: Added %Y-%m-%d to the time string so Date is captured in the database
-        # ---------------------------------------------------------------------------------
         scan_time_str = ist_now.strftime("%Y-%m-%d %I:%M %p (IST)")
         
         current_candle = df.iloc[-1]
@@ -191,7 +202,7 @@ def process_market_data():
         trend = "🟢 Bullish" if current_candle['EMA5'] > current_candle['EMA39'] else "🔴 Bearish"
         htf_trend = "🟢 Bullish" if current_candle['EMA20'] > current_candle['EMA156'] else "🔴 Bearish"
         vol_ratio = current_candle['Vol_Ratio']
-        adx_val = current_candle.get('ADX', 0.0)
+        adx_val = current_candle['ADX']
         
         for trade in open_trades:
             trade_id, sig_type, sl, tp = trade
@@ -238,11 +249,13 @@ def process_market_data():
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
         atr_val = last_closed['ATR']
         
+        # Chop Filter Enforced
         is_trending = last_closed.get('ADX', 0.0) > 20.0
         
         if len(open_trades) == 0 and is_trending:
             if long_cross and htf_trend == "🟢 Bullish":
                 entry = last_closed['Close']
+                # 1:3 RR Logic Enforced
                 sl, tp = entry - (1.5 * atr_val), entry + (4.5 * atr_val)
                 
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -253,6 +266,7 @@ def process_market_data():
                 
             elif short_cross and htf_trend == "🔴 Bearish":
                 entry = last_closed['Close']
+                # 1:3 RR Logic Enforced
                 sl, tp = entry + (1.5 * atr_val), entry - (4.5 * atr_val)
                 
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -265,7 +279,7 @@ def process_market_data():
         time.sleep(1) 
         
     c.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 500)")
-    # Also added the date to the system status tracker
+    
     status_time_str = ist_now.strftime("%Y-%m-%d %I:%M %p (IST)")
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (status_time_str,))
     conn.commit()
@@ -312,6 +326,7 @@ if st.sidebar.button("🔄 Force Manual Data Sync"):
         st.rerun()
 
 st.sidebar.markdown("---")
+# LEAVE THIS ALONE - Do not click it so you preserve your logs and positions!
 if st.sidebar.button("⚠️ Factory Reset Database"):
     ui_c.execute("DROP TABLE IF EXISTS trades")
     ui_c.execute("DROP TABLE IF EXISTS live_market_data")
@@ -358,6 +373,14 @@ with tab1:
         st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), width='stretch', hide_index=True)
     else:
         st.info("Waiting for first data sync...")
+
+    with st.expander("📝 How to read the Advanced Context Metrics"):
+        st.markdown("""
+        * **1-Hour Trend:** Must match the 15-minute trend for a trade to execute.
+        * **ADX (Trend Strength):** Must be **> 20.0** for a trade to execute. If it's below 20, the market is chopping sideways and will destroy stop losses.
+        * **Vol Surge (x):** Compares current 15m volume to the 20-candle average (> 1.5x = Heavy institutional volume).
+        * **Risk Management Update:** Trades now execute at a strict **1:3 Risk/Reward** ratio utilizing a 1.5x ATR dynamic Stop Loss for breathing room.
+        """)
 
 with tab2:
     st.markdown("<h3>Institutional Chart Terminal</h3>", unsafe_allow_html=True)
