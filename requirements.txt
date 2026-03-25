@@ -4,3 +4,4 @@ pandas-ta==0.4.71b0
 requests
 yfinance
 tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git
+plotly
