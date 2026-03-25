@@ -16,7 +16,6 @@ from tvDatafeed import TvDatafeed, Interval
 # ==========================================
 st.set_page_config(page_title="Alpha Engine Terminal", layout="wide", initial_sidebar_state="expanded")
 
-# Custom CSS to reduce header sizes, tighten padding, and make it look institutional
 st.markdown("""
     <style>
         .block-container { padding-top: 1rem; padding-bottom: 1rem; }
@@ -65,8 +64,16 @@ def get_db_connection():
 
     c.execute('''CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, value TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS system_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
+    
     c.execute('''CREATE TABLE IF NOT EXISTS live_market_data 
                  (ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL, ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL, htf_trend TEXT, vol_ratio REAL)''')
+    
+    try:
+        c.execute("ALTER TABLE live_market_data ADD COLUMN adx REAL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     return conn
 
@@ -104,7 +111,7 @@ WATCHLIST = [
 tv = TvDatafeed()
 
 # ==========================================
-# 3. DUAL-ENGINE LOGIC & NEW DATA CAPTURE
+# 3. DUAL-ENGINE LOGIC & ADVANCED MATH
 # ==========================================
 def fetch_and_analyze(item):
     global tv
@@ -140,6 +147,11 @@ def fetch_and_analyze(item):
             df['EMA20'] = ta.ema(df['Close'], length=20)
             df['EMA156'] = ta.ema(df['Close'], length=156)
             
+            try:
+                df['ADX'] = ta.adx(df['High'], df['Low'], df['Close'], length=14)['ADX_14']
+            except:
+                df['ADX'] = 0.0
+            
             if 'Volume' in df.columns:
                 df['Vol_MA20'] = df['Volume'].rolling(20).mean()
                 df['Vol_Ratio'] = df['Volume'] / df['Vol_MA20']
@@ -167,7 +179,10 @@ def process_market_data():
         open_trades = c.fetchall()
         
         ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-        scan_time_str = ist_now.strftime("%I:%M:%S %p (IST)")
+        # ---------------------------------------------------------------------------------
+        # BUG FIX: Added %Y-%m-%d to the time string so Date is captured in the database
+        # ---------------------------------------------------------------------------------
+        scan_time_str = ist_now.strftime("%Y-%m-%d %I:%M %p (IST)")
         
         current_candle = df.iloc[-1]
         last_closed = df.iloc[-2]
@@ -176,6 +191,7 @@ def process_market_data():
         trend = "🟢 Bullish" if current_candle['EMA5'] > current_candle['EMA39'] else "🔴 Bearish"
         htf_trend = "🟢 Bullish" if current_candle['EMA20'] > current_candle['EMA156'] else "🔴 Bearish"
         vol_ratio = current_candle['Vol_Ratio']
+        adx_val = current_candle.get('ADX', 0.0)
         
         for trade in open_trades:
             trade_id, sig_type, sl, tp = trade
@@ -184,10 +200,10 @@ def process_market_data():
             if sig_type == 'long':
                 if current_open >= tp:
                     c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
-                    send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)} (Slippage in your favor!)")
+                    send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)}")
                 elif current_open <= sl:
                     c.execute("UPDATE trades SET status='SL HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
-                    send_telegram_alert(f"🛑 <b>GAP DOWN STOP LOSS</b>\n{name} LONG closed at {round(current_open, 2)} (Negative Slippage)")
+                    send_telegram_alert(f"🛑 <b>GAP DOWN STOP LOSS</b>\n{name} LONG closed at {round(current_open, 2)}")
                 elif current_high >= tp:
                     c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
                     send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} LONG closed at {round(tp, 2)}")
@@ -198,10 +214,10 @@ def process_market_data():
             elif sig_type == 'short':
                 if current_open <= tp:
                     c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
-                    send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)} (Slippage in your favor!)")
+                    send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)}")
                 elif current_open >= sl:
                     c.execute("UPDATE trades SET status='SL HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
-                    send_telegram_alert(f"🛑 <b>GAP UP STOP LOSS</b>\n{name} SHORT closed at {round(current_open, 2)} (Negative Slippage)")
+                    send_telegram_alert(f"🛑 <b>GAP UP STOP LOSS</b>\n{name} SHORT closed at {round(current_open, 2)}")
                 elif current_low <= tp:
                     c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
                     send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} SHORT closed at {round(tp, 2)}")
@@ -214,30 +230,34 @@ def process_market_data():
         ema5_live, ema39_live = current_candle['EMA5'], current_candle['EMA39']
         dist_pct = abs(ema5_live - ema39_live) / ema39_live * 100
         
-        c.execute("INSERT OR REPLACE INTO live_market_data (ticker, last_update, close_price, ema5, ema39, trend, distance_pct, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                  (name, scan_time_str, round(latest_price, 2), round(ema5_live, 2), round(ema39_live, 2), trend, round(dist_pct, 4), htf_trend, round(vol_ratio, 2)))
+        c.execute("INSERT OR REPLACE INTO live_market_data (ticker, last_update, close_price, ema5, ema39, trend, distance_pct, htf_trend, vol_ratio, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  (name, scan_time_str, round(latest_price, 2), round(ema5_live, 2), round(ema39_live, 2), trend, round(dist_pct, 4), htf_trend, round(vol_ratio, 2), round(adx_val, 2)))
         conn.commit()
 
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
         atr_val = last_closed['ATR']
         
-        if len(open_trades) == 0:
-            if long_cross:
+        is_trending = last_closed.get('ADX', 0.0) > 20.0
+        
+        if len(open_trades) == 0 and is_trending:
+            if long_cross and htf_trend == "🟢 Bullish":
                 entry = last_closed['Close']
-                sl, tp = entry - atr_val, entry + (3.0 * atr_val)
+                sl, tp = entry - (1.5 * atr_val), entry + (4.5 * atr_val)
+                
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                           (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
-                msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x"
+                msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX Strength: {round(adx_val, 1)}"
                 alerts.append(msg)
                 send_telegram_alert(msg)
                 
-            elif short_cross:
+            elif short_cross and htf_trend == "🔴 Bearish":
                 entry = last_closed['Close']
-                sl, tp = entry + atr_val, entry - (3.0 * atr_val)
+                sl, tp = entry + (1.5 * atr_val), entry - (4.5 * atr_val)
+                
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                           (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
-                msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x"
+                msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX Strength: {round(adx_val, 1)}"
                 alerts.append(msg)
                 send_telegram_alert(msg)
                 
@@ -245,7 +265,9 @@ def process_market_data():
         time.sleep(1) 
         
     c.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 500)")
-    c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (ist_now.strftime("%I:%M:%S %p (IST)"),))
+    # Also added the date to the system status tracker
+    status_time_str = ist_now.strftime("%Y-%m-%d %I:%M %p (IST)")
+    c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (status_time_str,))
     conn.commit()
     conn.close()
     return alerts
@@ -315,15 +337,14 @@ col_c.metric("Active Watchlist Size", len(WATCHLIST))
 
 st.markdown("---")
 
-# --- TABBED INTERFACE FOR CLEAN UX ---
+# --- TABBED INTERFACE ---
 tab1, tab2, tab3, tab4 = st.tabs(["🔥 Live Heatmap", "📈 Advanced Chart", "🟢 Open Positions", "📚 Trade History"])
 
-# --- TAB 1: HEATMAP ---
 with tab1:
     st.markdown("<h3>Imminent Crossover Heatmap</h3>", unsafe_allow_html=True)
     st.markdown("<p style='font-size:0.9rem; color:gray;'><b>Legend:</b> 🔴 Red < 0.1% Gap (Imminent) | 🟠 Orange < 0.5% Gap (Watch Closely)</p>", unsafe_allow_html=True)
 
-    live_df = pd.read_sql_query("SELECT ticker as Asset, close_price as 'Latest Price', distance_pct as '% Gap', ema5 as 'EMA 5', ema39 as 'EMA 39', trend as '15m Trend', htf_trend as '1-Hour Trend', vol_ratio as 'Vol Surge (x)', last_update as 'Time (IST)' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
+    live_df = pd.read_sql_query("SELECT ticker as Asset, close_price as 'Latest Price', distance_pct as '% Gap', trend as '15m Trend', htf_trend as '1H Trend', vol_ratio as 'Vol (x)', adx as 'ADX', last_update as 'Time (IST)' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
 
     def apply_heatmap(val):
         if pd.isna(val): return ''
@@ -338,16 +359,6 @@ with tab1:
     else:
         st.info("Waiting for first data sync...")
 
-    with st.expander("📝 How to read the Advanced Context Metrics"):
-        st.markdown("""
-        * **1-Hour Trend:** Represents the broader market momentum. Trading *with* this trend greatly increases win probability.
-        * **Vol Surge (x):** Compares current 15m volume to the 20-candle average. 
-            * **~ 1.0x** = Normal volume.
-            * **> 1.5x** = Heavy institutional volume (validates a crossover).
-            * **< 0.8x** = Low volume (higher risk of a fakeout).
-        """)
-
-# --- TAB 2: INTERACTIVE CHART ---
 with tab2:
     st.markdown("<h3>Institutional Chart Terminal</h3>", unsafe_allow_html=True)
     if not live_df.empty:
@@ -389,7 +400,6 @@ with tab2:
                 except Exception:
                     st.error("Chart data unavailable right now. Try again shortly.")
 
-# --- TAB 3: OPEN POSITIONS ---
 with tab3:
     st.markdown("<h3>Active Open Positions</h3>", unsafe_allow_html=True)
     open_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
@@ -398,7 +408,6 @@ with tab3:
     else: 
         st.info("No active trades currently open.")
 
-# --- TAB 4: TRADE HISTORY ---
 with tab4:
     st.markdown("<h3>Closed Trade Ledger</h3>", unsafe_allow_html=True)
     history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
