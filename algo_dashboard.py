@@ -12,7 +12,24 @@ from datetime import datetime, timedelta, timezone
 from tvDatafeed import TvDatafeed, Interval
 
 # ==========================================
-# 0. TELEGRAM ALERT SETUP
+# 0. UI INITIALIZATION & CUSTOM CSS
+# ==========================================
+st.set_page_config(page_title="Alpha Engine Terminal", layout="wide", initial_sidebar_state="expanded")
+
+# Custom CSS to reduce header sizes, tighten padding, and make it look institutional
+st.markdown("""
+    <style>
+        .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+        h1 { font-size: 1.8rem !important; margin-bottom: 0px; padding-bottom: 0px; font-weight: 600; }
+        h2 { font-size: 1.2rem !important; font-weight: 500; color: #888; margin-top: 0px; padding-top: 0px; }
+        h3 { font-size: 1.1rem !important; font-weight: 600; }
+        .stTabs [data-baseweb="tab-list"] { gap: 24px; }
+        .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; padding-top: 10px; padding-bottom: 10px; }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==========================================
+# 1. TELEGRAM ALERT SETUP
 # ==========================================
 try:
     TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
@@ -29,7 +46,7 @@ def send_telegram_alert(message):
     except: pass
 
 # ==========================================
-# 1. DATABASE SETUP
+# 2. DATABASE SETUP & SAFE MIGRATION
 # ==========================================
 def get_db_connection():
     conn = sqlite3.connect('nifty_live_trades.db', check_same_thread=False, timeout=30.0)
@@ -38,10 +55,16 @@ def get_db_connection():
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
                  entry_time TEXT, entry_price REAL, sl REAL, tp REAL, status TEXT, 
                  exit_time TEXT, exit_price REAL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS system_status 
-                 (key TEXT PRIMARY KEY, value TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS system_logs 
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
+    
+    try:
+        c.execute("ALTER TABLE trades ADD COLUMN htf_trend TEXT")
+        c.execute("ALTER TABLE trades ADD COLUMN vol_ratio REAL")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass 
+
+    c.execute('''CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, value TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS system_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS live_market_data 
                  (ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL, ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL, htf_trend TEXT, vol_ratio REAL)''')
     conn.commit()
@@ -81,7 +104,7 @@ WATCHLIST = [
 tv = TvDatafeed()
 
 # ==========================================
-# 2. DUAL-ENGINE LOGIC & NEW DATA CAPTURE
+# 3. DUAL-ENGINE LOGIC & NEW DATA CAPTURE
 # ==========================================
 def fetch_and_analyze(item):
     global tv
@@ -92,7 +115,7 @@ def fetch_and_analyze(item):
         if df_tv is not None and not df_tv.empty:
             df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
             df = df_tv
-    except Exception as e:
+    except Exception:
         try: tv = TvDatafeed() 
         except: pass
 
@@ -102,21 +125,18 @@ def fetch_and_analyze(item):
             if df_yf is not None and not df_yf.empty:
                 df_yf.index = df_yf.index.tz_localize(None)
                 df = df_yf
-        except Exception as e:
+        except Exception:
             pass
 
     if df is not None and not df.empty:
         try:
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-            
+                if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
             df.dropna(subset=['Close', 'High', 'Low'], inplace=True) 
             
             df['EMA5'] = ta.ema(df['Close'], length=5)
             df['EMA39'] = ta.ema(df['Close'], length=39)
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-            
             df['EMA20'] = ta.ema(df['Close'], length=20)
             df['EMA156'] = ta.ema(df['Close'], length=156)
             
@@ -153,22 +173,39 @@ def process_market_data():
         last_closed = df.iloc[-2]
         prev_closed = df.iloc[-3]
         
+        trend = "🟢 Bullish" if current_candle['EMA5'] > current_candle['EMA39'] else "🔴 Bearish"
+        htf_trend = "🟢 Bullish" if current_candle['EMA20'] > current_candle['EMA156'] else "🔴 Bearish"
+        vol_ratio = current_candle['Vol_Ratio']
+        
         for trade in open_trades:
             trade_id, sig_type, sl, tp = trade
-            high_price, low_price = current_candle['High'], current_candle['Low']
+            current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
             
             if sig_type == 'long':
-                if high_price >= tp:
+                if current_open >= tp:
+                    c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
+                    send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)} (Slippage in your favor!)")
+                elif current_open <= sl:
+                    c.execute("UPDATE trades SET status='SL HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
+                    send_telegram_alert(f"🛑 <b>GAP DOWN STOP LOSS</b>\n{name} LONG closed at {round(current_open, 2)} (Negative Slippage)")
+                elif current_high >= tp:
                     c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
                     send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} LONG closed at {round(tp, 2)}")
-                elif low_price <= sl:
+                elif current_low <= sl:
                     c.execute("UPDATE trades SET status='SL HIT (LOSS)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, sl, trade_id))
                     send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{name} LONG closed at {round(sl, 2)}")
+                    
             elif sig_type == 'short':
-                if low_price <= tp:
+                if current_open <= tp:
+                    c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
+                    send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)} (Slippage in your favor!)")
+                elif current_open >= sl:
+                    c.execute("UPDATE trades SET status='SL HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
+                    send_telegram_alert(f"🛑 <b>GAP UP STOP LOSS</b>\n{name} SHORT closed at {round(current_open, 2)} (Negative Slippage)")
+                elif current_low <= tp:
                     c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
                     send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} SHORT closed at {round(tp, 2)}")
-                elif high_price >= sl:
+                elif current_high >= sl:
                     c.execute("UPDATE trades SET status='SL HIT (LOSS)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, sl, trade_id))
                     send_telegram_alert(f"🛑 <b>STOP LOSS HIT</b>\n{name} SHORT closed at {round(sl, 2)}")
         conn.commit()
@@ -176,10 +213,6 @@ def process_market_data():
         latest_price = current_candle['Close']
         ema5_live, ema39_live = current_candle['EMA5'], current_candle['EMA39']
         dist_pct = abs(ema5_live - ema39_live) / ema39_live * 100
-        
-        trend = "🟢 Bullish" if ema5_live > ema39_live else "🔴 Bearish"
-        htf_trend = "🟢 Bullish" if current_candle['EMA20'] > current_candle['EMA156'] else "🔴 Bearish"
-        vol_ratio = current_candle['Vol_Ratio']
         
         c.execute("INSERT OR REPLACE INTO live_market_data (ticker, last_update, close_price, ema5, ema39, trend, distance_pct, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                   (name, scan_time_str, round(latest_price, 2), round(ema5_live, 2), round(ema39_live, 2), trend, round(dist_pct, 4), htf_trend, round(vol_ratio, 2)))
@@ -193,8 +226,8 @@ def process_market_data():
             if long_cross:
                 entry = last_closed['Close']
                 sl, tp = entry - atr_val, entry + (3.0 * atr_val)
-                c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
+                c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
                 msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x"
                 alerts.append(msg)
                 send_telegram_alert(msg)
@@ -202,8 +235,8 @@ def process_market_data():
             elif short_cross:
                 entry = last_closed['Close']
                 sl, tp = entry + atr_val, entry - (3.0 * atr_val)
-                c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                          (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN'))
+                c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
                 msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x"
                 alerts.append(msg)
                 send_telegram_alert(msg)
@@ -218,10 +251,10 @@ def process_market_data():
     return alerts
 
 # ==========================================
-# 3. STREAMLIT DASHBOARD UI
+# 4. STREAMLIT DASHBOARD UI
 # ==========================================
-st.set_page_config(page_title="Institutional Algo Engine", layout="wide")
-st.title("⚡ Quantitative Alpha Engine")
+st.markdown("<h1>⚡ Quantitative Alpha Engine</h1>", unsafe_allow_html=True)
+st.markdown("<h2>Institutional 15m EMA Tracker • Multi-Asset 24/5 Monitoring</h2>", unsafe_allow_html=True)
 
 ui_conn = get_db_connection()
 ui_c = ui_conn.cursor()
@@ -239,8 +272,9 @@ def start_background_scanner():
 
 engine_running = start_background_scanner()
 
-st.sidebar.header("Control Panel")
-if engine_running: st.sidebar.success("✅ Engine LIVE (Scanning 24/5)")
+# --- SIDEBAR CONTROL PANEL ---
+st.sidebar.markdown("<h3>⚙️ Control Panel</h3>", unsafe_allow_html=True)
+if engine_running: st.sidebar.success("✅ Background Daemon is LIVE")
 
 ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
 last_scan_row = ui_c.fetchone()
@@ -250,11 +284,12 @@ if st.sidebar.button("🔔 Send Test Telegram Alert"):
     send_telegram_alert("🟢 <b>TEST ALERT</b>\nSystem is online and tracking 18 assets.")
     st.sidebar.success("Test alert sent!")
 
-if st.sidebar.button("Force Manual Scan"):
+if st.sidebar.button("🔄 Force Manual Data Sync"):
     with st.spinner("Executing Data Sync..."):
         process_market_data()
         st.rerun()
 
+st.sidebar.markdown("---")
 if st.sidebar.button("⚠️ Factory Reset Database"):
     ui_c.execute("DROP TABLE IF EXISTS trades")
     ui_c.execute("DROP TABLE IF EXISTS live_market_data")
@@ -265,9 +300,7 @@ if st.sidebar.button("⚠️ Factory Reset Database"):
     time.sleep(1)
     st.rerun()
 
-# --- 1. PERFORMANCE ANALYTICS TOP BAR ---
-st.markdown("---")
-st.subheader("📊 System Analytics")
+# --- TOP LEVEL METRICS ---
 closed_trades = pd.read_sql_query("SELECT * FROM trades WHERE status!='OPEN'", ui_conn)
 col_a, col_b, col_c = st.columns(3)
 if not closed_trades.empty:
@@ -280,90 +313,100 @@ else:
     col_b.metric("Historical Win Rate", "0.0%")
 col_c.metric("Active Watchlist Size", len(WATCHLIST))
 
-# --- 2. LIVE HEATMAP TABLE ---
 st.markdown("---")
-st.subheader("🔥 Imminent Crossover Heatmap")
-st.info("Color Legend: 🔴 Red < 0.1% Gap (Imminent Cross) | 🟠 Orange < 0.5% Gap (Watch Closely)")
 
-live_df = pd.read_sql_query("SELECT ticker as Asset, close_price as 'Latest Price', distance_pct as '% Gap', ema5 as 'EMA 5', ema39 as 'EMA 39', trend as '15m Trend', htf_trend as '1-Hour Trend', vol_ratio as 'Vol Surge (x)', last_update as 'Time (IST)' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
+# --- TABBED INTERFACE FOR CLEAN UX ---
+tab1, tab2, tab3, tab4 = st.tabs(["🔥 Live Heatmap", "📈 Advanced Chart", "🟢 Open Positions", "📚 Trade History"])
 
-def apply_heatmap(val):
-    if pd.isna(val): return ''
-    try:
-        if float(val) < 0.10: return 'background-color: rgba(255, 0, 0, 0.4); color: white;'
-        elif float(val) < 0.50: return 'background-color: rgba(255, 165, 0, 0.4); color: white;'
-    except: pass
-    return ''
+# --- TAB 1: HEATMAP ---
+with tab1:
+    st.markdown("<h3>Imminent Crossover Heatmap</h3>", unsafe_allow_html=True)
+    st.markdown("<p style='font-size:0.9rem; color:gray;'><b>Legend:</b> 🔴 Red < 0.1% Gap (Imminent) | 🟠 Orange < 0.5% Gap (Watch Closely)</p>", unsafe_allow_html=True)
 
-if not live_df.empty:
-    st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), width='stretch', hide_index=True)
-else:
-    st.write("Waiting for data sync...")
+    live_df = pd.read_sql_query("SELECT ticker as Asset, close_price as 'Latest Price', distance_pct as '% Gap', ema5 as 'EMA 5', ema39 as 'EMA 39', trend as '15m Trend', htf_trend as '1-Hour Trend', vol_ratio as 'Vol Surge (x)', last_update as 'Time (IST)' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
 
-# --- NEW: EDUCATIONAL NOTES FOR METRICS ---
-st.markdown("""
-**📝 How to use the Advanced Metrics:**
-* **1-Hour Trend:** This shows the broader market direction. 
-    * *Pro Tip:* If your 15m signal says '🟢 Bullish' but the 1H Trend is '🔴 Bearish', you are trading against the larger trend. The safest and most explosive trades occur when the 15m signal and 1H Trend match.
-* **Vol Surge (x):** This compares current trading volume to the 20-candle average.
-    * *~ 1.0x* = Normal, average volume.
-    * *> 1.5x* = Heavy volume. Smart money/institutions are stepping in, making the crossover signal highly reliable.
-    * *< 0.8x* = Low volume. Beware of fake breakouts or market chop.
-""")
+    def apply_heatmap(val):
+        if pd.isna(val): return ''
+        try:
+            if float(val) < 0.10: return 'background-color: rgba(255, 0, 0, 0.4); color: white;'
+            elif float(val) < 0.50: return 'background-color: rgba(255, 165, 0, 0.4); color: white;'
+        except: pass
+        return ''
 
-# --- 3. INTERACTIVE CHARTING MODULE (GAP FIX APPLIED) ---
-st.markdown("---")
-st.subheader("📈 Institutional Chart Terminal")
-if not live_df.empty:
-    selected_stock = st.selectbox("Select an asset to render the live interactive chart:", ["-- Select an Asset --"] + sorted(live_df['Asset'].tolist()))
-    if selected_stock != "-- Select an Asset --":
-        yf_symbol = next(item['yf_symbol'] for item in WATCHLIST if item['name'] == selected_stock)
-        
-        with st.spinner(f"Loading live order book for {selected_stock}..."):
-            try:
-                chart_df = yf.Ticker(yf_symbol).history(interval="15m", period="3d")
-                if not chart_df.empty:
-                    chart_df.index = chart_df.index.tz_localize(None)
-                    chart_df['EMA5'] = ta.ema(chart_df['Close'], length=5)
-                    chart_df['EMA39'] = ta.ema(chart_df['Close'], length=39)
-                    
-                    # FIXED: Converting datetime to strings forces Plotly to ignore market closed hours and weekends
-                    time_labels = chart_df.index.strftime('%b %d, %H:%M')
-                    
-                    fig = go.Figure(data=[go.Candlestick(
-                        x=time_labels, open=chart_df['Open'], high=chart_df['High'], 
-                        low=chart_df['Low'], close=chart_df['Close'], name="Candles"
-                    )])
-                    fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'))
-                    fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'))
-                    
-                    fig.update_layout(
-                        title=f"{selected_stock} | 15m Timeframe",
-                        template="plotly_dark",
-                        xaxis_rangeslider_visible=False,
-                        margin=dict(l=0, r=0, t=40, b=0),
-                        height=500
-                    )
-                    # Tell Plotly to treat x-axis as discrete categories (removes all gaps automatically)
-                    fig.update_xaxes(type='category', nticks=10)
-                    
-                    st.plotly_chart(fig, width='stretch')
-            except Exception as e:
-                st.error("Chart data unavailable at this exact moment. Please try again in a minute.")
+    if not live_df.empty:
+        st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), width='stretch', hide_index=True)
+    else:
+        st.info("Waiting for first data sync...")
 
-# --- 4. LIVE OPEN POSITIONS ---
-st.markdown("---")
-st.subheader("🟢 Live Open Positions")
-open_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
-if not open_df.empty: st.dataframe(open_df, width='stretch')
-else: st.write("No active trades currently open.")
+    with st.expander("📝 How to read the Advanced Context Metrics"):
+        st.markdown("""
+        * **1-Hour Trend:** Represents the broader market momentum. Trading *with* this trend greatly increases win probability.
+        * **Vol Surge (x):** Compares current 15m volume to the 20-candle average. 
+            * **~ 1.0x** = Normal volume.
+            * **> 1.5x** = Heavy institutional volume (validates a crossover).
+            * **< 0.8x** = Low volume (higher risk of a fakeout).
+        """)
 
-# --- 5. TRADE HISTORY ---
-with st.expander("📚 View Closed Trade History"):
-    history_df = pd.read_sql_query("SELECT ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
+# --- TAB 2: INTERACTIVE CHART ---
+with tab2:
+    st.markdown("<h3>Institutional Chart Terminal</h3>", unsafe_allow_html=True)
+    if not live_df.empty:
+        selected_stock = st.selectbox("Select an asset to render:", ["-- Select an Asset --"] + sorted(live_df['Asset'].tolist()), label_visibility="collapsed")
+        if selected_stock != "-- Select an Asset --":
+            yf_symbol = next(item['yf_symbol'] for item in WATCHLIST if item['name'] == selected_stock)
+            
+            with st.spinner(f"Loading order book for {selected_stock}..."):
+                try:
+                    chart_df = yf.Ticker(yf_symbol).history(interval="15m", period="3d")
+                    if not chart_df.empty:
+                        if chart_df.index.tz is not None:
+                            chart_df.index = chart_df.index.tz_convert('Asia/Kolkata').tz_localize(None)
+                        else:
+                            chart_df.index = chart_df.index + timedelta(hours=5, minutes=30)
+                            
+                        chart_df['EMA5'] = ta.ema(chart_df['Close'], length=5)
+                        chart_df['EMA39'] = ta.ema(chart_df['Close'], length=39)
+                        
+                        time_labels = chart_df.index.strftime('%b %d, %H:%M')
+                        
+                        fig = go.Figure(data=[go.Candlestick(
+                            x=time_labels, open=chart_df['Open'], high=chart_df['High'], 
+                            low=chart_df['Low'], close=chart_df['Close'], name="Price"
+                        )])
+                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'))
+                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'))
+                        
+                        fig.update_layout(
+                            title=f"{selected_stock} | 15m Timeframe (IST)",
+                            template="plotly_dark",
+                            xaxis_rangeslider_visible=False,
+                            margin=dict(l=0, r=0, t=40, b=0),
+                            height=550,
+                            hovermode="x unified"
+                        )
+                        fig.update_xaxes(type='category', nticks=12, tickangle=-45)
+                        st.plotly_chart(fig, width='stretch')
+                except Exception:
+                    st.error("Chart data unavailable right now. Try again shortly.")
+
+# --- TAB 3: OPEN POSITIONS ---
+with tab3:
+    st.markdown("<h3>Active Open Positions</h3>", unsafe_allow_html=True)
+    open_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
+    if not open_df.empty: 
+        st.dataframe(open_df, width='stretch', hide_index=True)
+    else: 
+        st.info("No active trades currently open.")
+
+# --- TAB 4: TRADE HISTORY ---
+with tab4:
+    st.markdown("<h3>Closed Trade Ledger</h3>", unsafe_allow_html=True)
+    history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
     def color_status(val):
         if 'WIN' in str(val): return 'background-color: rgba(0, 255, 0, 0.2)'
         elif 'LOSS' in str(val): return 'background-color: rgba(255, 0, 0, 0.2)'
         return ''
-    if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['status']), width='stretch')
-    else: st.write("No closed trades yet.")
+    if not history_df.empty: 
+        st.dataframe(history_df.style.map(color_status, subset=['Status']), width='stretch', hide_index=True)
+    else: 
+        st.info("No closed trades yet.")
