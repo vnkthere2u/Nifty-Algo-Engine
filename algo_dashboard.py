@@ -18,14 +18,43 @@ from tvDatafeed import TvDatafeed, Interval
 # ==========================================
 st.set_page_config(page_title="Alpha Engine Terminal", layout="wide", initial_sidebar_state="expanded")
 
+# --- PRO UI UPGRADE ---
 st.markdown("""
     <style>
-        .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-        h1 { font-size: 1.8rem !important; margin-bottom: 0px; padding-bottom: 0px; font-weight: 600; }
-        h2 { font-size: 1.2rem !important; font-weight: 500; color: #888; margin-top: 0px; padding-top: 0px; }
-        h3 { font-size: 1.1rem !important; font-weight: 600; }
-        .stTabs [data-baseweb="tab-list"] { gap: 24px; }
-        .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; padding-top: 10px; padding-bottom: 10px; }
+        /* Squeeze the massive default padding */
+        .block-container { padding-top: 1.5rem !important; padding-bottom: 1rem !important; max-width: 98% !important; }
+        
+        /* Metric Card Styling */
+        [data-testid="stMetric"] {
+            background: linear-gradient(145deg, #16181c, #0e1117);
+            border: 1px solid #2b303b;
+            padding: 12px 20px;
+            border-radius: 10px;
+            box-shadow: 0px 4px 15px rgba(0,0,0,0.2);
+        }
+        [data-testid="stMetricValue"] { font-size: 1.6rem !important; font-weight: 700; color: #f0f6fc; }
+        [data-testid="stMetricLabel"] { font-size: 0.85rem !important; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+        
+        /* Anti-Crush Tab Styling */
+        .stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid #2b303b; }
+        .stTabs [data-baseweb="tab"] {
+            white-space: nowrap !important; /* Prevents text crushing */
+            padding: 10px 20px;
+            background-color: transparent;
+            color: #8b949e;
+            font-size: 0.95rem;
+            font-weight: 500;
+            border: none;
+        }
+        .stTabs [aria-selected="true"] {
+            background-color: rgba(88, 166, 255, 0.1) !important;
+            color: #58a6ff !important;
+            border-bottom: 3px solid #58a6ff !important;
+            border-radius: 6px 6px 0 0;
+        }
+        
+        /* Table enhancements */
+        .stDataFrame { margin-top: -15px; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -96,7 +125,6 @@ def get_db_connection():
     except sqlite3.OperationalError:
         pass
 
-    # NEW TABLE: For capturing blocked diagnostic signals
     c.execute('''CREATE TABLE IF NOT EXISTS blocked_signals 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
                  timestamp TEXT, price REAL, adx REAL, htf_trend TEXT, vol_ratio REAL, rejection_reasons TEXT)''')
@@ -208,7 +236,6 @@ def process_market_data():
     current_date_str = ist_now.strftime("%Y-%m-%d")
     scan_time_str = ist_now.strftime("%Y-%m-%d %I:%M %p (IST)")
     
-    # --- AUTOMATED DAILY BACKUP ---
     c.execute("SELECT value FROM system_status WHERE key='last_backup_date'")
     last_backup_row = c.fetchone()
     last_backup_date = last_backup_row[0] if last_backup_row else ""
@@ -240,7 +267,6 @@ def process_market_data():
             current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
             
             if sig_type == 'long':
-                # DYNAMIC BREAK-EVEN
                 if sl < entry_price:
                     original_risk = entry_price - sl
                     if current_high >= (entry_price + original_risk):
@@ -248,7 +274,6 @@ def process_market_data():
                         sl = entry_price
                         send_telegram_alert(f"🛡️ <b>RISK FREE TRADE</b>\n{name} LONG has moved in profit. SL moved to Break-Even ({round(entry_price, 2)}).")
                 
-                # STANDARD EXITS
                 if current_open >= tp:
                     c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)}")
@@ -265,7 +290,6 @@ def process_market_data():
                     send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(sl, 2)}")
                     
             elif sig_type == 'short':
-                # DYNAMIC BREAK-EVEN
                 if sl > entry_price:
                     original_risk = sl - entry_price
                     if current_low <= (entry_price - original_risk):
@@ -273,7 +297,6 @@ def process_market_data():
                         sl = entry_price
                         send_telegram_alert(f"🛡️ <b>RISK FREE TRADE</b>\n{name} SHORT has moved in profit. SL moved to Break-Even ({round(entry_price, 2)}).")
 
-                # STANDARD EXITS
                 if current_open <= tp:
                     c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)}")
@@ -298,7 +321,6 @@ def process_market_data():
                   (name, scan_time_str, round(latest_price, 2), round(ema5_live, 2), round(ema39_live, 2), trend, round(dist_pct, 4), htf_trend, round(vol_ratio, 2), round(adx_val, 2)))
         conn.commit()
 
-        # --- ENTRY TRIGGERS & DIAGNOSTIC LOGGING ---
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
         atr_val = last_closed['ATR']
@@ -339,13 +361,10 @@ def process_market_data():
                 send_telegram_alert(msg)
                 
             else:
-                # Store the blocked signal in the database
                 reason_str = " | ".join(rejection_reasons)
                 c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) 
                              VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                           (name, direction, scan_time_str, round(last_closed['Close'], 2), round(adx_val, 2), htf_trend, round(vol_ratio, 2), reason_str))
-                
-                # Send diagnostic Telegram alert
                 msg = f"⚠️ <b>BLOCKED {direction} CROSS: {name}</b>\nTime: {scan_time_str}\n\n<i>Rejected Because:</i>\n"
                 for reason in rejection_reasons:
                     msg += f"❌ {reason}\n"
@@ -365,9 +384,6 @@ def process_market_data():
 # ==========================================
 # 4. STREAMLIT DASHBOARD UI & RECOVERY
 # ==========================================
-st.markdown("<h1>⚡ Quantitative Alpha Engine</h1>", unsafe_allow_html=True)
-st.markdown("<h2>Institutional 15m EMA Tracker • Multi-Asset 24/5 Monitoring</h2>", unsafe_allow_html=True)
-
 ui_conn = get_db_connection()
 ui_c = ui_conn.cursor()
 
@@ -384,6 +400,7 @@ def start_background_scanner():
 
 engine_running = start_background_scanner()
 
+# --- SIDEBAR ---
 st.sidebar.markdown("<h3>⚙️ Control Panel</h3>", unsafe_allow_html=True)
 if engine_running: st.sidebar.success("✅ Background Daemon is LIVE")
 
@@ -421,7 +438,6 @@ if uploaded_file is not None:
             }
             restore_df = restore_df.rename(columns=rename_map)
             restore_df = restore_df.fillna({'exit_time': '', 'exit_price': 0.0, 'htf_trend': '', 'vol_ratio': 1.0})
-            
             for index, row in restore_df.iterrows():
                 ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
                 if not ui_c.fetchone():
@@ -437,25 +453,31 @@ if uploaded_file is not None:
         except Exception as e:
             st.sidebar.error(f"Restore failed: {e}")
 
-col_a, col_b, col_c = st.columns(3)
+# --- MAIN DASHBOARD AREA (Redesigned Header Row) ---
+head_col, m1, m2, m3 = st.columns([1.5, 1, 1, 1])
+
+with head_col:
+    st.markdown("<h1 style='background: -webkit-linear-gradient(45deg, #58a6ff, #1f6feb); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>⚡ Alpha Engine</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='color: #8b949e; font-size: 0.95rem; margin-top: -10px;'>Institutional 15m EMA Tracker • 24/5 Live</p>", unsafe_allow_html=True)
+
 if not backup_df.empty:
     wins = len(backup_df[backup_df['status'].str.contains('WIN')])
     total = len(backup_df[backup_df['status'] != 'OPEN'])
     win_rate = (wins / total * 100) if total > 0 else 0.0
-    col_a.metric("Total Executed Trades", len(backup_df))
-    col_b.metric("Historical Win Rate", f"{win_rate:.1f}%")
 else:
-    col_a.metric("Total Executed Trades", 0)
-    col_b.metric("Historical Win Rate", "0.0%")
-col_c.metric("Active Watchlist Size", len(WATCHLIST))
+    total, win_rate = 0, 0.0
 
-st.markdown("---")
-# Added 5th tab for Blocked Signals
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 Live Heatmap", "📈 Advanced Chart", "🟢 Open Positions", "📚 Trade History", "🚫 Blocked Signals"])
+with m1: st.metric("Executed Trades", total)
+with m2: st.metric("Win Rate", f"{win_rate:.1f}%")
+with m3: st.metric("Active Watchlist", len(WATCHLIST))
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# --- TABBED INTERFACE ---
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 Heatmap", "📈 Chart", "🟢 Open", "📚 Ledger", "🚫 Blocked"])
 
 with tab1:
-    st.markdown("<h3>Imminent Crossover Heatmap</h3>", unsafe_allow_html=True)
-    st.markdown("<p style='font-size:0.9rem; color:gray;'><b>Legend:</b> 🔴 Red < 0.1% Gap (Imminent) | 🟠 Orange < 0.5% Gap (Watch Closely)</p>", unsafe_allow_html=True)
+    st.markdown("<p style='font-size:0.9rem; color:gray; margin-bottom:5px;'><b>Legend:</b> 🔴 Red < 0.1% Gap (Imminent) | 🟠 Orange < 0.5% Gap (Watch Closely)</p>", unsafe_allow_html=True)
 
     live_df = pd.read_sql_query("SELECT ticker as Asset, close_price as 'Latest Price', distance_pct as '% Gap', trend as '15m Trend', htf_trend as '1H Trend', vol_ratio as 'Vol (x)', adx as 'ADX', last_update as 'Time (IST)' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
 
@@ -468,25 +490,16 @@ with tab1:
         return ''
 
     if not live_df.empty:
-        st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), width='stretch', hide_index=True)
+        # Added height to push table down the page
+        st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), use_container_width=True, height=600, hide_index=True)
     else:
         st.info("Waiting for first data sync...")
 
-    with st.expander("📝 System Protections currently ACTIVE"):
-        st.markdown("""
-        * **1-Hour Trend:** Ensures entries align with macro momentum (Price > 1H 39 EMA).
-        * **ADX (Trend Strength):** Must be **> 20.0**. Blocks trades during sideways chops.
-        * **Over-Extension Filter:** Rejects fakeouts if price has surged >2.5 ATRs away from the baseline.
-        * **Dynamic SL:** Auto-moves Stop Loss to Break-Even once price moves +1.5 ATR in profit.
-        """)
-
 with tab2:
-    st.markdown("<h3>Institutional Chart Terminal</h3>", unsafe_allow_html=True)
     if not live_df.empty:
         selected_stock = st.selectbox("Select an asset to render:", ["-- Select an Asset --"] + sorted(live_df['Asset'].tolist()), label_visibility="collapsed")
         if selected_stock != "-- Select an Asset --":
             yf_symbol = next(item['yf_symbol'] for item in WATCHLIST if item['name'] == selected_stock)
-            
             with st.spinner(f"Loading order book for {selected_stock}..."):
                 try:
                     chart_df = yf.Ticker(yf_symbol).history(interval="15m", period="3d")
@@ -500,53 +513,32 @@ with tab2:
                         chart_df['EMA39'] = ta.ema(chart_df['Close'], length=39)
                         
                         time_labels = chart_df.index.strftime('%b %d, %H:%M')
-                        
-                        fig = go.Figure(data=[go.Candlestick(
-                            x=time_labels, open=chart_df['Open'], high=chart_df['High'], 
-                            low=chart_df['Low'], close=chart_df['Close'], name="Price"
-                        )])
+                        fig = go.Figure(data=[go.Candlestick(x=time_labels, open=chart_df['Open'], high=chart_df['High'], low=chart_df['Low'], close=chart_df['Close'], name="Price")])
                         fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'))
                         fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'))
-                        
-                        fig.update_layout(
-                            title=f"{selected_stock} | 15m Timeframe (IST)",
-                            template="plotly_dark",
-                            xaxis_rangeslider_visible=False,
-                            margin=dict(l=0, r=0, t=40, b=0),
-                            height=550,
-                            hovermode="x unified"
-                        )
+                        fig.update_layout(title=f"{selected_stock} | 15m Timeframe (IST)", template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=40, b=0), height=600, hovermode="x unified")
                         fig.update_xaxes(type='category', nticks=12, tickangle=-45)
-                        st.plotly_chart(fig, width='stretch')
+                        st.plotly_chart(fig, use_container_width=True)
                 except Exception:
                     st.error("Chart data unavailable right now. Try again shortly.")
 
 with tab3:
-    st.markdown("<h3>Active Open Positions</h3>", unsafe_allow_html=True)
     open_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
-    if not open_df.empty: 
-        st.dataframe(open_df, width='stretch', hide_index=True)
-    else: 
-        st.info("No active trades currently open.")
+    if not open_df.empty: st.dataframe(open_df, use_container_width=True, height=600, hide_index=True)
+    else: st.info("No active trades currently open.")
 
 with tab4:
-    st.markdown("<h3>Closed Trade Ledger</h3>", unsafe_allow_html=True)
     history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
     def color_status(val):
         if 'WIN' in str(val): return 'background-color: rgba(0, 255, 0, 0.2)'
         elif 'LOSS' in str(val): return 'background-color: rgba(255, 0, 0, 0.2)'
         elif 'BREAK' in str(val): return 'background-color: rgba(128, 128, 128, 0.2)'
         return ''
-    if not history_df.empty: 
-        st.dataframe(history_df.style.map(color_status, subset=['Status']), width='stretch', hide_index=True)
-    else: 
-        st.info("No closed trades yet.")
+    if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['Status']), use_container_width=True, height=600, hide_index=True)
+    else: st.info("No closed trades yet.")
 
 with tab5:
-    st.markdown("<h3>Diagnostic Rejection Logs</h3>", unsafe_allow_html=True)
-    st.markdown("<p style='font-size:0.9rem; color:gray;'>Signals that occurred but were mathematically rejected by institutional filters to protect capital.</p>", unsafe_allow_html=True)
+    st.markdown("<p style='font-size:0.9rem; color:gray; margin-bottom:5px;'>Signals that were mathematically rejected by institutional filters to protect capital.</p>", unsafe_allow_html=True)
     blocked_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, timestamp as 'Time (IST)', price as Price, rejection_reasons as 'Rejection Reasons', adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM blocked_signals ORDER BY id DESC", ui_conn)
-    if not blocked_df.empty:
-        st.dataframe(blocked_df, width='stretch', hide_index=True)
-    else:
-        st.info("No signals have been blocked yet.")
+    if not blocked_df.empty: st.dataframe(blocked_df, use_container_width=True, height=600, hide_index=True)
+    else: st.info("No signals have been blocked yet.")
