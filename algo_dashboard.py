@@ -230,7 +230,7 @@ def process_market_data():
         prev_closed = df.iloc[-3]
         
         trend = "🟢 Bullish" if current_candle['EMA5'] > current_candle['EMA39'] else "🔴 Bearish"
-        htf_trend = "🟢 Bullish" if current_candle['EMA5_1H'] > current_candle['EMA39_1H'] else "🔴 Bearish"
+        htf_trend = "🟢 Bullish" if current_candle['Close'] > current_candle['EMA39_1H'] else "🔴 Bearish"
         vol_ratio = current_candle['Vol_Ratio']
         adx_val = current_candle['ADX']
         
