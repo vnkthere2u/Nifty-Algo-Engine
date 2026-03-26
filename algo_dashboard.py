@@ -6,6 +6,7 @@ import sqlite3
 import time
 import requests
 import threading
+import os
 import traceback
 import yfinance as yf
 import plotly.graph_objects as go
@@ -29,7 +30,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. TELEGRAM ALERT SETUP
+# 1. TELEGRAM ALERT & BACKUP SETUP
 # ==========================================
 try:
     TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
@@ -44,6 +45,27 @@ def send_telegram_alert(message):
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
     try: requests.post(url, data=payload, timeout=5)
     except: pass
+
+def send_telegram_csv_backup():
+    """Automatically exports the DB and sends it to Telegram as a file"""
+    if not TELEGRAM_TOKEN: return
+    try:
+        conn = get_db_connection()
+        df = pd.read_sql_query("SELECT * FROM trades", conn)
+        conn.close()
+        
+        ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        filename = f"Algo_Backup_{ist_now.strftime('%Y-%m-%d')}.csv"
+        df.to_csv(filename, index=False)
+        
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        payload = {'chat_id': TELEGRAM_CHAT_ID, 'caption': f"📊 <b>Automated Daily Backup</b>\nDate: {ist_now.strftime('%Y-%m-%d')}\n<i>Keep this file safe. Upload it to the dashboard if the server ever resets.</i>", 'parse_mode': 'HTML'}
+        files = {'document': open(filename, 'rb')}
+        
+        requests.post(url, data=payload, files=files, timeout=15)
+        os.remove(filename) # Clean up server space
+    except Exception as e:
+        pass
 
 # ==========================================
 # 2. DATABASE SETUP & SAFE MIGRATION
@@ -118,7 +140,6 @@ def fetch_and_analyze(item):
     global tv
     df = None
     
-    # 1. TradingView Primary Engine
     try:
         df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
         if df_tv is not None and not df_tv.empty:
@@ -128,10 +149,8 @@ def fetch_and_analyze(item):
         try: tv = TvDatafeed() 
         except: pass
 
-    # 2. Yahoo Finance Fallback Engine
     if df is None or df.empty:
         try:
-            # FIX: Pulled 20 days so Indian stocks have > 156 candles for the 1H proxy math
             df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="20d")
             if df_yf is not None and not df_yf.empty:
                 df_yf.index = df_yf.index.tz_localize(None)
@@ -139,31 +158,32 @@ def fetch_and_analyze(item):
         except Exception:
             pass
 
-    # 3. Mathematical Calculations & Sanitization
     if df is not None and not df.empty:
         try:
-            # Force everything to numbers
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
                 
-            # FIX: Forward-fill micro-gaps before math to prevent EMA/ATR crashes
             df[['Open', 'High', 'Low', 'Close']] = df[['Open', 'High', 'Low', 'Close']].ffill()
             df.dropna(subset=['Close', 'High', 'Low'], inplace=True) 
             
             df['EMA5'] = ta.ema(df['Close'], length=5)
             df['EMA39'] = ta.ema(df['Close'], length=39)
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-            df['EMA20'] = ta.ema(df['Close'], length=20)
-            df['EMA156'] = ta.ema(df['Close'], length=156)
             
-            # ADX Chop Filter (Sanitized)
+            # True MTF 1-Hour Resampling
+            df_1h = df.resample('1h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
+            df_1h['EMA5_1H'] = ta.ema(df_1h['Close'], length=5)
+            df_1h['EMA39_1H'] = ta.ema(df_1h['Close'], length=39)
+            df_1h_aligned = df_1h[['EMA5_1H', 'EMA39_1H']].reindex(df.index, method='ffill')
+            df['EMA5_1H'] = df_1h_aligned['EMA5_1H']
+            df['EMA39_1H'] = df_1h_aligned['EMA39_1H']
+            
             adx_data = ta.adx(df['High'], df['Low'], df['Close'], length=14)
             if adx_data is not None and not adx_data.empty:
                 df['ADX'] = adx_data.iloc[:, 0].ffill().fillna(0.0)
             else:
                 df['ADX'] = 0.0
             
-            # Volume Surge (Vectorized for high speed)
             if 'Volume' in df.columns:
                 df['Volume'] = df['Volume'].fillna(0)
                 df['Vol_MA20'] = df['Volume'].rolling(20).mean()
@@ -171,8 +191,7 @@ def fetch_and_analyze(item):
             else:
                 df['Vol_Ratio'] = 1.0 
                 
-            # Safely drop rows only if the EMAs couldn't calculate
-            df.dropna(subset=['EMA156', 'EMA39', 'EMA5', 'ATR'], inplace=True)
+            df.dropna(subset=['EMA39_1H', 'EMA39', 'EMA5', 'ATR'], inplace=True)
             if len(df) >= 5: return df
         except Exception as e:
             log_error(f"Math Error on {item['name']}: {e}")
@@ -184,6 +203,20 @@ def process_market_data():
     c = conn.cursor()
     alerts = []
     
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    current_date_str = ist_now.strftime("%Y-%m-%d")
+    scan_time_str = ist_now.strftime("%Y-%m-%d %I:%M %p (IST)")
+    
+    # --- AUTOMATED DAILY BACKUP LOGIC (Runs at 11:30 PM IST) ---
+    c.execute("SELECT value FROM system_status WHERE key='last_backup_date'")
+    last_backup_row = c.fetchone()
+    last_backup_date = last_backup_row[0] if last_backup_row else ""
+    
+    if current_date_str != last_backup_date and ist_now.hour >= 23 and ist_now.minute >= 30:
+        send_telegram_csv_backup()
+        c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_backup_date', ?)", (current_date_str,))
+        conn.commit()
+
     for item in WATCHLIST:
         name = item['name']
         df = fetch_and_analyze(item)
@@ -192,15 +225,12 @@ def process_market_data():
         c.execute("SELECT id, signal_type, sl, tp FROM trades WHERE ticker=? AND status='OPEN'", (name,))
         open_trades = c.fetchall()
         
-        ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-        scan_time_str = ist_now.strftime("%Y-%m-%d %I:%M %p (IST)")
-        
         current_candle = df.iloc[-1]
         last_closed = df.iloc[-2]
         prev_closed = df.iloc[-3]
         
         trend = "🟢 Bullish" if current_candle['EMA5'] > current_candle['EMA39'] else "🔴 Bearish"
-        htf_trend = "🟢 Bullish" if current_candle['EMA20'] > current_candle['EMA156'] else "🔴 Bearish"
+        htf_trend = "🟢 Bullish" if current_candle['EMA5_1H'] > current_candle['EMA39_1H'] else "🔴 Bearish"
         vol_ratio = current_candle['Vol_Ratio']
         adx_val = current_candle['ADX']
         
@@ -249,15 +279,12 @@ def process_market_data():
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
         atr_val = last_closed['ATR']
         
-        # Chop Filter Enforced
         is_trending = last_closed.get('ADX', 0.0) > 20.0
         
         if len(open_trades) == 0 and is_trending:
             if long_cross and htf_trend == "🟢 Bullish":
                 entry = last_closed['Close']
-                # 1:3 RR Logic Enforced
                 sl, tp = entry - (1.5 * atr_val), entry + (4.5 * atr_val)
-                
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                           (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
                 msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX Strength: {round(adx_val, 1)}"
@@ -266,9 +293,7 @@ def process_market_data():
                 
             elif short_cross and htf_trend == "🔴 Bearish":
                 entry = last_closed['Close']
-                # 1:3 RR Logic Enforced
                 sl, tp = entry + (1.5 * atr_val), entry - (4.5 * atr_val)
-                
                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                           (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
                 msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX Strength: {round(adx_val, 1)}"
@@ -279,15 +304,13 @@ def process_market_data():
         time.sleep(1) 
         
     c.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 500)")
-    
-    status_time_str = ist_now.strftime("%Y-%m-%d %I:%M %p (IST)")
-    c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (status_time_str,))
+    c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (scan_time_str,))
     conn.commit()
     conn.close()
     return alerts
 
 # ==========================================
-# 4. STREAMLIT DASHBOARD UI
+# 4. STREAMLIT DASHBOARD UI & RECOVERY
 # ==========================================
 st.markdown("<h1>⚡ Quantitative Alpha Engine</h1>", unsafe_allow_html=True)
 st.markdown("<h2>Institutional 15m EMA Tracker • Multi-Asset 24/5 Monitoring</h2>", unsafe_allow_html=True)
@@ -316,35 +339,66 @@ ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
 last_scan_row = ui_c.fetchone()
 st.sidebar.info(f"⏱️ **Last Database Sync:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
 
-if st.sidebar.button("🔔 Send Test Telegram Alert"):
-    send_telegram_alert("🟢 <b>TEST ALERT</b>\nSystem is online and tracking 18 assets.")
-    st.sidebar.success("Test alert sent!")
-
 if st.sidebar.button("🔄 Force Manual Data Sync"):
     with st.spinner("Executing Data Sync..."):
         process_market_data()
         st.rerun()
 
+# --- BACKUP AND RESTORE MODULE ---
 st.sidebar.markdown("---")
-# LEAVE THIS ALONE - Do not click it so you preserve your logs and positions!
-if st.sidebar.button("⚠️ Factory Reset Database"):
-    ui_c.execute("DROP TABLE IF EXISTS trades")
-    ui_c.execute("DROP TABLE IF EXISTS live_market_data")
-    ui_c.execute("DROP TABLE IF EXISTS system_status")
-    ui_c.execute("DROP TABLE IF EXISTS system_logs")
-    ui_conn.commit()
-    st.sidebar.success("Database wiped. Rebooting...")
-    time.sleep(1)
-    st.rerun()
+st.sidebar.markdown("<h3>🛡️ System Backup & Restore</h3>", unsafe_allow_html=True)
+
+# 1. Manual Download Button
+backup_df = pd.read_sql_query("SELECT * FROM trades", ui_conn)
+csv_data = backup_df.to_csv(index=False).encode('utf-8')
+st.sidebar.download_button(
+    label="⬇️ Download DB Backup Now",
+    data=csv_data,
+    file_name=f"Manual_Backup_{datetime.now().strftime('%Y-%m-%d')}.csv",
+    mime="text/csv"
+)
+
+# 2. Smart Restore Uploader
+uploaded_file = st.sidebar.file_uploader("Restore Data (Upload CSV)", type=['csv'])
+if uploaded_file is not None:
+    if st.sidebar.button("⚙️ Execute Data Restore"):
+        try:
+            restore_df = pd.read_csv(uploaded_file)
+            
+            # SMART MAPPING: Translates the old dashboard export headers into the internal SQLite headers
+            rename_map = {
+                'Asset': 'ticker', 'Signal': 'signal_type', 'Entry Time': 'entry_time',
+                'Entry': 'entry_price', 'SL': 'sl', 'TP': 'tp', 'Status': 'status',
+                'Exit Time': 'exit_time', 'Exit Price': 'exit_price',
+                '1H Trend': 'htf_trend', 'Vol (x)': 'vol_ratio'
+            }
+            restore_df = restore_df.rename(columns=rename_map)
+            restore_df = restore_df.fillna({'exit_time': '', 'exit_price': 0.0, 'htf_trend': '', 'vol_ratio': 1.0})
+            
+            for index, row in restore_df.iterrows():
+                # Check if trade already exists to prevent duplicate entries
+                ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
+                if not ui_c.fetchone():
+                    ui_c.execute("""INSERT INTO trades 
+                        (ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price, htf_trend, vol_ratio) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (row['ticker'], row['signal_type'], row['entry_time'], row['entry_price'], row['sl'], row['tp'], row['status'],
+                         row['exit_time'], row['exit_price'], row['htf_trend'], row['vol_ratio']))
+            ui_conn.commit()
+            st.sidebar.success("✅ Database Restored! Rebooting...")
+            time.sleep(2)
+            st.rerun()
+        except Exception as e:
+            st.sidebar.error(f"Restore failed: {e}")
 
 # --- TOP LEVEL METRICS ---
-closed_trades = pd.read_sql_query("SELECT * FROM trades WHERE status!='OPEN'", ui_conn)
 col_a, col_b, col_c = st.columns(3)
-if not closed_trades.empty:
-    wins = len(closed_trades[closed_trades['status'].str.contains('WIN')])
-    total = len(closed_trades)
-    col_a.metric("Total Executed Trades", total)
-    col_b.metric("Historical Win Rate", f"{(wins/total)*100:.1f}%")
+if not backup_df.empty:
+    wins = len(backup_df[backup_df['status'].str.contains('WIN')])
+    total = len(backup_df[backup_df['status'] != 'OPEN'])
+    win_rate = (wins / total * 100) if total > 0 else 0.0
+    col_a.metric("Total Executed Trades", len(backup_df))
+    col_b.metric("Historical Win Rate", f"{win_rate:.1f}%")
 else:
     col_a.metric("Total Executed Trades", 0)
     col_b.metric("Historical Win Rate", "0.0%")
@@ -373,14 +427,6 @@ with tab1:
         st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), width='stretch', hide_index=True)
     else:
         st.info("Waiting for first data sync...")
-
-    with st.expander("📝 How to read the Advanced Context Metrics"):
-        st.markdown("""
-        * **1-Hour Trend:** Must match the 15-minute trend for a trade to execute.
-        * **ADX (Trend Strength):** Must be **> 20.0** for a trade to execute. If it's below 20, the market is chopping sideways and will destroy stop losses.
-        * **Vol Surge (x):** Compares current 15m volume to the 20-candle average (> 1.5x = Heavy institutional volume).
-        * **Risk Management Update:** Trades now execute at a strict **1:3 Risk/Reward** ratio utilizing a 1.5x ATR dynamic Stop Loss for breathing room.
-        """)
 
 with tab2:
     st.markdown("<h3>Institutional Chart Terminal</h3>", unsafe_allow_html=True)
