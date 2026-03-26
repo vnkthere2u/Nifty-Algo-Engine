@@ -96,6 +96,11 @@ def get_db_connection():
     except sqlite3.OperationalError:
         pass
 
+    # NEW TABLE: For capturing blocked diagnostic signals
+    c.execute('''CREATE TABLE IF NOT EXISTS blocked_signals 
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
+                 timestamp TEXT, price REAL, adx REAL, htf_trend TEXT, vol_ratio REAL, rejection_reasons TEXT)''')
+
     conn.commit()
     return conn
 
@@ -218,7 +223,6 @@ def process_market_data():
         df = fetch_and_analyze(item)
         if df is None: continue
             
-        # BUG FIX: Pull entry_price from DB to calculate Break-Even distance
         c.execute("SELECT id, signal_type, sl, tp, entry_price FROM trades WHERE ticker=? AND status='OPEN'", (name,))
         open_trades = c.fetchall()
         
@@ -227,7 +231,6 @@ def process_market_data():
         prev_closed = df.iloc[-3]
         
         trend = "🟢 Bullish" if current_candle['EMA5'] > current_candle['EMA39'] else "🔴 Bearish"
-        # 1H Trend using Price-to-Baseline logic (Resolves "Lag Chain")
         htf_trend = "🟢 Bullish" if current_candle['Close'] > current_candle['EMA39_1H'] else "🔴 Bearish"
         vol_ratio = current_candle['Vol_Ratio']
         adx_val = current_candle['ADX']
@@ -237,15 +240,15 @@ def process_market_data():
             current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
             
             if sig_type == 'long':
-                # --- DYNAMIC BREAK-EVEN ---
+                # DYNAMIC BREAK-EVEN
                 if sl < entry_price:
                     original_risk = entry_price - sl
                     if current_high >= (entry_price + original_risk):
                         c.execute("UPDATE trades SET sl=? WHERE id=?", (entry_price, trade_id))
-                        sl = entry_price # Update sl in memory for standard exits
+                        sl = entry_price
                         send_telegram_alert(f"🛡️ <b>RISK FREE TRADE</b>\n{name} LONG has moved in profit. SL moved to Break-Even ({round(entry_price, 2)}).")
                 
-                # --- STANDARD EXITS ---
+                # STANDARD EXITS
                 if current_open >= tp:
                     c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)}")
@@ -262,15 +265,15 @@ def process_market_data():
                     send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(sl, 2)}")
                     
             elif sig_type == 'short':
-                # --- DYNAMIC BREAK-EVEN ---
+                # DYNAMIC BREAK-EVEN
                 if sl > entry_price:
                     original_risk = sl - entry_price
                     if current_low <= (entry_price - original_risk):
                         c.execute("UPDATE trades SET sl=? WHERE id=?", (entry_price, trade_id))
-                        sl = entry_price # Update sl in memory for standard exits
+                        sl = entry_price
                         send_telegram_alert(f"🛡️ <b>RISK FREE TRADE</b>\n{name} SHORT has moved in profit. SL moved to Break-Even ({round(entry_price, 2)}).")
 
-                # --- STANDARD EXITS ---
+                # STANDARD EXITS
                 if current_open <= tp:
                     c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)}")
@@ -295,49 +298,65 @@ def process_market_data():
                   (name, scan_time_str, round(latest_price, 2), round(ema5_live, 2), round(ema39_live, 2), trend, round(dist_pct, 4), htf_trend, round(vol_ratio, 2), round(adx_val, 2)))
         conn.commit()
 
-        # --- ENTRY TRIGGERS ---
+        # --- ENTRY TRIGGERS & DIAGNOSTIC LOGGING ---
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
         atr_val = last_closed['ATR']
         
-        # Chop Filter
         is_trending = last_closed.get('ADX', 0.0) > 20.0
-        
-        # Rubber-Band Extension Filter (Blocks entries if price is > 2.5 ATR away from baseline)
         max_extension = 2.5 * atr_val
-        is_not_overextended = abs(last_closed['Close'] - last_closed['EMA39']) <= max_extension
+        baseline_distance = abs(last_closed['Close'] - last_closed['EMA39'])
+        is_not_overextended = baseline_distance <= max_extension
         
-        if len(open_trades) == 0 and is_trending and is_not_overextended:
-            if long_cross and htf_trend == "🟢 Bullish":
-                entry = last_closed['Close']
-                # Updated 1:2.5 Risk/Reward logic (1.5x Risk / 3.75x Reward)
-                sl_dist = 1.5 * atr_val
-                tp_dist = 3.75 * atr_val
-                sl, tp = entry - sl_dist, entry + tp_dist
+        if long_cross or short_cross:
+            direction = "LONG" if long_cross else "SHORT"
+            required_htf = "🟢 Bullish" if long_cross else "🔴 Bearish"
+            rejection_reasons = []
+            
+            if len(open_trades) > 0:
+                rejection_reasons.append("Active trade already open.")
+            if not is_trending:
+                rejection_reasons.append(f"ADX < 20 ({round(adx_val, 1)}).")
+            if htf_trend != required_htf:
+                rejection_reasons.append(f"1H Trend Conflict ({htf_trend}).")
+            if not is_not_overextended:
+                rejection_reasons.append(f"Overextended Price Surge.")
                 
-                c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
-                msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX Strength: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
+            if len(rejection_reasons) == 0:
+                entry = last_closed['Close']
+                if long_cross:
+                    sl, tp = entry - (1.5 * atr_val), entry + (3.75 * atr_val)
+                    c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
+                    msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
+                elif short_cross:
+                    sl, tp = entry + (1.5 * atr_val), entry - (3.75 * atr_val)
+                    c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
+                    msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
+                
                 alerts.append(msg)
                 send_telegram_alert(msg)
                 
-            elif short_cross and htf_trend == "🔴 Bearish":
-                entry = last_closed['Close']
-                # Updated 1:2.5 Risk/Reward logic (1.5x Risk / 3.75x Reward)
-                sl_dist = 1.5 * atr_val
-                tp_dist = 3.75 * atr_val
-                sl, tp = entry + sl_dist, entry - tp_dist
+            else:
+                # Store the blocked signal in the database
+                reason_str = " | ".join(rejection_reasons)
+                c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) 
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                          (name, direction, scan_time_str, round(last_closed['Close'], 2), round(adx_val, 2), htf_trend, round(vol_ratio, 2), reason_str))
                 
-                c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
-                msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX Strength: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
-                alerts.append(msg)
+                # Send diagnostic Telegram alert
+                msg = f"⚠️ <b>BLOCKED {direction} CROSS: {name}</b>\nTime: {scan_time_str}\n\n<i>Rejected Because:</i>\n"
+                for reason in rejection_reasons:
+                    msg += f"❌ {reason}\n"
+                msg += f"\n<i>Context:</i>\n1H Trend: {htf_trend}\nADX: {round(adx_val, 1)}\nVol Surge: {round(vol_ratio, 1)}x"
                 send_telegram_alert(msg)
                 
         conn.commit()
         time.sleep(1) 
         
     c.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 500)")
+    c.execute("DELETE FROM blocked_signals WHERE id NOT IN (SELECT id FROM blocked_signals ORDER BY id DESC LIMIT 300)")
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (scan_time_str,))
     conn.commit()
     conn.close()
@@ -431,7 +450,8 @@ else:
 col_c.metric("Active Watchlist Size", len(WATCHLIST))
 
 st.markdown("---")
-tab1, tab2, tab3, tab4 = st.tabs(["🔥 Live Heatmap", "📈 Advanced Chart", "🟢 Open Positions", "📚 Trade History"])
+# Added 5th tab for Blocked Signals
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 Live Heatmap", "📈 Advanced Chart", "🟢 Open Positions", "📚 Trade History", "🚫 Blocked Signals"])
 
 with tab1:
     st.markdown("<h3>Imminent Crossover Heatmap</h3>", unsafe_allow_html=True)
@@ -521,3 +541,12 @@ with tab4:
         st.dataframe(history_df.style.map(color_status, subset=['Status']), width='stretch', hide_index=True)
     else: 
         st.info("No closed trades yet.")
+
+with tab5:
+    st.markdown("<h3>Diagnostic Rejection Logs</h3>", unsafe_allow_html=True)
+    st.markdown("<p style='font-size:0.9rem; color:gray;'>Signals that occurred but were mathematically rejected by institutional filters to protect capital.</p>", unsafe_allow_html=True)
+    blocked_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, timestamp as 'Time (IST)', price as Price, rejection_reasons as 'Rejection Reasons', adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM blocked_signals ORDER BY id DESC", ui_conn)
+    if not blocked_df.empty:
+        st.dataframe(blocked_df, width='stretch', hide_index=True)
+    else:
+        st.info("No signals have been blocked yet.")
