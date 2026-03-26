@@ -215,21 +215,28 @@ def process_market_data():
         for trade in open_trades:
             trade_id, sig_type, sl, tp, entry_price, entry_time_str = trade
             
-            # --- HISTORICAL MEMORY SWEEP FIX ---
+            # --- FIX: TIMEZONE-AGNOSTIC MEMORY SWEEP ---
             try:
+                # Calculate exactly how many candles ago the trade started
                 clean_time_str = entry_time_str.replace(" (IST)", "")
-                entry_dt = pd.to_datetime(clean_time_str, format="%Y-%m-%d %I:%M %p")
-                trade_history = df[df.index >= entry_dt]
-                max_high_reached = trade_history['High'].max() if not trade_history.empty else current_candle['High']
-                min_low_reached = trade_history['Low'].min() if not trade_history.empty else current_candle['Low']
-            except:
+                entry_dt_ist = pd.to_datetime(clean_time_str, format="%Y-%m-%d %I:%M %p")
+                time_diff = ist_now.replace(tzinfo=None) - entry_dt_ist
+                candles_since_entry = int(time_diff.total_seconds() / 900) + 2 # Add buffer
+                
+                if candles_since_entry > 0 and len(df) > 0:
+                    trade_history = df.tail(min(candles_since_entry, len(df)))
+                    max_high_reached = trade_history['High'].max()
+                    min_low_reached = trade_history['Low'].min()
+                else:
+                    max_high_reached = current_candle['High']
+                    min_low_reached = current_candle['Low']
+            except Exception as e:
                 max_high_reached = current_candle['High']
                 min_low_reached = current_candle['Low']
 
             current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
             
             if sig_type == 'long':
-                # DYNAMIC BREAK-EVEN (Now uses absolute highest price reached historically)
                 if sl < entry_price:
                     original_risk = entry_price - sl
                     if max_high_reached >= (entry_price + original_risk):
@@ -237,7 +244,6 @@ def process_market_data():
                         sl = entry_price
                         send_telegram_alert(f"🛡️ <b>RISK FREE TRADE</b>\n{name} LONG has moved in profit. SL retroactively moved to Break-Even ({round(entry_price, 2)}).")
                 
-                # STANDARD EXITS
                 if current_open >= tp:
                     c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)}")
@@ -254,7 +260,6 @@ def process_market_data():
                     send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(sl, 2)}")
                     
             elif sig_type == 'short':
-                # DYNAMIC BREAK-EVEN (Now uses absolute lowest price reached historically)
                 if sl > entry_price:
                     original_risk = sl - entry_price
                     if min_low_reached <= (entry_price - original_risk):
@@ -262,7 +267,6 @@ def process_market_data():
                         sl = entry_price
                         send_telegram_alert(f"🛡️ <b>RISK FREE TRADE</b>\n{name} SHORT has moved in profit. SL retroactively moved to Break-Even ({round(entry_price, 2)}).")
 
-                # STANDARD EXITS
                 if current_open <= tp:
                     c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)}")
