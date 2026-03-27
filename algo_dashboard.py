@@ -45,8 +45,17 @@ def send_telegram_alert(message):
     if not TELEGRAM_TOKEN: return 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
-    try: requests.post(url, data=payload, timeout=5)
-    except: pass
+    
+    # Retry logic to defeat Telegram Rate Limits
+    for attempt in range(3):
+        try: 
+            response = requests.post(url, data=payload, timeout=10)
+            if response.status_code == 429: # Hit the spam filter limit
+                time.sleep(3) # Wait 3 seconds and retry
+                continue
+            break # Success, exit the loop
+        except: 
+            time.sleep(1)
 
 def send_telegram_csv_backup():
     if not TELEGRAM_TOKEN: return
@@ -215,13 +224,11 @@ def process_market_data():
         for trade in open_trades:
             trade_id, sig_type, sl, tp, entry_price, entry_time_str = trade
             
-            # --- FIX: TIMEZONE-AGNOSTIC MEMORY SWEEP ---
             try:
-                # Calculate exactly how many candles ago the trade started
                 clean_time_str = entry_time_str.replace(" (IST)", "")
                 entry_dt_ist = pd.to_datetime(clean_time_str, format="%Y-%m-%d %I:%M %p")
                 time_diff = ist_now.replace(tzinfo=None) - entry_dt_ist
-                candles_since_entry = int(time_diff.total_seconds() / 900) + 2 # Add buffer
+                candles_since_entry = int(time_diff.total_seconds() / 900) + 2 
                 
                 if candles_since_entry > 0 and len(df) > 0:
                     trade_history = df.tail(min(candles_since_entry, len(df)))
@@ -326,14 +333,29 @@ def process_market_data():
                 alerts.append(msg)
                 send_telegram_alert(msg)
             else:
-                reason_str = " | ".join(rejection_reasons)
-                c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) 
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                          (name, direction, scan_time_str, round(last_closed['Close'], 2), round(adx_val, 2), htf_trend, round(vol_ratio, 2), reason_str))
-                msg = f"⚠️ <b>BLOCKED {direction} CROSS: {name}</b>\nTime: {scan_time_str}\n\n<i>Rejected Because:</i>\n"
-                for reason in rejection_reasons: msg += f"❌ {reason}\n"
-                msg += f"\n<i>Context:</i>\n1H Trend: {htf_trend}\nADX: {round(adx_val, 1)}\nVol Surge: {round(vol_ratio, 1)}x"
-                send_telegram_alert(msg)
+                # DUPLICATE SPAM PREVENTION (15-Minute Cooldown)
+                c.execute("SELECT timestamp FROM blocked_signals WHERE ticker=? ORDER BY id DESC LIMIT 1", (name,))
+                last_blocked = c.fetchone()
+                skip_spam = False
+                
+                if last_blocked:
+                    try:
+                        last_time_str = last_blocked[0].replace(" (IST)", "")
+                        last_time = pd.to_datetime(last_time_str, format="%Y-%m-%d %I:%M %p")
+                        if (ist_now.replace(tzinfo=None) - last_time).total_seconds() < 800:
+                            skip_spam = True
+                    except: pass
+                
+                if not skip_spam:
+                    reason_str = " | ".join(rejection_reasons)
+                    c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) 
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                              (name, direction, scan_time_str, round(last_closed['Close'], 2), round(adx_val, 2), htf_trend, round(vol_ratio, 2), reason_str))
+                    
+                    msg = f"⚠️ <b>BLOCKED {direction} CROSS: {name}</b>\nTime: {scan_time_str}\n\n<i>Rejected Because:</i>\n"
+                    for reason in rejection_reasons: msg += f"❌ {reason}\n"
+                    msg += f"\n<i>Context:</i>\n1H Trend: {htf_trend}\nADX: {round(adx_val, 1)}\nVol Surge: {round(vol_ratio, 1)}x"
+                    send_telegram_alert(msg)
                 
         conn.commit()
         time.sleep(1) 
