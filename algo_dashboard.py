@@ -298,55 +298,61 @@ def process_market_data():
                   (name, scan_time_str, round(latest_price, 2), round(ema5_live, 2), round(ema39_live, 2), trend, round(dist_pct, 4), htf_trend, round(vol_ratio, 2), round(adx_val, 2)))
         conn.commit()
 
+        # --- ENTRY TRIGGERS & CANDLE LOCKING ---
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
-        atr_val = last_closed['ATR']
-        
-        is_trending = last_closed.get('ADX', 0.0) > 20.0
-        max_extension = 2.5 * atr_val
-        baseline_distance = abs(last_closed['Close'] - last_closed['EMA39'])
-        is_not_overextended = baseline_distance <= max_extension
         
         if long_cross or short_cross:
-            direction = "LONG" if long_cross else "SHORT"
-            required_htf = "🟢 Bullish" if long_cross else "🔴 Bearish"
-            rejection_reasons = []
+            # 1. Get the exact, unique timestamp of this closed candle
+            try:
+                signal_candle_time = last_closed.name.strftime("%Y-%m-%d %H:%M:%S")
+            except AttributeError:
+                signal_candle_time = scan_time_str # Fallback if index formatting fails
             
-            if len(open_trades) > 0: rejection_reasons.append("Active trade already open.")
-            if not is_trending: rejection_reasons.append(f"ADX < 20 ({round(adx_val, 1)}).")
-            if htf_trend != required_htf: rejection_reasons.append(f"1H Trend Conflict ({htf_trend}).")
-            if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
-                
-            if len(rejection_reasons) == 0:
-                entry = last_closed['Close']
-                if long_cross:
-                    sl, tp = entry - (1.5 * atr_val), entry + (3.75 * atr_val)
-                    c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                              (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
-                    msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
-                elif short_cross:
-                    sl, tp = entry + (1.5 * atr_val), entry - (3.75 * atr_val)
-                    c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                              (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
-                    msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
-                
-                alerts.append(msg)
-                send_telegram_alert(msg)
+            # 2. Check the database to see if we already processed this exact candle
+            c.execute("SELECT value FROM system_status WHERE key=?", (f"last_signal_{name}",))
+            last_processed = c.fetchone()
+            
+            # If the timestamps match, we already evaluated this crossover in a previous 5-min loop.
+            if last_processed and last_processed[0] == signal_candle_time:
+                pass # Silently skip. Do not alert, do not log, do not trade.
+            
+            # If it is a fresh candle, evaluate it!
             else:
-                # DUPLICATE SPAM PREVENTION (15-Minute Cooldown)
-                c.execute("SELECT timestamp FROM blocked_signals WHERE ticker=? ORDER BY id DESC LIMIT 1", (name,))
-                last_blocked = c.fetchone()
-                skip_spam = False
+                # 3. Lock this candle in the database so it never fires again
+                c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"last_signal_{name}", signal_candle_time))
                 
-                if last_blocked:
-                    try:
-                        last_time_str = last_blocked[0].replace(" (IST)", "")
-                        last_time = pd.to_datetime(last_time_str, format="%Y-%m-%d %I:%M %p")
-                        if (ist_now.replace(tzinfo=None) - last_time).total_seconds() < 800:
-                            skip_spam = True
-                    except: pass
+                atr_val = last_closed['ATR']
+                is_trending = last_closed.get('ADX', 0.0) > 20.0
+                max_extension = 2.5 * atr_val
+                baseline_distance = abs(last_closed['Close'] - last_closed['EMA39'])
+                is_not_overextended = baseline_distance <= max_extension
                 
-                if not skip_spam:
+                direction = "LONG" if long_cross else "SHORT"
+                required_htf = "🟢 Bullish" if long_cross else "🔴 Bearish"
+                rejection_reasons = []
+                
+                if len(open_trades) > 0: rejection_reasons.append("Active trade already open.")
+                if not is_trending: rejection_reasons.append(f"ADX < 20 ({round(adx_val, 1)}).")
+                if htf_trend != required_htf: rejection_reasons.append(f"1H Trend Conflict ({htf_trend}).")
+                if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
+                    
+                if len(rejection_reasons) == 0:
+                    entry = last_closed['Close']
+                    if long_cross:
+                        sl, tp = entry - (1.5 * atr_val), entry + (3.75 * atr_val)
+                        c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                  (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
+                        msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
+                    elif short_cross:
+                        sl, tp = entry + (1.5 * atr_val), entry - (3.75 * atr_val)
+                        c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                  (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
+                        msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
+                    
+                    alerts.append(msg)
+                    send_telegram_alert(msg)
+                else:
                     reason_str = " | ".join(rejection_reasons)
                     c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) 
                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
