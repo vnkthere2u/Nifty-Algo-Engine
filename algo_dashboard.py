@@ -94,7 +94,6 @@ def get_db_connection():
         c.execute("ALTER TABLE trades ADD COLUMN vol_ratio REAL")
     except sqlite3.OperationalError: pass 
     
-    # SAFE MIGRATION: Adding ATR Column without dropping data
     try:
         c.execute("ALTER TABLE trades ADD COLUMN atr REAL")
     except sqlite3.OperationalError: pass 
@@ -217,12 +216,15 @@ def process_market_data():
     for item in WATCHLIST:
         name = item['name']
         
-        # --- MARKET HOURS FREEZE SHIELD ---
+        # --- ENHANCED MARKET HOURS SHIELD (Includes Weekends) ---
         market_open = True
         if item['tv_exchange'] == 'NSE':
-            minutes_since_midnight = ist_now.hour * 60 + ist_now.minute
-            if minutes_since_midnight < 555 or minutes_since_midnight > 935:
+            if ist_now.weekday() >= 5: # 5 = Saturday, 6 = Sunday
                 market_open = False
+            else:
+                minutes_since_midnight = ist_now.hour * 60 + ist_now.minute
+                if minutes_since_midnight < 555 or minutes_since_midnight > 935:
+                    market_open = False
                 
         df = fetch_and_analyze(item)
         if df is None: continue
@@ -251,14 +253,15 @@ def process_market_data():
             for trade in open_trades:
                 trade_id, sig_type, sl, tp, entry_price, entry_time_str = trade
                 
+                # --- FIXED: STRICT TIME-SLICING FOR RETROACTIVE SWEEPS ---
                 try:
                     clean_time_str = entry_time_str.replace(" (IST)", "")
                     entry_dt_ist = pd.to_datetime(clean_time_str, format="%Y-%m-%d %I:%M %p")
-                    time_diff = ist_now.replace(tzinfo=None) - entry_dt_ist
-                    candles_since_entry = int(time_diff.total_seconds() / 900) + 2 
                     
-                    if candles_since_entry > 0 and len(df) > 0:
-                        trade_history = df.tail(min(candles_since_entry, len(df)))
+                    temp_idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
+                    trade_history = df[temp_idx >= entry_dt_ist]
+                    
+                    if not trade_history.empty:
                         max_high_reached = trade_history['High'].max()
                         min_low_reached = trade_history['Low'].min()
                     else:
@@ -355,13 +358,11 @@ def process_market_data():
                         entry = last_closed['Close']
                         if long_cross:
                             sl, tp = entry - (1.5 * atr_val), entry + (3.75 * atr_val)
-                            # ADDED ATR to INSERT statement
                             c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                       (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2), round(atr_val, 2)))
                             msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(closed_vol, 1)}x\nADX: {round(closed_adx, 1)}\nATR: {round(atr_val, 2)}\nR:R Profile: 1:2.5"
                         elif short_cross:
                             sl, tp = entry + (1.5 * atr_val), entry - (3.75 * atr_val)
-                            # ADDED ATR to INSERT statement
                             c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                       (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2), round(atr_val, 2)))
                             msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(closed_vol, 1)}x\nADX: {round(closed_adx, 1)}\nATR: {round(atr_val, 2)}\nR:R Profile: 1:2.5"
@@ -439,7 +440,6 @@ if uploaded_file is not None:
             for index, row in restore_df.iterrows():
                 ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
                 if not ui_c.fetchone():
-                    # Added ATR to restore insertion
                     ui_c.execute("""INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price, htf_trend, vol_ratio, atr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['entry_time'], row['entry_price'], row['sl'], row['tp'], row['status'], row['exit_time'], row['exit_price'], row['htf_trend'], row['vol_ratio'], row['atr']))
             ui_conn.commit()
             st.sidebar.success("✅ Database Restored! Rebooting...")
@@ -447,12 +447,11 @@ if uploaded_file is not None:
             st.rerun()
         except Exception as e: st.sidebar.error(f"Restore failed: {e}")
 
-
 # ==========================================
 # UI: NEW GRID METRICS MATRIX 
 # ==========================================
 st.markdown("<h1 style='background: -webkit-linear-gradient(45deg, #58a6ff, #1f6feb); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>⚡ Alpha Engine</h1>", unsafe_allow_html=True)
-st.markdown("<p style='color: #8b949e; font-size: 0.95rem; margin-top: -10px;'>Institutional 15m EMA Tracker • 24/5 Live</p>", unsafe_allow_html=True)
+st.markdown("<p style='color: #8b949e; font-size: 0.95rem; margin-top: -10px;'>Institutional 15m EMA Tracker • 24/7 Multi-Market</p>", unsafe_allow_html=True)
 
 if not backup_df.empty:
     closed_df = backup_df[backup_df['status'] != 'OPEN']
@@ -511,7 +510,6 @@ st.markdown(f"""
 </table>
 """, unsafe_allow_html=True)
 
-
 # ==========================================
 # UI: TABBED INTERFACE
 # ==========================================
@@ -537,7 +535,6 @@ with tab2:
             yf_symbol = next(item['yf_symbol'] for item in WATCHLIST if item['name'] == selected_stock)
             with st.spinner(f"Loading order book for {selected_stock}..."):
                 try:
-                    # FIX: Reverted to 3d to protect IP from API Rate Limits
                     chart_df = yf.Ticker(yf_symbol).history(interval="15m", period="3d")
                     if not chart_df.empty:
                         if chart_df.index.tz is not None: chart_df.index = chart_df.index.tz_convert('Asia/Kolkata').tz_localize(None)
@@ -554,9 +551,7 @@ with tab2:
                 except Exception: st.error("Chart data unavailable right now. Try again shortly.")
 
 with tab3:
-    # ADDED 'atr' to the SQL query
     open_df_ui = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
-    
     if not open_df_ui.empty: 
         open_df_ui['Risk Status'] = np.where(np.round(open_df_ui['SL'].astype(float), 2) == np.round(open_df_ui['Entry'].astype(float), 2), '🛡️ RISK-FREE', '⚠️ AT RISK')
         cols = ['Risk Status'] + [col for col in open_df_ui.columns if col != 'Risk Status']
@@ -570,7 +565,6 @@ with tab3:
         st.info("No active trades currently open.")
 
 with tab4:
-    # ADDED 'atr' to the SQL query
     history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
     def color_status(val):
         if 'WIN' in str(val): return 'background-color: rgba(63, 185, 80, 0.2); color: #3fb950; font-weight: bold;'
