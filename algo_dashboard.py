@@ -21,9 +21,21 @@ st.set_page_config(page_title="Alpha Engine Terminal", layout="wide", initial_si
 st.markdown("""
     <style>
         .block-container { padding-top: 1.5rem !important; padding-bottom: 1rem !important; max-width: 98% !important; }
-        [data-testid="stMetric"] { background: linear-gradient(145deg, #16181c, #0e1117); border: 1px solid #2b303b; padding: 12px 20px; border-radius: 10px; box-shadow: 0px 4px 15px rgba(0,0,0,0.2); }
-        [data-testid="stMetricValue"] { font-size: 1.6rem !important; font-weight: 700; color: #f0f6fc; }
-        [data-testid="stMetricLabel"] { font-size: 0.85rem !important; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; }
+        
+        /* Custom Metrics Matrix CSS */
+        .metrics-matrix { width: 100%; border-collapse: collapse; margin-top: 10px; margin-bottom: 20px; background: linear-gradient(145deg, #16181c, #0e1117); border-radius: 8px; overflow: hidden; border: 1px solid #2b303b; box-shadow: 0px 4px 15px rgba(0,0,0,0.2); text-align: center; font-family: sans-serif; }
+        .metrics-matrix th { background-color: #121418; color: #8b949e; font-size: 0.85rem; font-weight: 600; text-transform: uppercase; padding: 12px 8px; border: 1px solid #2b303b; letter-spacing: 0.5px; }
+        .metrics-matrix td { padding: 10px 8px; border: 1px solid #2b303b; }
+        .metrics-matrix .val { font-size: 1.8rem; font-weight: 700; color: #f0f6fc; }
+        .metrics-matrix .pct { font-size: 1rem; font-weight: 500; }
+        .metrics-matrix .row-title { font-size: 0.9rem; color: #8b949e; font-weight: 600; text-align: left; padding-left: 15px; }
+        
+        /* Matrix Colors */
+        .color-win { color: #3fb950; }
+        .color-loss { color: #f85149; }
+        .color-be { color: #a371f7; }
+        .color-open { color: #58a6ff; }
+
         .stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid #2b303b; }
         .stTabs [data-baseweb="tab"] { white-space: nowrap !important; padding: 10px 20px; background-color: transparent; color: #8b949e; font-size: 0.95rem; font-weight: 500; border: none; }
         .stTabs [aria-selected="true"] { background-color: rgba(88, 166, 255, 0.1) !important; color: #58a6ff !important; border-bottom: 3px solid #58a6ff !important; border-radius: 6px 6px 0 0; }
@@ -45,7 +57,6 @@ def send_telegram_alert(message):
     if not TELEGRAM_TOKEN: return 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
-    
     for attempt in range(3):
         try: 
             response = requests.post(url, data=payload, timeout=10)
@@ -220,7 +231,6 @@ def process_market_data():
         vol_ratio = current_candle['Vol_Ratio']
         adx_val = current_candle['ADX']
         
-        # Ensure we are using exact rounded values to fight Floating Point Drift
         for trade in open_trades:
             trade_id, sig_type, sl, tp, entry_price, entry_time_str = trade
             
@@ -237,14 +247,13 @@ def process_market_data():
                 else:
                     max_high_reached = current_candle['High']
                     min_low_reached = current_candle['Low']
-            except Exception as e:
+            except Exception:
                 max_high_reached = current_candle['High']
                 min_low_reached = current_candle['Low']
 
             current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
             
             if sig_type == 'long':
-                # FIXED: Round comparison blocks floating drift from triggering this repeatedly
                 if round(sl, 2) < round(entry_price, 2):
                     original_risk = entry_price - sl
                     if max_high_reached >= (entry_price + original_risk):
@@ -256,7 +265,6 @@ def process_market_data():
                     c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)}")
                 elif current_open <= sl:
-                    # FIXED: Hard rounding correctly labels zero-risk stops
                     status_text = 'BREAK-EVEN (GAP DOWN)' if round(sl, 2) == round(entry_price, 2) else 'SL HIT (GAP DOWN)'
                     c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(current_open, 2)}")
@@ -300,27 +308,21 @@ def process_market_data():
                   (name, scan_time_str, round(latest_price, 2), round(ema5_live, 2), round(ema39_live, 2), trend, round(dist_pct, 4), htf_trend, round(vol_ratio, 2), round(adx_val, 2)))
         conn.commit()
 
-        # --- ENTRY TRIGGERS & CANDLE LOCKING ---
         long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
         
         if long_cross or short_cross:
-            # 1. Capture exact timestamp of the locked 15m candle 
             try:
                 signal_candle_time = pd.to_datetime(last_closed.name).strftime("%Y-%m-%d %H:%M:%S")
             except:
                 signal_candle_time = scan_time_str 
             
-            # 2. Check DB memory to ensure we haven't already processed this exact candle
             c.execute("SELECT value FROM system_status WHERE key=?", (f"last_signal_{name}",))
             last_processed = c.fetchone()
             
-            # If timestamps match exactly, skip processing to avoid 5-minute spam
             if last_processed and last_processed[0] == signal_candle_time:
                 pass 
-            
             else:
-                # 3. Apply the lock permanently for this candle
                 c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"last_signal_{name}", signal_candle_time))
                 
                 atr_val = last_closed['ATR']
@@ -432,24 +434,77 @@ if uploaded_file is not None:
             st.rerun()
         except Exception as e: st.sidebar.error(f"Restore failed: {e}")
 
-head_col, m1, m2, m3 = st.columns([1.5, 1, 1, 1])
-with head_col:
-    st.markdown("<h1 style='background: -webkit-linear-gradient(45deg, #58a6ff, #1f6feb); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>⚡ Alpha Engine</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='color: #8b949e; font-size: 0.95rem; margin-top: -10px;'>Institutional 15m EMA Tracker • 24/5 Live</p>", unsafe_allow_html=True)
 
+# ==========================================
+# UI: NEW GRID METRICS MATRIX 
+# ==========================================
+st.markdown("<h1 style='background: -webkit-linear-gradient(45deg, #58a6ff, #1f6feb); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>⚡ Alpha Engine</h1>", unsafe_allow_html=True)
+st.markdown("<p style='color: #8b949e; font-size: 0.95rem; margin-top: -10px;'>Institutional 15m EMA Tracker • 24/5 Live</p>", unsafe_allow_html=True)
+
+# Math for the Metrics Matrix
 if not backup_df.empty:
-    wins = len(backup_df[backup_df['status'].str.contains('WIN')])
-    total = len(backup_df[backup_df['status'] != 'OPEN'])
-    win_rate = (wins / total * 100) if total > 0 else 0.0
+    closed_df = backup_df[backup_df['status'] != 'OPEN']
+    open_df = backup_df[backup_df['status'] == 'OPEN']
+    
+    total_closed = len(closed_df)
+    win_count = len(closed_df[closed_df['status'].str.contains('WIN', na=False)])
+    be_count = len(closed_df[closed_df['status'].str.contains('BREAK-EVEN', na=False)])
+    loss_count = len(closed_df[closed_df['status'].str.contains('LOSS', na=False)])
+    
+    win_pct = f"{(win_count / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
+    be_pct = f"{(be_count / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
+    loss_pct = f"{(loss_count / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
+    
+    total_open = len(open_df)
+    
+    # Calculate exactly how many open trades are mathematically "Risk-Free"
+    risk_free_count = 0
+    for _, row in open_df.iterrows():
+        try:
+            if round(float(row['sl']), 2) == round(float(row['entry_price']), 2):
+                risk_free_count += 1
+        except: pass
 else:
-    total, win_rate = 0, 0.0
+    total_closed, win_count, be_count, loss_count = 0, 0, 0, 0
+    win_pct, be_pct, loss_pct = "0.0%", "0.0%", "0.0%"
+    total_open, risk_free_count = 0, 0
 
-with m1: st.metric("Executed Trades", total)
-with m2: st.metric("Win Rate", f"{win_rate:.1f}%")
-with m3: st.metric("Active Watchlist", len(WATCHLIST))
+# Render the Custom HTML Grid Matrix
+st.markdown(f"""
+<table class="metrics-matrix">
+    <tr>
+        <th></th>
+        <th>Trades</th>
+        <th>Win</th>
+        <th>Break Even</th>
+        <th>Loss</th>
+    </tr>
+    <tr>
+        <td class="row-title">CLOSED TRADES</td>
+        <td class="val">{total_closed}</td>
+        <td class="val color-win">{win_count}</td>
+        <td class="val color-be">{be_count}</td>
+        <td class="val color-loss">{loss_count}</td>
+    </tr>
+    <tr>
+        <td class="row-title" style="border-bottom: 2px solid #2b303b;">WIN RATE %</td>
+        <td class="pct" style="border-bottom: 2px solid #2b303b;">-</td>
+        <td class="pct color-win" style="border-bottom: 2px solid #2b303b;">{win_pct}</td>
+        <td class="pct color-be" style="border-bottom: 2px solid #2b303b;">{be_pct}</td>
+        <td class="pct color-loss" style="border-bottom: 2px solid #2b303b;">{loss_pct}</td>
+    </tr>
+    <tr>
+        <td class="row-title">OPEN TRADES</td>
+        <td class="val color-open">{total_open}</td>
+        <td colspan="3" class="pct color-be" style="text-align: left; padding-left: 20px;">🛡️ {risk_free_count} Risk-Free | ⚠️ {total_open - risk_free_count} At Risk</td>
+    </tr>
+</table>
+""", unsafe_allow_html=True)
 
-st.markdown("<br>", unsafe_allow_html=True)
 
+# ==========================================
+# UI: TABBED INTERFACE
+# ==========================================
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔥 Heatmap", "📈 Chart", "🟢 Open", "📚 Ledger", "🚫 Blocked"])
 
 with tab1:
@@ -464,14 +519,6 @@ with tab1:
         return ''
     if not live_df.empty: st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), use_container_width=True, height=600, hide_index=True)
     else: st.info("Waiting for first data sync...")
-
-    with st.expander("📝 System Protections currently ACTIVE"):
-        st.markdown("""
-        * **1-Hour Trend:** Ensures entries align with macro momentum (Price > 1H 39 EMA).
-        * **ADX (Trend Strength):** Must be **> 20.0**. Blocks trades during sideways chops.
-        * **Over-Extension Filter:** Rejects fakeouts if price has surged >2.5 ATRs away from the baseline.
-        * **Dynamic SL:** Auto-moves Stop Loss to Break-Even once price moves +1.5 ATR in profit.
-        """)
 
 with tab2:
     if not live_df.empty:
@@ -496,16 +543,32 @@ with tab2:
                 except Exception: st.error("Chart data unavailable right now. Try again shortly.")
 
 with tab3:
-    open_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
-    if not open_df.empty: st.dataframe(open_df, use_container_width=True, height=600, hide_index=True)
-    else: st.info("No active trades currently open.")
+    open_df_ui = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
+    
+    if not open_df_ui.empty: 
+        # Add the automated Risk Status column
+        open_df_ui['Risk Status'] = np.where(np.round(open_df_ui['SL'].astype(float), 2) == np.round(open_df_ui['Entry'].astype(float), 2), '🛡️ RISK-FREE', '⚠️ AT RISK')
+        
+        # Move Risk Status to the front for easy reading
+        cols = ['Risk Status'] + [col for col in open_df_ui.columns if col != 'Risk Status']
+        open_df_ui = open_df_ui[cols]
+        
+        # Color code the Risk Status
+        def color_risk(val):
+            if 'RISK-FREE' in str(val): return 'background-color: rgba(163, 113, 247, 0.2); color: #a371f7; font-weight: bold;'
+            if 'AT RISK' in str(val): return 'color: #8b949e;'
+            return ''
+            
+        st.dataframe(open_df_ui.style.map(color_risk, subset=['Risk Status']), use_container_width=True, height=600, hide_index=True)
+    else: 
+        st.info("No active trades currently open.")
 
 with tab4:
     history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
     def color_status(val):
-        if 'WIN' in str(val): return 'background-color: rgba(0, 255, 0, 0.2)'
-        elif 'LOSS' in str(val): return 'background-color: rgba(255, 0, 0, 0.2)'
-        elif 'BREAK' in str(val): return 'background-color: rgba(128, 128, 128, 0.2)'
+        if 'WIN' in str(val): return 'background-color: rgba(63, 185, 80, 0.2); color: #3fb950; font-weight: bold;'
+        elif 'LOSS' in str(val): return 'background-color: rgba(248, 81, 73, 0.2); color: #f85149; font-weight: bold;'
+        elif 'BREAK' in str(val): return 'background-color: rgba(163, 113, 247, 0.2); color: #a371f7; font-weight: bold;'
         return ''
     if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['Status']), use_container_width=True, height=600, hide_index=True)
     else: st.info("No closed trades yet.")
