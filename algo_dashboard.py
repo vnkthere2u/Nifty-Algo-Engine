@@ -46,14 +46,13 @@ def send_telegram_alert(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
     
-    # Retry logic to defeat Telegram Rate Limits
     for attempt in range(3):
         try: 
             response = requests.post(url, data=payload, timeout=10)
-            if response.status_code == 429: # Hit the spam filter limit
-                time.sleep(3) # Wait 3 seconds and retry
+            if response.status_code == 429: 
+                time.sleep(3) 
                 continue
-            break # Success, exit the loop
+            break 
         except: 
             time.sleep(1)
 
@@ -221,6 +220,7 @@ def process_market_data():
         vol_ratio = current_candle['Vol_Ratio']
         adx_val = current_candle['ADX']
         
+        # Ensure we are using exact rounded values to fight Floating Point Drift
         for trade in open_trades:
             trade_id, sig_type, sl, tp, entry_price, entry_time_str = trade
             
@@ -244,7 +244,8 @@ def process_market_data():
             current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
             
             if sig_type == 'long':
-                if sl < entry_price:
+                # FIXED: Round comparison blocks floating drift from triggering this repeatedly
+                if round(sl, 2) < round(entry_price, 2):
                     original_risk = entry_price - sl
                     if max_high_reached >= (entry_price + original_risk):
                         c.execute("UPDATE trades SET sl=? WHERE id=?", (entry_price, trade_id))
@@ -255,19 +256,20 @@ def process_market_data():
                     c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)}")
                 elif current_open <= sl:
-                    status_text = 'BREAK-EVEN (GAP DOWN)' if sl == entry_price else 'SL HIT (GAP DOWN)'
+                    # FIXED: Hard rounding correctly labels zero-risk stops
+                    status_text = 'BREAK-EVEN (GAP DOWN)' if round(sl, 2) == round(entry_price, 2) else 'SL HIT (GAP DOWN)'
                     c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(current_open, 2)}")
                 elif current_high >= tp:
                     c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
                     send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} LONG closed at {round(tp, 2)}")
                 elif current_low <= sl:
-                    status_text = 'BREAK-EVEN (0 RISK)' if sl == entry_price else 'SL HIT (LOSS)'
+                    status_text = 'BREAK-EVEN (0 RISK)' if round(sl, 2) == round(entry_price, 2) else 'SL HIT (LOSS)'
                     c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, sl, trade_id))
                     send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(sl, 2)}")
                     
             elif sig_type == 'short':
-                if sl > entry_price:
+                if round(sl, 2) > round(entry_price, 2):
                     original_risk = sl - entry_price
                     if min_low_reached <= (entry_price - original_risk):
                         c.execute("UPDATE trades SET sl=? WHERE id=?", (entry_price, trade_id))
@@ -278,14 +280,14 @@ def process_market_data():
                     c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)}")
                 elif current_open >= sl:
-                    status_text = 'BREAK-EVEN (GAP UP)' if sl == entry_price else 'SL HIT (GAP UP)'
+                    status_text = 'BREAK-EVEN (GAP UP)' if round(sl, 2) == round(entry_price, 2) else 'SL HIT (GAP UP)'
                     c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_open, trade_id))
                     send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(current_open, 2)}")
                 elif current_low <= tp:
                     c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
                     send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} SHORT closed at {round(tp, 2)}")
                 elif current_high >= sl:
-                    status_text = 'BREAK-EVEN (0 RISK)' if sl == entry_price else 'SL HIT (LOSS)'
+                    status_text = 'BREAK-EVEN (0 RISK)' if round(sl, 2) == round(entry_price, 2) else 'SL HIT (LOSS)'
                     c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, sl, trade_id))
                     send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(sl, 2)}")
         conn.commit()
@@ -303,27 +305,28 @@ def process_market_data():
         short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
         
         if long_cross or short_cross:
-            # 1. Get the exact, unique timestamp of this closed candle
+            # 1. Capture exact timestamp of the locked 15m candle 
             try:
-                signal_candle_time = last_closed.name.strftime("%Y-%m-%d %H:%M:%S")
-            except AttributeError:
-                signal_candle_time = scan_time_str # Fallback if index formatting fails
+                signal_candle_time = pd.to_datetime(last_closed.name).strftime("%Y-%m-%d %H:%M:%S")
+            except:
+                signal_candle_time = scan_time_str 
             
-            # 2. Check the database to see if we already processed this exact candle
+            # 2. Check DB memory to ensure we haven't already processed this exact candle
             c.execute("SELECT value FROM system_status WHERE key=?", (f"last_signal_{name}",))
             last_processed = c.fetchone()
             
-            # If the timestamps match, we already evaluated this crossover in a previous 5-min loop.
+            # If timestamps match exactly, skip processing to avoid 5-minute spam
             if last_processed and last_processed[0] == signal_candle_time:
-                pass # Silently skip. Do not alert, do not log, do not trade.
+                pass 
             
-            # If it is a fresh candle, evaluate it!
             else:
-                # 3. Lock this candle in the database so it never fires again
+                # 3. Apply the lock permanently for this candle
                 c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"last_signal_{name}", signal_candle_time))
                 
                 atr_val = last_closed['ATR']
-                is_trending = last_closed.get('ADX', 0.0) > 20.0
+                closed_adx = last_closed.get('ADX', 0.0)
+                closed_vol = last_closed.get('Vol_Ratio', 1.0)
+                is_trending = closed_adx > 20.0
                 max_extension = 2.5 * atr_val
                 baseline_distance = abs(last_closed['Close'] - last_closed['EMA39'])
                 is_not_overextended = baseline_distance <= max_extension
@@ -333,7 +336,7 @@ def process_market_data():
                 rejection_reasons = []
                 
                 if len(open_trades) > 0: rejection_reasons.append("Active trade already open.")
-                if not is_trending: rejection_reasons.append(f"ADX < 20 ({round(adx_val, 1)}).")
+                if not is_trending: rejection_reasons.append(f"ADX < 20 ({round(closed_adx, 1)}).")
                 if htf_trend != required_htf: rejection_reasons.append(f"1H Trend Conflict ({htf_trend}).")
                 if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
                     
@@ -342,13 +345,13 @@ def process_market_data():
                     if long_cross:
                         sl, tp = entry - (1.5 * atr_val), entry + (3.75 * atr_val)
                         c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                  (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
-                        msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
+                                  (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2)))
+                        msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(closed_vol, 1)}x\nADX: {round(closed_adx, 1)}\nR:R Profile: 1:2.5"
                     elif short_cross:
                         sl, tp = entry + (1.5 * atr_val), entry - (3.75 * atr_val)
                         c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                  (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(vol_ratio, 2)))
-                        msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(vol_ratio, 1)}x\nADX: {round(adx_val, 1)}\nR:R Profile: 1:2.5"
+                                  (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2)))
+                        msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(closed_vol, 1)}x\nADX: {round(closed_adx, 1)}\nR:R Profile: 1:2.5"
                     
                     alerts.append(msg)
                     send_telegram_alert(msg)
@@ -356,11 +359,11 @@ def process_market_data():
                     reason_str = " | ".join(rejection_reasons)
                     c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) 
                                  VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                              (name, direction, scan_time_str, round(last_closed['Close'], 2), round(adx_val, 2), htf_trend, round(vol_ratio, 2), reason_str))
+                              (name, direction, scan_time_str, round(last_closed['Close'], 2), round(closed_adx, 2), htf_trend, round(closed_vol, 2), reason_str))
                     
                     msg = f"⚠️ <b>BLOCKED {direction} CROSS: {name}</b>\nTime: {scan_time_str}\n\n<i>Rejected Because:</i>\n"
                     for reason in rejection_reasons: msg += f"❌ {reason}\n"
-                    msg += f"\n<i>Context:</i>\n1H Trend: {htf_trend}\nADX: {round(adx_val, 1)}\nVol Surge: {round(vol_ratio, 1)}x"
+                    msg += f"\n<i>Context:</i>\n1H Trend: {htf_trend}\nADX: {round(closed_adx, 1)}\nVol Surge: {round(closed_vol, 1)}x"
                     send_telegram_alert(msg)
                 
         conn.commit()
