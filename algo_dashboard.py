@@ -50,15 +50,22 @@ except:
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN: return 
+    
+    # Minor sanitization to protect Telegram formatting
+    safe_message = message.replace("&", "&amp;")
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'}
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': safe_message, 'parse_mode': 'HTML'}
     for attempt in range(3):
         try: 
             response = requests.post(url, data=payload, timeout=10)
-            if response.status_code == 429: 
+            if response.status_code == 200:
+                break
+            elif response.status_code == 429: 
                 time.sleep(3) 
                 continue
-            break 
+            else:
+                break 
         except: 
             time.sleep(1)
 
@@ -94,9 +101,12 @@ def get_db_connection():
         c.execute("ALTER TABLE trades ADD COLUMN vol_ratio REAL")
     except sqlite3.OperationalError: pass 
     
-    try:
-        c.execute("ALTER TABLE trades ADD COLUMN atr REAL")
+    # SAFE MIGRATIONS for ATR and ADX tracking
+    try: c.execute("ALTER TABLE trades ADD COLUMN atr REAL")
     except sqlite3.OperationalError: pass 
+    try: c.execute("ALTER TABLE trades ADD COLUMN adx REAL")
+    except sqlite3.OperationalError: pass 
+    
     conn.commit()
 
     c.execute('''CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, value TEXT)''')
@@ -216,10 +226,9 @@ def process_market_data():
     for item in WATCHLIST:
         name = item['name']
         
-        # --- ENHANCED MARKET HOURS SHIELD (Includes Weekends) ---
         market_open = True
         if item['tv_exchange'] == 'NSE':
-            if ist_now.weekday() >= 5: # 5 = Saturday, 6 = Sunday
+            if ist_now.weekday() >= 5: 
                 market_open = False
             else:
                 minutes_since_midnight = ist_now.hour * 60 + ist_now.minute
@@ -253,7 +262,6 @@ def process_market_data():
             for trade in open_trades:
                 trade_id, sig_type, sl, tp, entry_price, entry_time_str = trade
                 
-                # --- FIXED: STRICT TIME-SLICING FOR RETROACTIVE SWEEPS ---
                 try:
                     clean_time_str = entry_time_str.replace(" (IST)", "")
                     entry_dt_ist = pd.to_datetime(clean_time_str, format="%Y-%m-%d %I:%M %p")
@@ -350,7 +358,8 @@ def process_market_data():
                     rejection_reasons = []
                     
                     if len(open_trades) > 0: rejection_reasons.append("Active trade already open.")
-                    if not is_trending: rejection_reasons.append(f"ADX < 20 ({round(closed_adx, 1)}).")
+                    # THE FIX: Swapped "<" for "Below" to prevent Telegram HTML Crash
+                    if not is_trending: rejection_reasons.append(f"ADX Below 20 ({round(closed_adx, 1)}).")
                     if htf_trend != required_htf: rejection_reasons.append(f"1H Trend Conflict ({htf_trend}).")
                     if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
                         
@@ -358,13 +367,15 @@ def process_market_data():
                         entry = last_closed['Close']
                         if long_cross:
                             sl, tp = entry - (1.5 * atr_val), entry + (3.75 * atr_val)
-                            c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                      (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2), round(atr_val, 2)))
+                            # THE FIX: Added ADX tracking to trade inserts
+                            c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                      (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2), round(atr_val, 2), round(closed_adx, 2)))
                             msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(closed_vol, 1)}x\nADX: {round(closed_adx, 1)}\nATR: {round(atr_val, 2)}\nR:R Profile: 1:2.5"
                         elif short_cross:
                             sl, tp = entry + (1.5 * atr_val), entry - (3.75 * atr_val)
-                            c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                      (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2), round(atr_val, 2)))
+                            # THE FIX: Added ADX tracking to trade inserts
+                            c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                      (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2), round(atr_val, 2), round(closed_adx, 2)))
                             msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(closed_vol, 1)}x\nADX: {round(closed_adx, 1)}\nATR: {round(atr_val, 2)}\nR:R Profile: 1:2.5"
                         
                         alerts.append(msg)
@@ -423,26 +434,47 @@ if st.sidebar.button("🔄 Force Manual Data Sync"):
         st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("<h3>🛡️ System Backup & Restore</h3>", unsafe_allow_html=True)
+st.sidebar.markdown("<h3>🛡️ Dual Backup & Restore</h3>", unsafe_allow_html=True)
 
-backup_df = pd.read_sql_query("SELECT * FROM trades", ui_conn)
-csv_data = backup_df.to_csv(index=False).encode('utf-8')
-st.sidebar.download_button(label="⬇️ Download DB Backup Now", data=csv_data, file_name=f"Manual_Backup_{datetime.now().strftime('%Y-%m-%d')}.csv", mime="text/csv")
+# THE FIX: Dual Backup Generators
+colA, colB = st.sidebar.columns(2)
+backup_trades_df = pd.read_sql_query("SELECT * FROM trades", ui_conn)
+csv_trades = backup_trades_df.to_csv(index=False).encode('utf-8')
+with colA: st.download_button(label="⬇️ Backup Trades", data=csv_trades, file_name=f"Trades_Backup_{datetime.now().strftime('%Y-%m-%d')}.csv", mime="text/csv")
 
-uploaded_file = st.sidebar.file_uploader("Restore Data (Upload CSV)", type=['csv'])
+backup_blocked_df = pd.read_sql_query("SELECT * FROM blocked_signals", ui_conn)
+csv_blocked = backup_blocked_df.to_csv(index=False).encode('utf-8')
+with colB: st.download_button(label="⬇️ Backup Blocked", data=csv_blocked, file_name=f"Blocked_Backup_{datetime.now().strftime('%Y-%m-%d')}.csv", mime="text/csv")
+
+# THE FIX: Dual Restore Interface
+st.sidebar.markdown("<b>Restore Database (Upload CSV)</b>", unsafe_allow_html=True)
+restore_type = st.sidebar.radio("Select which table to restore:", ["Trades Database", "Blocked Signals Database"], label_visibility="collapsed")
+uploaded_file = st.sidebar.file_uploader(f"Upload CSV", type=['csv'], label_visibility="collapsed")
+
 if uploaded_file is not None:
-    if st.sidebar.button("⚙️ Execute Data Restore"):
+    if st.sidebar.button(f"⚙️ Execute {restore_type.split()[0]} Restore"):
         try:
             restore_df = pd.read_csv(uploaded_file)
-            rename_map = {'Asset': 'ticker', 'Signal': 'signal_type', 'Entry Time': 'entry_time', 'Entry': 'entry_price', 'SL': 'sl', 'TP': 'tp', 'ATR': 'atr', 'Status': 'status', 'Exit Time': 'exit_time', 'Exit Price': 'exit_price', '1H Trend': 'htf_trend', 'Vol (x)': 'vol_ratio'}
-            restore_df = restore_df.rename(columns=rename_map)
-            restore_df = restore_df.fillna({'exit_time': '', 'exit_price': 0.0, 'htf_trend': '', 'vol_ratio': 1.0, 'atr': 0.0})
-            for index, row in restore_df.iterrows():
-                ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
-                if not ui_c.fetchone():
-                    ui_c.execute("""INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price, htf_trend, vol_ratio, atr) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['entry_time'], row['entry_price'], row['sl'], row['tp'], row['status'], row['exit_time'], row['exit_price'], row['htf_trend'], row['vol_ratio'], row['atr']))
+            
+            if "Trades" in restore_type:
+                rename_map = {'Asset': 'ticker', 'Signal': 'signal_type', 'Entry Time': 'entry_time', 'Entry': 'entry_price', 'SL': 'sl', 'TP': 'tp', 'ATR': 'atr', 'ADX': 'adx', 'Status': 'status', 'Exit Time': 'exit_time', 'Exit Price': 'exit_price', '1H Trend': 'htf_trend', 'Vol (x)': 'vol_ratio'}
+                restore_df = restore_df.rename(columns=rename_map)
+                restore_df = restore_df.fillna({'exit_time': '', 'exit_price': 0.0, 'htf_trend': '', 'vol_ratio': 1.0, 'atr': 0.0, 'adx': 0.0})
+                for index, row in restore_df.iterrows():
+                    ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
+                    if not ui_c.fetchone():
+                        ui_c.execute("""INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['entry_time'], row['entry_price'], row['sl'], row['tp'], row['status'], row['exit_time'], row['exit_price'], row['htf_trend'], row['vol_ratio'], row['atr'], row['adx']))
+            else:
+                rename_map = {'Asset': 'ticker', 'Signal': 'signal_type', 'Time (IST)': 'timestamp', 'Price': 'price', 'ADX': 'adx', '1H Trend': 'htf_trend', 'Vol (x)': 'vol_ratio', 'Rejection Reasons': 'rejection_reasons'}
+                restore_df = restore_df.rename(columns=rename_map)
+                restore_df = restore_df.fillna({'adx': 0.0, 'htf_trend': '', 'vol_ratio': 1.0, 'rejection_reasons': ''})
+                for index, row in restore_df.iterrows():
+                    ui_c.execute("SELECT id FROM blocked_signals WHERE ticker=? AND timestamp=?", (row['ticker'], row['timestamp']))
+                    if not ui_c.fetchone():
+                        ui_c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['timestamp'], row['price'], row['adx'], row['htf_trend'], row['vol_ratio'], row['rejection_reasons']))
+            
             ui_conn.commit()
-            st.sidebar.success("✅ Database Restored! Rebooting...")
+            st.sidebar.success(f"✅ Data Restored! Rebooting...")
             time.sleep(2)
             st.rerun()
         except Exception as e: st.sidebar.error(f"Restore failed: {e}")
@@ -453,9 +485,9 @@ if uploaded_file is not None:
 st.markdown("<h1 style='background: -webkit-linear-gradient(45deg, #58a6ff, #1f6feb); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>⚡ Alpha Engine</h1>", unsafe_allow_html=True)
 st.markdown("<p style='color: #8b949e; font-size: 0.95rem; margin-top: -10px;'>Institutional 15m EMA Tracker • 24/7 Multi-Market</p>", unsafe_allow_html=True)
 
-if not backup_df.empty:
-    closed_df = backup_df[backup_df['status'] != 'OPEN']
-    open_df = backup_df[backup_df['status'] == 'OPEN']
+if not backup_trades_df.empty:
+    closed_df = backup_trades_df[backup_trades_df['status'] != 'OPEN']
+    open_df = backup_trades_df[backup_trades_df['status'] == 'OPEN']
     
     total_closed = len(closed_df)
     win_count = len(closed_df[closed_df['status'].str.contains('WIN', na=False)])
@@ -551,7 +583,8 @@ with tab2:
                 except Exception: st.error("Chart data unavailable right now. Try again shortly.")
 
 with tab3:
-    open_df_ui = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
+    # THE FIX: Added ADX to Open trades display
+    open_df_ui = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
     if not open_df_ui.empty: 
         open_df_ui['Risk Status'] = np.where(np.round(open_df_ui['SL'].astype(float), 2) == np.round(open_df_ui['Entry'].astype(float), 2), '🛡️ RISK-FREE', '⚠️ AT RISK')
         cols = ['Risk Status'] + [col for col in open_df_ui.columns if col != 'Risk Status']
@@ -565,7 +598,8 @@ with tab3:
         st.info("No active trades currently open.")
 
 with tab4:
-    history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
+    # THE FIX: Added ADX to Ledger display
+    history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, adx as ADX, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
     def color_status(val):
         if 'WIN' in str(val): return 'background-color: rgba(63, 185, 80, 0.2); color: #3fb950; font-weight: bold;'
         elif 'LOSS' in str(val): return 'background-color: rgba(248, 81, 73, 0.2); color: #f85149; font-weight: bold;'
