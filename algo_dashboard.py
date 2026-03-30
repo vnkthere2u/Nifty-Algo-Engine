@@ -51,11 +51,10 @@ except:
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN: return 
     
-    # Minor sanitization to protect Telegram formatting
     safe_message = message.replace("&", "&amp;")
-    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': safe_message, 'parse_mode': 'HTML'}
+    
     for attempt in range(3):
         try: 
             response = requests.post(url, data=payload, timeout=10)
@@ -65,8 +64,23 @@ def send_telegram_alert(message):
                 time.sleep(3) 
                 continue
             else:
+                conn = get_db_connection()
+                c = conn.cursor()
+                ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+                err_msg = f"Telegram API Error {response.status_code}: {response.text}"
+                c.execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (ist_now.strftime("%Y-%m-%d %I:%M %p"), err_msg))
+                conn.commit()
+                conn.close()
                 break 
-        except: 
+        except Exception as e: 
+            try:
+                conn = get_db_connection()
+                c = conn.cursor()
+                ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+                c.execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (ist_now.strftime("%Y-%m-%d %I:%M %p"), f"Telegram Network Crash: {str(e)}"))
+                conn.commit()
+                conn.close()
+            except: pass
             time.sleep(1)
 
 def send_telegram_csv_backup():
@@ -101,7 +115,6 @@ def get_db_connection():
         c.execute("ALTER TABLE trades ADD COLUMN vol_ratio REAL")
     except sqlite3.OperationalError: pass 
     
-    # SAFE MIGRATIONS for ATR and ADX tracking
     try: c.execute("ALTER TABLE trades ADD COLUMN atr REAL")
     except sqlite3.OperationalError: pass 
     try: c.execute("ALTER TABLE trades ADD COLUMN adx REAL")
@@ -358,7 +371,6 @@ def process_market_data():
                     rejection_reasons = []
                     
                     if len(open_trades) > 0: rejection_reasons.append("Active trade already open.")
-                    # THE FIX: Swapped "<" for "Below" to prevent Telegram HTML Crash
                     if not is_trending: rejection_reasons.append(f"ADX Below 20 ({round(closed_adx, 1)}).")
                     if htf_trend != required_htf: rejection_reasons.append(f"1H Trend Conflict ({htf_trend}).")
                     if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
@@ -367,13 +379,11 @@ def process_market_data():
                         entry = last_closed['Close']
                         if long_cross:
                             sl, tp = entry - (1.5 * atr_val), entry + (3.75 * atr_val)
-                            # THE FIX: Added ADX tracking to trade inserts
                             c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                       (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2), round(atr_val, 2), round(closed_adx, 2)))
                             msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(closed_vol, 1)}x\nADX: {round(closed_adx, 1)}\nATR: {round(atr_val, 2)}\nR:R Profile: 1:2.5"
                         elif short_cross:
                             sl, tp = entry + (1.5 * atr_val), entry - (3.75 * atr_val)
-                            # THE FIX: Added ADX tracking to trade inserts
                             c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                       (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', htf_trend, round(closed_vol, 2), round(atr_val, 2), round(closed_adx, 2)))
                             msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {htf_trend}\nVol Surge: {round(closed_vol, 1)}x\nADX: {round(closed_adx, 1)}\nATR: {round(atr_val, 2)}\nR:R Profile: 1:2.5"
@@ -436,7 +446,6 @@ if st.sidebar.button("🔄 Force Manual Data Sync"):
 st.sidebar.markdown("---")
 st.sidebar.markdown("<h3>🛡️ Dual Backup & Restore</h3>", unsafe_allow_html=True)
 
-# THE FIX: Dual Backup Generators
 colA, colB = st.sidebar.columns(2)
 backup_trades_df = pd.read_sql_query("SELECT * FROM trades", ui_conn)
 csv_trades = backup_trades_df.to_csv(index=False).encode('utf-8')
@@ -446,7 +455,6 @@ backup_blocked_df = pd.read_sql_query("SELECT * FROM blocked_signals", ui_conn)
 csv_blocked = backup_blocked_df.to_csv(index=False).encode('utf-8')
 with colB: st.download_button(label="⬇️ Backup Blocked", data=csv_blocked, file_name=f"Blocked_Backup_{datetime.now().strftime('%Y-%m-%d')}.csv", mime="text/csv")
 
-# THE FIX: Dual Restore Interface
 st.sidebar.markdown("<b>Restore Database (Upload CSV)</b>", unsafe_allow_html=True)
 restore_type = st.sidebar.radio("Select which table to restore:", ["Trades Database", "Blocked Signals Database"], label_visibility="collapsed")
 uploaded_file = st.sidebar.file_uploader(f"Upload CSV", type=['csv'], label_visibility="collapsed")
@@ -479,6 +487,13 @@ if uploaded_file is not None:
             st.rerun()
         except Exception as e: st.sidebar.error(f"Restore failed: {e}")
 
+st.sidebar.markdown("---")
+st.sidebar.markdown("<h3>🧪 System Diagnostics</h3>", unsafe_allow_html=True)
+if st.sidebar.button("🔔 Send Test Telegram Alert"):
+    send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\n<i>Testing HTML Parser:</i>\nAsset: L&amp;T\nReason: ADX Below 20 (< 20)")
+    st.sidebar.success("Ping fired! Check your Telegram.")
+
+
 # ==========================================
 # UI: NEW GRID METRICS MATRIX 
 # ==========================================
@@ -490,7 +505,9 @@ if not backup_trades_df.empty:
     open_df = backup_trades_df[backup_trades_df['status'] == 'OPEN']
     
     total_closed = len(closed_df)
-    win_count = len(closed_df[closed_df['status'].str.contains('WIN', na=False)])
+    
+    # THE FIX: Upgraded string match to catch 'TP' or 'WIN'
+    win_count = len(closed_df[closed_df['status'].str.contains('TP|WIN', na=False, regex=True)])
     be_count = len(closed_df[closed_df['status'].str.contains('BREAK-EVEN', na=False)])
     loss_count = len(closed_df[closed_df['status'].str.contains('LOSS', na=False)])
     
@@ -583,7 +600,6 @@ with tab2:
                 except Exception: st.error("Chart data unavailable right now. Try again shortly.")
 
 with tab3:
-    # THE FIX: Added ADX to Open trades display
     open_df_ui = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
     if not open_df_ui.empty: 
         open_df_ui['Risk Status'] = np.where(np.round(open_df_ui['SL'].astype(float), 2) == np.round(open_df_ui['Entry'].astype(float), 2), '🛡️ RISK-FREE', '⚠️ AT RISK')
@@ -598,13 +614,16 @@ with tab3:
         st.info("No active trades currently open.")
 
 with tab4:
-    # THE FIX: Added ADX to Ledger display
     history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, adx as ADX, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
+    
+    # THE FIX: Upgraded color coder to highlight 'TP' hits as green
     def color_status(val):
-        if 'WIN' in str(val): return 'background-color: rgba(63, 185, 80, 0.2); color: #3fb950; font-weight: bold;'
-        elif 'LOSS' in str(val): return 'background-color: rgba(248, 81, 73, 0.2); color: #f85149; font-weight: bold;'
-        elif 'BREAK' in str(val): return 'background-color: rgba(163, 113, 247, 0.2); color: #a371f7; font-weight: bold;'
+        val_str = str(val).upper()
+        if 'WIN' in val_str or 'TP' in val_str: return 'background-color: rgba(63, 185, 80, 0.2); color: #3fb950; font-weight: bold;'
+        elif 'LOSS' in val_str: return 'background-color: rgba(248, 81, 73, 0.2); color: #f85149; font-weight: bold;'
+        elif 'BREAK' in val_str: return 'background-color: rgba(163, 113, 247, 0.2); color: #a371f7; font-weight: bold;'
         return ''
+        
     if not history_df.empty: st.dataframe(history_df.style.map(color_status, subset=['Status']), use_container_width=True, height=600, hide_index=True)
     else: st.info("No closed trades yet.")
 
