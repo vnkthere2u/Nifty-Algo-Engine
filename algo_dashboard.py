@@ -272,10 +272,7 @@ def process_market_data():
         
         if market_open:
             for trade in open_trades:
-                # FIX: Unpacking the ATR value directly from DB
                 trade_id, sig_type, sl, tp, entry_price, entry_time_str, db_atr = trade
-                
-                # Math Fallback: If DB ATR is missing (old trades), reverse-engineer it from the TP width
                 atr_val = db_atr if (db_atr and db_atr > 0) else abs(tp - entry_price) / 3.75
                 
                 try:
@@ -296,11 +293,10 @@ def process_market_data():
 
                 current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
                 
-                # ===============================================
-                # UPDATED: 1.0 ATR Profit-Locking Logic
-                # ===============================================
+                # Protects against chronological evaluation paradoxes
+                sl_before_update = sl 
+                
                 if sig_type == 'long':
-                    # Check if SL is still at original risk
                     if round(sl, 2) <= round(entry_price, 2):
                         if max_high_reached >= (entry_price + (1.0 * atr_val)):
                             new_sl = entry_price + (0.25 * atr_val)
@@ -311,8 +307,8 @@ def process_market_data():
                     if current_open >= tp:
                         c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                         send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)}")
-                    elif current_open <= sl:
-                        status_text = 'BREAK-EVEN TP HIT (GAP)' if sl > entry_price else ('BREAK-EVEN (GAP)' if sl == entry_price else 'SL HIT (GAP DOWN)')
+                    elif current_open <= sl_before_update:
+                        status_text = 'BREAK-EVEN TP HIT (GAP)' if sl_before_update > entry_price else ('BREAK-EVEN (GAP DOWN)' if sl_before_update == entry_price else 'SL HIT (GAP DOWN)')
                         c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_open, trade_id))
                         send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(current_open, 2)}")
                     elif current_high >= tp:
@@ -324,7 +320,6 @@ def process_market_data():
                         send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(sl, 2)}")
                         
                 elif sig_type == 'short':
-                    # Check if SL is still at original risk
                     if round(sl, 2) >= round(entry_price, 2):
                         if min_low_reached <= (entry_price - (1.0 * atr_val)):
                             new_sl = entry_price - (0.25 * atr_val)
@@ -335,8 +330,8 @@ def process_market_data():
                     if current_open <= tp:
                         c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
                         send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)}")
-                    elif current_open >= sl:
-                        status_text = 'BREAK-EVEN TP HIT (GAP)' if sl < entry_price else ('BREAK-EVEN (GAP)' if sl == entry_price else 'SL HIT (GAP UP)')
+                    elif current_open >= sl_before_update:
+                        status_text = 'BREAK-EVEN TP HIT (GAP)' if sl_before_update < entry_price else ('BREAK-EVEN (GAP UP)' if sl_before_update == entry_price else 'SL HIT (GAP UP)')
                         c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_open, trade_id))
                         send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(current_open, 2)}")
                     elif current_low <= tp:
@@ -456,7 +451,8 @@ csv_blocked = backup_blocked_df.to_csv(index=False).encode('utf-8')
 with colB: st.download_button(label="⬇️ Backup Blocked", data=csv_blocked, file_name=f"Blocked_Backup_{datetime.now().strftime('%Y-%m-%d')}.csv", mime="text/csv")
 
 st.sidebar.markdown("<b>Restore Database (Upload CSV)</b>", unsafe_allow_html=True)
-uploaded_file = st.sidebar.file_uploader("Upload CSV", type=['csv'], label_visibility="collapsed")
+# THE FIX: Removed type=['csv'] so Mobile browsers don't hide the file!
+uploaded_file = st.sidebar.file_uploader("Upload CSV", type=None, label_visibility="collapsed")
 
 if uploaded_file is not None:
     if st.sidebar.button("⚙️ Execute Auto-Restore"):
@@ -516,8 +512,9 @@ if not history_df.empty:
                                      (history_df['Entry'] - history_df['Exit Price']) / history_df['Entry'])
     history_df['PnL (₹)'] = history_df['Yield'] * TRADE_ALLOCATION
     
-    # Mathematically force 0 Risk Break-Evens to 0. (Break-Even TP Hits keep their profit!)
-    history_df['PnL (₹)'] = np.where(history_df['Status'] == 'BREAK-EVEN (0 RISK)', 0.0, history_df['PnL (₹)'])
+    # THE FIX: Mutually exclusive masks to ensure 0 Risk Break-Evens are 0, but TP Hits keep profit
+    is_zero_be = history_df['Status'].str.contains('BREAK-EVEN', regex=True) & ~history_df['Status'].str.contains('TP HIT', regex=True)
+    history_df.loc[is_zero_be, 'PnL (₹)'] = 0.0
     history_df['PnL (₹)'] = history_df['PnL (₹)'].round(2)
     realized_pnl = history_df['PnL (₹)'].sum()
 else: realized_pnl = 0.0
@@ -535,7 +532,6 @@ if not open_df_ui.empty:
     open_df_ui['Unrealized PnL (₹)'] = (open_df_ui['Yield'] * TRADE_ALLOCATION).round(2)
     total_unrealized_pnl = open_df_ui['Unrealized PnL (₹)'].sum()
     
-    # Advanced Risk Flag logic (Accounts for Longs/Shorts correctly locking profit)
     open_df_ui['Risk Status'] = np.where( ((open_df_ui['Signal'].str.lower() == 'long') & (open_df_ui['SL'] >= open_df_ui['Entry'])) | 
                                           ((open_df_ui['Signal'].str.lower() == 'short') & (open_df_ui['SL'] <= open_df_ui['Entry'])), 
                                           '🛡️ RISK-FREE', '⚠️ AT RISK')
@@ -543,7 +539,6 @@ if not open_df_ui.empty:
 # ==========================================
 # UI: NEW GRID METRICS MATRIX 
 # ==========================================
-# THE FIX: Golden Custom Header
 st.markdown("<h1 style='background: -webkit-linear-gradient(45deg, #ffd700, #ffaa00); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>⚡ Algo Engine by Vinayak</h1>", unsafe_allow_html=True)
 st.markdown("<p style='color: #8b949e; font-size: 0.95rem; margin-top: -10px;'>Multi Asset Market Tracker</p>", unsafe_allow_html=True)
 
@@ -552,16 +547,20 @@ if not backup_trades_df.empty:
     open_df = backup_trades_df[backup_trades_df['status'] == 'OPEN']
     
     total_closed = len(closed_df)
-    # The regex 'TP|WIN' perfectly captures our new 'BREAK-EVEN TP HIT' status!
-    win_count = len(closed_df[closed_df['status'].str.contains('TP|WIN', na=False, regex=True)])
-    be_count = len(closed_df[closed_df['status'].str.contains('BREAK-EVEN \(0', na=False, regex=True)])
-    loss_count = len(closed_df[closed_df['status'].str.contains('LOSS', na=False)])
+    
+    # THE FIX: Mutually exclusive counting masks to prevent Double-Counting!
+    win_mask = closed_df['status'].str.contains('TP|WIN', regex=True, na=False)
+    be_mask = closed_df['status'].str.contains('BREAK-EVEN', regex=True, na=False) & ~win_mask
+    loss_mask = closed_df['status'].str.contains('LOSS', regex=True, na=False)
+    
+    win_count = len(closed_df[win_mask])
+    be_count = len(closed_df[be_mask])
+    loss_count = len(closed_df[loss_mask])
     
     win_pct = f"{(win_count / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
     be_pct = f"{(be_count / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
     loss_pct = f"{(loss_count / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
     
-    # THE FIX: Combined Win + BE Rate
     combined_win_be_pct = f"{((win_count + be_count) / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
     
     total_open = len(open_df)
@@ -614,7 +613,6 @@ st.markdown(f"""
 </table>
 """, unsafe_allow_html=True)
 
-# Helper function for new interactive filters
 def render_filters(df, tab_name):
     if df.empty: return df
     with st.expander(f"🔍 Filter {tab_name} Data"):
@@ -639,7 +637,6 @@ def render_filters(df, tab_name):
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🔥 Heatmap", "📈 Chart", "🟢 Open", "📚 Ledger", "🚫 Blocked", "💰 Equity"])
 
 with tab1:
-    # THE FIX: HTML breaks added to legend
     st.markdown("<p style='font-size:0.9rem; color:gray; margin-bottom:5px; line-height:1.4;'><b>Legend:</b><br>🔴 Red &lt; 0.1% Gap (Imminent) | 🟠 Orange &lt; 0.5% Gap (Watch Closely)</p>", unsafe_allow_html=True)
     def apply_heatmap(val):
         if pd.isna(val): return ''
@@ -751,9 +748,8 @@ with tab6:
         equity_df = pd.concat([start_row, equity_df], ignore_index=True)
         
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=equity_df['Exit Time'], y=equity_df['Account Equity'], mode='lines+markers', line=dict(color='#58a6ff', width=3), marker=dict(size=6, color='#58a6ff'), fill='tozeroy', fillcolor='rgba(88, 166, 255, 0.1)'))
+        fig.add_trace(go.Scatter(x=equity_df['Exit Time'], y=equity_df['Account Equity'], mode='lines+markers', line=dict(color='#ffd700', width=3), marker=dict(size=6, color='#ffd700'), fill='tozeroy', fillcolor='rgba(255, 215, 0, 0.1)'))
         
-        # THE FIX: Explicitly zoom the Y-Axis to the exact high/low to prevent flattening
         min_eq = equity_df['Account Equity'].min()
         max_eq = equity_df['Account Equity'].max()
         padding = (max_eq - min_eq) * 0.1 if max_eq != min_eq else 1000
