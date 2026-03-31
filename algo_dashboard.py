@@ -293,7 +293,6 @@ def process_market_data():
 
                 current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
                 
-                # Protects against chronological evaluation paradoxes
                 sl_before_update = sl 
                 
                 if sig_type == 'long':
@@ -451,7 +450,6 @@ csv_blocked = backup_blocked_df.to_csv(index=False).encode('utf-8')
 with colB: st.download_button(label="⬇️ Backup Blocked", data=csv_blocked, file_name=f"Blocked_Backup_{datetime.now().strftime('%Y-%m-%d')}.csv", mime="text/csv")
 
 st.sidebar.markdown("<b>Restore Database (Upload CSV)</b>", unsafe_allow_html=True)
-# THE FIX: Removed type=['csv'] so Mobile browsers don't hide the file!
 uploaded_file = st.sidebar.file_uploader("Upload CSV", type=None, label_visibility="collapsed")
 
 if uploaded_file is not None:
@@ -512,7 +510,6 @@ if not history_df.empty:
                                      (history_df['Entry'] - history_df['Exit Price']) / history_df['Entry'])
     history_df['PnL (₹)'] = history_df['Yield'] * TRADE_ALLOCATION
     
-    # THE FIX: Mutually exclusive masks to ensure 0 Risk Break-Evens are 0, but TP Hits keep profit
     is_zero_be = history_df['Status'].str.contains('BREAK-EVEN', regex=True) & ~history_df['Status'].str.contains('TP HIT', regex=True)
     history_df.loc[is_zero_be, 'PnL (₹)'] = 0.0
     history_df['PnL (₹)'] = history_df['PnL (₹)'].round(2)
@@ -548,10 +545,10 @@ if not backup_trades_df.empty:
     
     total_closed = len(closed_df)
     
-    # THE FIX: Mutually exclusive counting masks to prevent Double-Counting!
+    # THE FULLY ARMORED MASKS
     win_mask = closed_df['status'].str.contains('TP|WIN', regex=True, na=False)
     be_mask = closed_df['status'].str.contains('BREAK-EVEN', regex=True, na=False) & ~win_mask
-    loss_mask = closed_df['status'].str.contains('LOSS', regex=True, na=False)
+    loss_mask = closed_df['status'].str.contains('LOSS|SL HIT', regex=True, na=False)
     
     win_count = len(closed_df[win_mask])
     be_count = len(closed_df[be_mask])
@@ -712,7 +709,8 @@ with tab4:
             def color_status_pnl(val):
                 val_str = str(val).upper()
                 if 'WIN' in val_str or 'TP' in val_str: return 'background-color: rgba(63, 185, 80, 0.2); color: #3fb950; font-weight: bold;'
-                elif 'LOSS' in val_str: return 'background-color: rgba(248, 81, 73, 0.2); color: #f85149; font-weight: bold;'
+                # THE FINAL COLOR FIX
+                elif 'LOSS' in val_str or 'SL HIT' in val_str: return 'background-color: rgba(248, 81, 73, 0.2); color: #f85149; font-weight: bold;'
                 elif 'BREAK' in val_str: return 'background-color: rgba(163, 113, 247, 0.2); color: #a371f7; font-weight: bold;'
                 try:
                     if float(val) > 0: return 'color: #3fb950; font-weight: bold;'
