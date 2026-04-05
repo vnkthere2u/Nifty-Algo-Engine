@@ -7,6 +7,7 @@ import time
 import requests
 import threading
 import os
+import gc # THE FIX: Python Garbage Collector
 import traceback
 import yfinance as yf
 import plotly.graph_objects as go
@@ -179,8 +180,8 @@ def fetch_and_analyze(item):
             df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
             df = df_tv
     except Exception:
-        try: tv = TvDatafeed() 
-        except: pass
+        # THE FIX: Removed forceful re-instantiation of tvDatafeed to prevent Memory Leak
+        pass
 
     if df is None or df.empty:
         try:
@@ -404,6 +405,9 @@ def process_market_data():
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (scan_time_str,))
     conn.commit()
     conn.close()
+    
+    # THE FIX: Forcefully purge hidden DataFrames and fragments from RAM every 5 minutes
+    gc.collect() 
     return alerts
 
 # ==========================================
@@ -416,8 +420,10 @@ ui_c = ui_conn.cursor()
 def start_background_scanner():
     def background_loop():
         while True:
-            try: process_market_data()
-            except Exception: pass
+            try: 
+                process_market_data()
+            except Exception: 
+                pass
             time.sleep(300)
     thread = threading.Thread(target=background_loop, daemon=True)
     thread.start()
@@ -545,7 +551,6 @@ if not backup_trades_df.empty:
     
     total_closed = len(closed_df)
     
-    # THE FULLY ARMORED MASKS
     win_mask = closed_df['status'].str.contains('TP|WIN', regex=True, na=False)
     be_mask = closed_df['status'].str.contains('BREAK-EVEN', regex=True, na=False) & ~win_mask
     loss_mask = closed_df['status'].str.contains('LOSS|SL HIT', regex=True, na=False)
@@ -709,7 +714,6 @@ with tab4:
             def color_status_pnl(val):
                 val_str = str(val).upper()
                 if 'WIN' in val_str or 'TP' in val_str: return 'background-color: rgba(63, 185, 80, 0.2); color: #3fb950; font-weight: bold;'
-                # THE FINAL COLOR FIX
                 elif 'LOSS' in val_str or 'SL HIT' in val_str: return 'background-color: rgba(248, 81, 73, 0.2); color: #f85149; font-weight: bold;'
                 elif 'BREAK' in val_str: return 'background-color: rgba(163, 113, 247, 0.2); color: #a371f7; font-weight: bold;'
                 try:
@@ -762,3 +766,6 @@ with tab6:
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No closed trades available to plot equity curve yet.")
+
+# THE FIX: Close the SQLite connection to prevent UI memory leaks
+ui_conn.close()
