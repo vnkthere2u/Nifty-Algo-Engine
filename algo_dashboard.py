@@ -11,6 +11,7 @@ import gc
 import traceback
 import yfinance as yf
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, timezone
 from tvDatafeed import TvDatafeed, Interval
 
@@ -271,7 +272,6 @@ def process_market_data():
         conn.commit()
         
         if market_open:
-            # 1. MANAGE OPEN TRADES
             for trade in open_trades:
                 trade_id, sig_type, sl, tp, entry_price, entry_time_str, db_atr = trade
                 atr_val = db_atr if (db_atr and db_atr > 0) else abs(tp - entry_price) / 3.75
@@ -346,7 +346,6 @@ def process_market_data():
             long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
             short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
             
-            # The slot_id is the timestamp of the CURRENT forming candle (e.g., 9:00:00) to act as a unique lock
             try: slot_id = pd.to_datetime(current_candle.name).strftime("%Y-%m-%d %H:%M:%S")
             except: slot_id = scan_time_str 
             
@@ -358,8 +357,18 @@ def process_market_data():
                 if long_cross or short_cross:
                     direction = "LONG" if long_cross else "SHORT"
                     atr_val = last_closed['ATR']
-                    # THE FIX: Store the true Atomic Clock time of when the anchor was dropped
-                    atomic_start = ist_now.strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # THE FIX: TRUE MARKET ANCHORING
+                    # We mathematically lock the start time to the EXACT close of the crossover candle, ignoring server delays.
+                    try:
+                        last_closed_dt = pd.to_datetime(last_closed.name)
+                        if last_closed_dt.tz is not None: 
+                            last_closed_dt = last_closed_dt.tz_localize(None)
+                        true_anchor_time = last_closed_dt + timedelta(minutes=15)
+                        atomic_start = true_anchor_time.strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        atomic_start = ist_now.strftime("%Y-%m-%d %H:%M:%S")
+
                     anchor_val = f"{atomic_start}|{direction}|{atr_val}|{slot_id}"
                     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
                     conn.commit()
@@ -378,13 +387,10 @@ def process_market_data():
                 try: anchor_dt = datetime.strptime(atomic_start_str, "%Y-%m-%d %H:%M:%S")
                 except: anchor_dt = ist_now.replace(tzinfo=None) - timedelta(minutes=20) 
                 
-                # THE FIX: Calculate elapsed time using the Atomic Clock!
                 atomic_now = ist_now.replace(tzinfo=None)
                 time_diff = (atomic_now - anchor_dt).total_seconds() / 60.0
                 
-                if time_diff <= 16.0: # Buffer added to protect against slow server scans
-                    # If roughly 15 minutes have elapsed, the candle has closed. Use finalized data.
-                    # Otherwise, evaluate the live, breathing current_candle data.
+                if time_diff <= 16.0: 
                     eval_candle = last_closed if time_diff >= 14.0 else current_candle
                     
                     live_adx = eval_candle.get('ADX', 0.0)
@@ -542,6 +548,7 @@ st.sidebar.markdown("<h3>🧪 System Diagnostics</h3>", unsafe_allow_html=True)
 if st.sidebar.button("🔔 Send Test Telegram Alert"):
     send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\n<i>Testing HTML Parser:</i>\nAsset: L&amp;T\nReason: ADX Below 20 (< 20)")
     st.sidebar.success("Ping fired! Check your Telegram.")
+
 
 # ==========================================
 # CAPITAL & PNL CALCULATIONS (NATIVE INR)
@@ -708,20 +715,51 @@ with tab2:
             yf_symbol = next(item['yf_symbol'] for item in WATCHLIST if item['name'] == selected_stock)
             with st.spinner(f"Loading order book for {selected_stock}..."):
                 try:
-                    chart_df = yf.Ticker(yf_symbol).history(interval="15m", period="3d")
+                    chart_df = yf.Ticker(yf_symbol).history(interval="15m", period="5d") 
                     if not chart_df.empty:
                         if chart_df.index.tz is not None: chart_df.index = chart_df.index.tz_convert('Asia/Kolkata').tz_localize(None)
                         else: chart_df.index = chart_df.index + timedelta(hours=5, minutes=30)
+                        
                         chart_df['EMA5'] = ta.ema(chart_df['Close'], length=5)
                         chart_df['EMA39'] = ta.ema(chart_df['Close'], length=39)
+                        chart_df['ATR'] = ta.atr(chart_df['High'], chart_df['Low'], chart_df['Close'], length=14)
+                        adx_res = ta.adx(chart_df['High'], chart_df['Low'], chart_df['Close'], length=14)
+                        
+                        if adx_res is not None and not adx_res.empty: chart_df['ADX'] = adx_res.iloc[:, 0].ffill()
+                        else: chart_df['ADX'] = 0.0
+                        
+                        chart_df.dropna(subset=['EMA39', 'ADX', 'ATR'], inplace=True)
                         time_labels = chart_df.index.strftime('%b %d, %H:%M')
-                        fig = go.Figure(data=[go.Candlestick(x=time_labels, open=chart_df['Open'], high=chart_df['High'], low=chart_df['Low'], close=chart_df['Close'], name="Price")])
-                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'))
-                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'))
-                        fig.update_layout(title=f"{selected_stock} | 15m Timeframe (IST)", template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=40, b=0), height=600, hovermode="x unified")
-                        fig.update_xaxes(type='category', nticks=12, tickangle=-45)
+                        
+                        live_adx_val = chart_df['ADX'].iloc[-1].round(2)
+                        live_atr_val = chart_df['ATR'].iloc[-1].round(2)
+                        
+                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+                        
+                        fig.add_trace(go.Candlestick(
+                            x=time_labels, open=chart_df['Open'], high=chart_df['High'], 
+                            low=chart_df['Low'], close=chart_df['Close'], name="Price",
+                            customdata=chart_df['ATR'].round(2),
+                            hovertemplate="Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<br>ATR: %{customdata}<extra></extra>"
+                        ), row=1, col=1)
+                        
+                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'), row=1, col=1)
+                        
+                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['ADX'], line=dict(color='#ffd700', width=1.5), name='ADX'), row=2, col=1)
+                        fig.add_hline(y=20, line_dash="dot", annotation_text="Trend (20)", annotation_position="top right", line_color="#8b949e", row=2, col=1)
+                        
+                        fig.update_layout(
+                            title=f"{selected_stock} | 15m Timeframe &nbsp;&nbsp;&nbsp; <span style='font-size:14px; color:#ffd700;'>Live ADX: {live_adx_val} | Live ATR: {live_atr_val}</span>",
+                            template="plotly_dark", 
+                            xaxis_rangeslider_visible=False, 
+                            margin=dict(l=0, r=0, t=50, b=0), 
+                            height=700, 
+                            hovermode="x unified"
+                        )
+                        fig.update_xaxes(type='category', nticks=12, tickangle=-45, row=2, col=1)
                         st.plotly_chart(fig, use_container_width=True)
-                except Exception: st.error("Chart data unavailable right now. Try again shortly.")
+                except Exception as e: st.error(f"Chart data unavailable right now. Try again shortly. {str(e)}")
 
 with tab3:
     if not open_df_ui.empty: 
