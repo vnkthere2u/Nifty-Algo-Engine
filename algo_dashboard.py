@@ -183,9 +183,10 @@ def fetch_and_analyze(item):
     except Exception:
         pass
 
-    if df is None or df.empty:
+    # THE FIX: Banning Yahoo Finance failover for non-NSE assets to prevent Spot vs Futures spread traps!
+    if (df is None or df.empty) and item['tv_exchange'] == 'NSE':
         try:
-            df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="20d")
+            df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="5d")
             if df_yf is not None and not df_yf.empty:
                 df_yf.index = df_yf.index.tz_localize(None)
                 df = df_yf
@@ -342,7 +343,6 @@ def process_market_data():
                         send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(sl, 2)}")
             conn.commit()
 
-            # 2. STATE MACHINE: DETECT FRESH CROSSOVERS & DROP ANCHORS
             long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
             short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
             
@@ -358,8 +358,6 @@ def process_market_data():
                     direction = "LONG" if long_cross else "SHORT"
                     atr_val = last_closed['ATR']
                     
-                    # THE FIX: TRUE MARKET ANCHORING
-                    # We mathematically lock the start time to the EXACT close of the crossover candle, ignoring server delays.
                     try:
                         last_closed_dt = pd.to_datetime(last_closed.name)
                         if last_closed_dt.tz is not None: 
@@ -373,7 +371,6 @@ def process_market_data():
                     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
                     conn.commit()
 
-            # 3. STATE MACHINE: EVALUATE ACTIVE ANCHORS
             c.execute("SELECT value FROM system_status WHERE key=?", (f"anchor_{name}",))
             anchor_row = c.fetchone()
             
@@ -398,18 +395,13 @@ def process_market_data():
                     live_htf_trend = "🟢 Bullish" if eval_candle['Close'] > eval_candle['EMA39_1H'] else "🔴 Bearish"
                     live_distance = abs(eval_candle['Close'] - eval_candle['EMA39'])
                     
-                    # --- NEW ANTI-CHOP LOGIC ---
-                    # 1. ADX Slope: Is the momentum expanding or dying?
                     prev_adx = prev_closed['ADX'] if time_diff >= 14.0 else last_closed['ADX']
                     adx_is_rising = live_adx >= prev_adx
-                    
-                    # 2. EMA Fanning: Are the EMAs tangled, or clearly separating?
                     ema_separation = abs(eval_candle['EMA5'] - eval_candle['EMA39'])
                     min_separation = 0.15 * anchor_atr
                     
                     is_trending = live_adx > 20.0 and adx_is_rising
                     is_properly_fanned = ema_separation >= min_separation
-                    
                     max_extension = 2.5 * anchor_atr
                     is_not_overextended = live_distance <= max_extension
                     
@@ -447,12 +439,9 @@ def process_market_data():
                         
                         if time_diff >= 14.0:
                             c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
-                            
-                            # THE FIX: Detailed Telegram Expiration Alert
                             expiration_msg = f"💀 <b>SIGNAL EXPIRED: {name}</b>\n{anchor_direction} crossover failed to align within 15m.\n\n<i>Final Rejection Reasons:</i>\n"
                             for reason in rejection_reasons:
                                 expiration_msg += f"❌ {reason}\n"
-                                
                             send_telegram_alert(expiration_msg)
                 else:
                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
@@ -726,29 +715,25 @@ with tab1:
     if not live_df.empty: st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), use_container_width=True, height=600, hide_index=True)
     else: st.info("Waiting for first data sync...")
 
+# THE FIX: Chart explicitly calls fetch_and_analyze (TradingView) instead of hardcoded Yahoo Finance
 with tab2:
     if not live_df.empty:
         selected_stock = st.selectbox("Select an asset to render:", ["-- Select an Asset --"] + sorted(live_df['Asset'].tolist()), label_visibility="collapsed")
         if selected_stock != "-- Select an Asset --":
-            yf_symbol = next(item['yf_symbol'] for item in WATCHLIST if item['name'] == selected_stock)
+            selected_item = next(item for item in WATCHLIST if item['name'] == selected_stock)
             with st.spinner(f"Loading order book for {selected_stock}..."):
                 try:
-                    chart_df = yf.Ticker(yf_symbol).history(interval="15m", period="5d") 
-                    if not chart_df.empty:
+                    # Guarantees the dashboard is looking at the EXACT same data source as the trading engine
+                    chart_df = fetch_and_analyze(selected_item)
+                    if chart_df is not None and not chart_df.empty:
+                        # Slice to last 5 days to keep chart performant and readable
+                        limit_time = chart_df.index[-1] - timedelta(days=5)
+                        chart_df = chart_df[chart_df.index >= limit_time]
+                        
                         if chart_df.index.tz is not None: chart_df.index = chart_df.index.tz_convert('Asia/Kolkata').tz_localize(None)
                         else: chart_df.index = chart_df.index + timedelta(hours=5, minutes=30)
                         
-                        chart_df['EMA5'] = ta.ema(chart_df['Close'], length=5)
-                        chart_df['EMA39'] = ta.ema(chart_df['Close'], length=39)
-                        chart_df['ATR'] = ta.atr(chart_df['High'], chart_df['Low'], chart_df['Close'], length=14)
-                        adx_res = ta.adx(chart_df['High'], chart_df['Low'], chart_df['Close'], length=14)
-                        
-                        if adx_res is not None and not adx_res.empty: chart_df['ADX'] = adx_res.iloc[:, 0].ffill()
-                        else: chart_df['ADX'] = 0.0
-                        
-                        chart_df.dropna(subset=['EMA39', 'ADX', 'ATR'], inplace=True)
                         time_labels = chart_df.index.strftime('%b %d, %H:%M')
-                        
                         live_adx_val = chart_df['ADX'].iloc[-1].round(2)
                         live_atr_val = chart_df['ATR'].iloc[-1].round(2)
                         
@@ -777,6 +762,7 @@ with tab2:
                         )
                         fig.update_xaxes(type='category', nticks=12, tickangle=-45, row=2, col=1)
                         st.plotly_chart(fig, use_container_width=True)
+                    else: st.error("No valid data returned for the chart.")
                 except Exception as e: st.error(f"Chart data unavailable right now. Try again shortly. {str(e)}")
 
 with tab3:
