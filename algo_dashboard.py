@@ -447,7 +447,13 @@ def process_market_data():
                         
                         if time_diff >= 14.0:
                             c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
-                            send_telegram_alert(f"💀 <b>SIGNAL EXPIRED: {name}</b>\n{anchor_direction} crossover failed to align conditions within 15 minutes. Signal destroyed.")
+                            
+                            # THE FIX: Detailed Telegram Expiration Alert
+                            expiration_msg = f"💀 <b>SIGNAL EXPIRED: {name}</b>\n{anchor_direction} crossover failed to align within 15m.\n\n<i>Final Rejection Reasons:</i>\n"
+                            for reason in rejection_reasons:
+                                expiration_msg += f"❌ {reason}\n"
+                                
+                            send_telegram_alert(expiration_msg)
                 else:
                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
             conn.commit()
