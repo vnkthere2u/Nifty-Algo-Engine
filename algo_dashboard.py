@@ -345,18 +345,22 @@ def process_market_data():
             # 2. STATE MACHINE: DETECT FRESH CROSSOVERS & DROP ANCHORS
             long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
             short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
-            try: signal_candle_time = pd.to_datetime(last_closed.name).strftime("%Y-%m-%d %H:%M:%S")
-            except: signal_candle_time = scan_time_str 
+            
+            # The slot_id is the timestamp of the CURRENT forming candle (e.g., 9:00:00) to act as a unique lock
+            try: slot_id = pd.to_datetime(current_candle.name).strftime("%Y-%m-%d %H:%M:%S")
+            except: slot_id = scan_time_str 
             
             c.execute("SELECT value FROM system_status WHERE key=?", (f"last_signal_{name}",))
             last_processed = c.fetchone()
-            already_entered = last_processed and last_processed[0] == signal_candle_time
+            already_entered = last_processed and last_processed[0] == slot_id
             
             if not already_entered:
                 if long_cross or short_cross:
                     direction = "LONG" if long_cross else "SHORT"
                     atr_val = last_closed['ATR']
-                    anchor_val = f"{signal_candle_time}|{direction}|{atr_val}"
+                    # THE FIX: Store the true Atomic Clock time of when the anchor was dropped
+                    atomic_start = ist_now.strftime("%Y-%m-%d %H:%M:%S")
+                    anchor_val = f"{atomic_start}|{direction}|{atr_val}|{slot_id}"
                     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
                     conn.commit()
 
@@ -366,24 +370,22 @@ def process_market_data():
             
             if anchor_row:
                 anchor_data = anchor_row[0].split('|')
-                anchor_time_str = anchor_data[0]
+                atomic_start_str = anchor_data[0]
                 anchor_direction = anchor_data[1]
                 anchor_atr = float(anchor_data[2])
+                slot_id = anchor_data[3]
                 
-                try: anchor_dt = datetime.strptime(anchor_time_str, "%Y-%m-%d %H:%M:%S")
-                except: anchor_dt = datetime.now() - timedelta(minutes=20) # Fallback expiration
+                try: anchor_dt = datetime.strptime(atomic_start_str, "%Y-%m-%d %H:%M:%S")
+                except: anchor_dt = ist_now.replace(tzinfo=None) - timedelta(minutes=20) 
                 
-                current_dt = pd.to_datetime(current_candle.name)
-                if current_dt.tz is not None: current_dt = current_dt.tz_localize(None)
+                # THE FIX: Calculate elapsed time using the Atomic Clock!
+                atomic_now = ist_now.replace(tzinfo=None)
+                time_diff = (atomic_now - anchor_dt).total_seconds() / 60.0
                 
-                time_diff = (current_dt - anchor_dt).total_seconds() / 60.0
-                
-                # 15-Minute TTL logic
-                if time_diff <= 15.0:
-                    # THE FIX: Terminal Boundary Check (Last Gasp Execution)
-                    # If time_diff is exactly 15m, the candle has closed. Evaluate the finalized last_closed data.
+                if time_diff <= 16.0: # Buffer added to protect against slow server scans
+                    # If roughly 15 minutes have elapsed, the candle has closed. Use finalized data.
                     # Otherwise, evaluate the live, breathing current_candle data.
-                    eval_candle = last_closed if time_diff == 15.0 else current_candle
+                    eval_candle = last_closed if time_diff >= 14.0 else current_candle
                     
                     live_adx = eval_candle.get('ADX', 0.0)
                     live_vol = eval_candle.get('Vol_Ratio', 1.0)
@@ -403,7 +405,6 @@ def process_market_data():
                     if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
                         
                     if len(rejection_reasons) == 0:
-                        # CONDITIONS ALIGNED. EXECUTE TRADE AND DESTROY ANCHOR!
                         entry = eval_candle['Close']
                         if anchor_direction == "LONG":
                             sl, tp = entry - (1.5 * anchor_atr), entry + (3.75 * anchor_atr)
@@ -416,23 +417,20 @@ def process_market_data():
                                       (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', live_htf_trend, round(live_vol, 2), round(anchor_atr, 2), round(live_adx, 2)))
                             msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {live_htf_trend}\nVol Surge: {round(live_vol, 1)}x\nADX: {round(live_adx, 1)}\nATR: {round(anchor_atr, 2)}\nR:R Profile: 1:2.5"
                         
-                        c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"last_signal_{name}", anchor_time_str))
+                        c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"last_signal_{name}", slot_id))
                         c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                         alerts.append(msg)
                         send_telegram_alert(msg)
                     else:
-                        # Conditions failed. Log rejection but leave Anchor alive if time_diff < 15.
                         reason_str = " | ".join(rejection_reasons)
                         c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) 
                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                                   (name, anchor_direction, scan_time_str, round(eval_candle['Close'], 2), round(live_adx, 2), live_htf_trend, round(live_vol, 2), reason_str))
                         
-                        if time_diff == 15.0:
-                            # Final Gasp Failed. Kill the Anchor.
+                        if time_diff >= 14.0:
                             c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                             send_telegram_alert(f"💀 <b>SIGNAL EXPIRED: {name}</b>\n{anchor_direction} crossover failed to align conditions within 15 minutes. Signal destroyed.")
                 else:
-                    # Time has passed 15m without success. Clean up the expired anchor.
                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
             conn.commit()
         time.sleep(1) 
@@ -660,7 +658,6 @@ st.markdown(f"""
 </table>
 """, unsafe_allow_html=True)
 
-# THE FIX: Upgraded render_filters to accept Status parsing for the Ledger tab
 def render_filters(df, tab_name, has_status=False):
     if df.empty: return df
     with st.expander(f"🔍 Filter {tab_name} Data"):
