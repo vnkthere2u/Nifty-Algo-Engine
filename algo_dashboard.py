@@ -398,7 +398,18 @@ def process_market_data():
                     live_htf_trend = "🟢 Bullish" if eval_candle['Close'] > eval_candle['EMA39_1H'] else "🔴 Bearish"
                     live_distance = abs(eval_candle['Close'] - eval_candle['EMA39'])
                     
-                    is_trending = live_adx > 20.0
+                    # --- NEW ANTI-CHOP LOGIC ---
+                    # 1. ADX Slope: Is the momentum expanding or dying?
+                    prev_adx = prev_closed['ADX'] if time_diff >= 14.0 else last_closed['ADX']
+                    adx_is_rising = live_adx >= prev_adx
+                    
+                    # 2. EMA Fanning: Are the EMAs tangled, or clearly separating?
+                    ema_separation = abs(eval_candle['EMA5'] - eval_candle['EMA39'])
+                    min_separation = 0.15 * anchor_atr
+                    
+                    is_trending = live_adx > 20.0 and adx_is_rising
+                    is_properly_fanned = ema_separation >= min_separation
+                    
                     max_extension = 2.5 * anchor_atr
                     is_not_overextended = live_distance <= max_extension
                     
@@ -406,7 +417,8 @@ def process_market_data():
                     rejection_reasons = []
                     
                     if len(open_trades) > 0: rejection_reasons.append("Active trade already open.")
-                    if not is_trending: rejection_reasons.append(f"ADX Below 20 ({round(live_adx, 1)}).")
+                    if not is_trending: rejection_reasons.append(f"Weak Trend (ADX: {round(live_adx, 1)}, Rising: {adx_is_rising}).")
+                    if not is_properly_fanned: rejection_reasons.append(f"EMAs Tangled (Chop Zone).")
                     if live_htf_trend != required_htf: rejection_reasons.append(f"1H Trend Conflict ({live_htf_trend}).")
                     if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
                         
