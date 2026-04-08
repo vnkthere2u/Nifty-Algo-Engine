@@ -183,7 +183,6 @@ def fetch_and_analyze(item):
     except Exception:
         pass
 
-    # THE FIX: Banning Yahoo Finance failover for non-NSE assets to prevent Spot vs Futures spread traps!
     if (df is None or df.empty) and item['tv_exchange'] == 'NSE':
         try:
             df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="5d")
@@ -222,6 +221,9 @@ def fetch_and_analyze(item):
             df.dropna(subset=['EMA39_1H', 'EMA39', 'EMA5', 'ATR'], inplace=True)
             if len(df) >= 5: return df
         except Exception as e: pass
+    
+    # Aggressive memory management for failed fetches
+    del df
     return None
 
 def process_market_data():
@@ -446,12 +448,20 @@ def process_market_data():
                 else:
                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
             conn.commit()
+            
+        # THE FIX: Forcefully annihilate variables to prevent memory bloat per loop iteration
+        del df
+        try: del open_trades, current_candle, last_closed, prev_closed
+        except: pass
+        gc.collect()
+        
         time.sleep(1) 
         
     c.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 500)")
     c.execute("DELETE FROM blocked_signals WHERE id NOT IN (SELECT id FROM blocked_signals ORDER BY id DESC LIMIT 300)")
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (scan_time_str,))
     conn.commit()
+    c.close()
     conn.close()
     
     gc.collect() 
@@ -715,7 +725,6 @@ with tab1:
     if not live_df.empty: st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), use_container_width=True, height=600, hide_index=True)
     else: st.info("Waiting for first data sync...")
 
-# THE FIX: Chart explicitly calls fetch_and_analyze (TradingView) instead of hardcoded Yahoo Finance
 with tab2:
     if not live_df.empty:
         selected_stock = st.selectbox("Select an asset to render:", ["-- Select an Asset --"] + sorted(live_df['Asset'].tolist()), label_visibility="collapsed")
@@ -723,10 +732,8 @@ with tab2:
             selected_item = next(item for item in WATCHLIST if item['name'] == selected_stock)
             with st.spinner(f"Loading order book for {selected_stock}..."):
                 try:
-                    # Guarantees the dashboard is looking at the EXACT same data source as the trading engine
                     chart_df = fetch_and_analyze(selected_item)
                     if chart_df is not None and not chart_df.empty:
-                        # Slice to last 5 days to keep chart performant and readable
                         limit_time = chart_df.index[-1] - timedelta(days=5)
                         chart_df = chart_df[chart_df.index >= limit_time]
                         
@@ -762,6 +769,11 @@ with tab2:
                         )
                         fig.update_xaxes(type='category', nticks=12, tickangle=-45, row=2, col=1)
                         st.plotly_chart(fig, use_container_width=True)
+                        
+                        # THE FIX: Annihilate heavy charting variables to save UI RAM
+                        del chart_df
+                        del fig
+                        gc.collect()
                     else: st.error("No valid data returned for the chart.")
                 except Exception as e: st.error(f"Chart data unavailable right now. Try again shortly. {str(e)}")
 
@@ -860,4 +872,10 @@ with tab6:
     else:
         st.info("No closed trades available to plot equity curve yet.")
 
+ui_c.close()
 ui_conn.close()
+
+# THE FIX: Annihilate massive UI DataFrames when Streamlit finishes rendering the page
+try: del live_df, history_df, open_df_ui, backup_trades_df, backup_blocked_df
+except: pass
+gc.collect()
