@@ -582,7 +582,7 @@ if st.sidebar.button("🔔 Send Test Telegram Alert"):
         st.sidebar.error("❌ Telegram Secrets Missing! Add them in App Settings.")
     else:
         with st.spinner("Pinging Telegram..."):
-            success, msg = send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\n<i>Testing HTML Parser:</i>\nAsset: L&amp;T\nReason: ADX Below 20 (< 20)", test_mode=True)
+            success, msg = send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\n<i>Testing HTML Parser:</i>\nAsset: L&amp;T\nReason: ADX Below 20 (&lt; 20)", test_mode=True)
             if success:
                 st.sidebar.success("Ping fired successfully! Check your phone.")
             else:
