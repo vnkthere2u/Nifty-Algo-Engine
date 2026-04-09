@@ -155,7 +155,7 @@ WATCHLIST = [
     {'name': 'BITCOIN (24/7)', 'tv_symbol': 'BTCUSDT', 'tv_exchange': 'BINANCE', 'yf_symbol': 'BTC-USD'},
     {'name': 'GOLD', 'tv_symbol': 'XAUUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'GC=F'},
     {'name': 'SILVER', 'tv_symbol': 'XAGUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'SI=F'},
-    {'name': 'CRUDE OIL', 'tv_symbol': 'USOIL', 'tv_exchange': 'OANDA', 'yf_symbol': 'CL=F'},
+    {'name': 'CRUDE OIL', 'tv_symbol': 'USOIL', 'tv_exchange': 'TVC', 'yf_symbol': 'CL=F'},
     {'name': 'HDFC BANK', 'tv_symbol': 'HDFCBANK', 'tv_exchange': 'NSE', 'yf_symbol': 'HDFCBANK.NS'},
     {'name': 'SBI', 'tv_symbol': 'SBIN', 'tv_exchange': 'NSE', 'yf_symbol': 'SBIN.NS'},
     {'name': 'RELIANCE', 'tv_symbol': 'RELIANCE', 'tv_exchange': 'NSE', 'yf_symbol': 'RELIANCE.NS'},
@@ -221,9 +221,6 @@ def fetch_and_analyze(item):
             df.dropna(subset=['EMA39_1H', 'EMA39', 'EMA5', 'ATR'], inplace=True)
             if len(df) >= 5: return df
         except Exception as e: pass
-    
-    # Aggressive memory management for failed fetches
-    del df
     return None
 
 def process_market_data():
@@ -360,14 +357,13 @@ def process_market_data():
                     direction = "LONG" if long_cross else "SHORT"
                     atr_val = last_closed['ATR']
                     
-                    try:
-                        last_closed_dt = pd.to_datetime(last_closed.name)
-                        if last_closed_dt.tz is not None: 
-                            last_closed_dt = last_closed_dt.tz_localize(None)
-                        true_anchor_time = last_closed_dt + timedelta(minutes=15)
-                        atomic_start = true_anchor_time.strftime("%Y-%m-%d %H:%M:%S")
-                    except:
-                        atomic_start = ist_now.strftime("%Y-%m-%d %H:%M:%S")
+                    # THE FIX 1: ATOMIC TIMEZONE DECOUPLING
+                    # Calculate the expiration strictly based on the IST atomic clock to prevent UTC dataframe mismatches
+                    current_minute = ist_now.minute
+                    window_start_minute = (current_minute // 15) * 15
+                    window_start_time = ist_now.replace(minute=window_start_minute, second=0, microsecond=0, tzinfo=None)
+                    true_anchor_time = window_start_time + timedelta(minutes=15)
+                    atomic_start = true_anchor_time.strftime("%Y-%m-%d %H:%M:%S")
 
                     anchor_val = f"{atomic_start}|{direction}|{atr_val}|{slot_id}"
                     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
@@ -448,20 +444,12 @@ def process_market_data():
                 else:
                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
             conn.commit()
-            
-        # THE FIX: Forcefully annihilate variables to prevent memory bloat per loop iteration
-        del df
-        try: del open_trades, current_candle, last_closed, prev_closed
-        except: pass
-        gc.collect()
-        
         time.sleep(1) 
         
     c.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 500)")
     c.execute("DELETE FROM blocked_signals WHERE id NOT IN (SELECT id FROM blocked_signals ORDER BY id DESC LIMIT 300)")
     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (scan_time_str,))
     conn.commit()
-    c.close()
     conn.close()
     
     gc.collect() 
@@ -562,9 +550,13 @@ if uploaded_file is not None:
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("<h3>🧪 System Diagnostics</h3>", unsafe_allow_html=True)
+# THE FIX 2: UI Safety Check for missing Streamlit Secrets
 if st.sidebar.button("🔔 Send Test Telegram Alert"):
-    send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\n<i>Testing HTML Parser:</i>\nAsset: L&amp;T\nReason: ADX Below 20 (< 20)")
-    st.sidebar.success("Ping fired! Check your Telegram.")
+    if not TELEGRAM_TOKEN:
+        st.sidebar.error("❌ Telegram Secrets Missing! Re-enter them in Streamlit Settings.")
+    else:
+        send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\n<i>Testing HTML Parser:</i>\nAsset: L&amp;T\nReason: ADX Below 20 (< 20)")
+        st.sidebar.success("Ping fired! Check your Telegram.")
 
 
 # ==========================================
@@ -769,11 +761,6 @@ with tab2:
                         )
                         fig.update_xaxes(type='category', nticks=12, tickangle=-45, row=2, col=1)
                         st.plotly_chart(fig, use_container_width=True)
-                        
-                        # THE FIX: Annihilate heavy charting variables to save UI RAM
-                        del chart_df
-                        del fig
-                        gc.collect()
                     else: st.error("No valid data returned for the chart.")
                 except Exception as e: st.error(f"Chart data unavailable right now. Try again shortly. {str(e)}")
 
@@ -872,10 +859,4 @@ with tab6:
     else:
         st.info("No closed trades available to plot equity curve yet.")
 
-ui_c.close()
 ui_conn.close()
-
-# THE FIX: Annihilate massive UI DataFrames when Streamlit finishes rendering the page
-try: del live_df, history_df, open_df_ui, backup_trades_df, backup_blocked_df
-except: pass
-gc.collect()
