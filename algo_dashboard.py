@@ -131,6 +131,9 @@ def send_telegram_csv_backup():
 def get_db_connection():
     conn = sqlite3.connect('nifty_live_trades.db', check_same_thread=False, timeout=30.0)
     c = conn.cursor()
+    # ARCHITECT PATCH 3: Enable WAL mode to prevent SQLite Database Locked errors
+    c.execute("PRAGMA journal_mode=WAL;")
+    
     c.execute('''CREATE TABLE IF NOT EXISTS trades 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
                  entry_time TEXT, entry_price REAL, sl REAL, tp REAL, status TEXT, 
@@ -211,12 +214,15 @@ def fetch_and_analyze(item):
         try:
             df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="5d")
             if df_yf is not None and not df_yf.empty:
-                df_yf.index = df_yf.index.tz_localize(None)
+                # ARCHITECT PATCH 2: Prevent tz_localize crash if yFinance index is already naive
+                df_yf.index = df_yf.index.tz_localize(None) if df_yf.index.tz is not None else df_yf.index
                 df = df_yf
         except Exception: pass
 
     if df is not None and not df.empty:
         try:
+            # ARCHITECT PATCH 5: Explicit copy to prevent pandas SettingWithCopyWarning
+            df = df.copy() 
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
                 
@@ -455,7 +461,10 @@ def process_market_data():
                         alerts.append(msg)
                         send_telegram_alert(msg)
                     else:
-                        reason_str = " | ".join(rejection_reasons)
+                        # ARCHITECT PATCH 4: Safe HTML escaping for dynamic Telegram variables
+                        safe_reasons = [r.replace("<", "&lt;").replace(">", "&gt;") for r in rejection_reasons]
+                        reason_str = " | ".join(safe_reasons)
+                        
                         c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) 
                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                                   (name, anchor_direction, scan_time_str, round(eval_candle['Close'], 2), round(live_adx, 2), live_htf_trend, round(live_vol, 2), reason_str))
@@ -463,7 +472,7 @@ def process_market_data():
                         if time_diff >= 14.0:
                             c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                             expiration_msg = f"💀 <b>SIGNAL EXPIRED: {name}</b>\n{anchor_direction} crossover failed to align within 15m.\n\n<i>Final Rejection Reasons:</i>\n"
-                            for reason in rejection_reasons:
+                            for reason in safe_reasons:
                                 expiration_msg += f"❌ {reason}\n"
                             send_telegram_alert(expiration_msg)
                 else:
@@ -552,6 +561,7 @@ if uploaded_file is not None:
                     ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
                     if not ui_c.fetchone():
                         ui_c.execute("""INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['entry_time'], row['entry_price'], row['sl'], row['tp'], row['status'], row['exit_time'], row['exit_price'], row['htf_trend'], row['vol_ratio'], row['atr'], row['adx']))
+                # ARCHITECT PATCH 3: Moved commit() outside the loop to prevent Database Lock
                 ui_conn.commit()
                 st.sidebar.success("✅ Trades Restored! Rebooting...")
 
@@ -563,6 +573,7 @@ if uploaded_file is not None:
                     ui_c.execute("SELECT id FROM blocked_signals WHERE ticker=? AND timestamp=?", (row['ticker'], row['timestamp']))
                     if not ui_c.fetchone():
                         ui_c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['timestamp'], row['price'], row['adx'], row['htf_trend'], row['vol_ratio'], row['rejection_reasons']))
+                # ARCHITECT PATCH 3: Moved commit() outside the loop
                 ui_conn.commit()
                 st.sidebar.success("✅ Blocked Signals Restored! Rebooting...")
                 
@@ -744,8 +755,8 @@ with tab1:
         except: pass
         return ''
     if not live_df.empty: 
-        # THE FIX: Removed deprecated use_container_width=True and used width="stretch"
-        st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), width="stretch", height=600, hide_index=True)
+        # ARCHITECT PATCH 1: Reverted width="stretch" to use_container_width=True
+        st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), use_container_width=True, height=600, hide_index=True)
     else: st.info("Waiting for first data sync...")
 
 with tab2:
@@ -815,7 +826,8 @@ with tab3:
                 except: pass
                 return ''
                 
-            st.dataframe(filtered_open.style.map(color_open_ui, subset=['Risk Status', 'Unrealized PnL (₹)']), width="stretch", height=600, hide_index=True)
+            # ARCHITECT PATCH 1: Reverted width="stretch" to use_container_width=True
+            st.dataframe(filtered_open.style.map(color_open_ui, subset=['Risk Status', 'Unrealized PnL (₹)']), use_container_width=True, height=600, hide_index=True)
         else: st.info("No active trades match these filters.")
     else: 
         st.info("No active trades currently open.")
@@ -846,7 +858,8 @@ with tab4:
                 except: pass
                 return ''
                 
-            st.dataframe(filtered_hist.style.map(color_status_pnl, subset=['Status', 'PnL (₹)']), width="stretch", height=600, hide_index=True)
+            # ARCHITECT PATCH 1: Reverted width="stretch" to use_container_width=True
+            st.dataframe(filtered_hist.style.map(color_status_pnl, subset=['Status', 'PnL (₹)']), use_container_width=True, height=600, hide_index=True)
         else: st.info("No closed trades match these filters.")
     else: st.info("No closed trades yet.")
 
@@ -856,7 +869,8 @@ with tab5:
     if not blocked_df.empty: 
         filtered_blocked = render_filters(blocked_df, "Blocked", has_status=False)
         st.markdown(f"**Total Blocked Signals:** {len(filtered_blocked)}")
-        st.dataframe(filtered_blocked, width="stretch", height=600, hide_index=True)
+        # ARCHITECT PATCH 1: Reverted width="stretch" to use_container_width=True
+        st.dataframe(filtered_blocked, use_container_width=True, height=600, hide_index=True)
     else: st.info("No signals have been blocked yet.")
 
 with tab6:
