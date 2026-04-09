@@ -9,11 +9,15 @@ import threading
 import os
 import gc 
 import traceback
+import logging
 import yfinance as yf
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, timezone
 from tvDatafeed import TvDatafeed, Interval
+
+# THE FIX: Suppress messy tvDatafeed console warnings
+logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 
 # ==========================================
 # 0. UI INITIALIZATION & CUSTOM CSS
@@ -50,17 +54,26 @@ except:
     TELEGRAM_TOKEN = ""
     TELEGRAM_CHAT_ID = ""
 
-def send_telegram_alert(message):
-    if not TELEGRAM_TOKEN: return 
+def send_telegram_alert(message, test_mode=False):
+    if not TELEGRAM_TOKEN: 
+        if test_mode: return False, "Telegram Secrets not found in config."
+        return False
+        
     safe_message = message.replace("&", "&amp;")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': safe_message, 'parse_mode': 'HTML'}
+    
     for attempt in range(3):
         try: 
             response = requests.post(url, data=payload, timeout=10)
-            if response.status_code == 200: break
-            elif response.status_code == 429: time.sleep(3); continue
+            if response.status_code == 200: 
+                if test_mode: return True, "Success"
+                break
+            elif response.status_code == 429: 
+                time.sleep(3)
+                continue
             else:
+                if test_mode: return False, f"API Error {response.status_code}: {response.text}"
                 conn = get_db_connection()
                 c = conn.cursor()
                 ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
@@ -70,6 +83,7 @@ def send_telegram_alert(message):
                 conn.close()
                 break 
         except Exception as e: 
+            if test_mode: return False, str(e)
             try:
                 conn = get_db_connection()
                 c = conn.cursor()
@@ -149,13 +163,14 @@ def get_db_connection():
 # ==========================================
 # 3. DUAL-ENGINE LOGIC & ADVANCED MATH
 # ==========================================
+# THE FIX: Changed Crude Oil to OANDA WTICOUSD to prevent "No Data" TVC blocks
 WATCHLIST = [
     {'name': 'NIFTY 50', 'tv_symbol': 'NIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEI'},
     {'name': 'BANK NIFTY', 'tv_symbol': 'BANKNIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEBANK'},
     {'name': 'BITCOIN (24/7)', 'tv_symbol': 'BTCUSDT', 'tv_exchange': 'BINANCE', 'yf_symbol': 'BTC-USD'},
     {'name': 'GOLD', 'tv_symbol': 'XAUUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'GC=F'},
     {'name': 'SILVER', 'tv_symbol': 'XAGUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'SI=F'},
-    {'name': 'CRUDE OIL', 'tv_symbol': 'USOIL', 'tv_exchange': 'TVC', 'yf_symbol': 'CL=F'},
+    {'name': 'CRUDE OIL', 'tv_symbol': 'WTICOUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'CL=F'},
     {'name': 'HDFC BANK', 'tv_symbol': 'HDFCBANK', 'tv_exchange': 'NSE', 'yf_symbol': 'HDFCBANK.NS'},
     {'name': 'SBI', 'tv_symbol': 'SBIN', 'tv_exchange': 'NSE', 'yf_symbol': 'SBIN.NS'},
     {'name': 'RELIANCE', 'tv_symbol': 'RELIANCE', 'tv_exchange': 'NSE', 'yf_symbol': 'RELIANCE.NS'},
@@ -175,13 +190,22 @@ tv = TvDatafeed()
 def fetch_and_analyze(item):
     global tv
     df = None
+    
+    # THE FIX: Auto-Reconnection Pool for tvDatafeed rate-limiting
     try:
         df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
         if df_tv is not None and not df_tv.empty:
             df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
             df = df_tv
     except Exception:
-        pass
+        try:
+            tv = TvDatafeed() 
+            df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
+            if df_tv is not None and not df_tv.empty:
+                df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+                df = df_tv
+        except Exception:
+            pass
 
     if (df is None or df.empty) and item['tv_exchange'] == 'NSE':
         try:
@@ -357,13 +381,14 @@ def process_market_data():
                     direction = "LONG" if long_cross else "SHORT"
                     atr_val = last_closed['ATR']
                     
-                    # THE FIX 1: ATOMIC TIMEZONE DECOUPLING
-                    # Calculate the expiration strictly based on the IST atomic clock to prevent UTC dataframe mismatches
-                    current_minute = ist_now.minute
-                    window_start_minute = (current_minute // 15) * 15
-                    window_start_time = ist_now.replace(minute=window_start_minute, second=0, microsecond=0, tzinfo=None)
-                    true_anchor_time = window_start_time + timedelta(minutes=15)
-                    atomic_start = true_anchor_time.strftime("%Y-%m-%d %H:%M:%S")
+                    try:
+                        last_closed_dt = pd.to_datetime(last_closed.name)
+                        if last_closed_dt.tz is not None: 
+                            last_closed_dt = last_closed_dt.tz_localize(None)
+                        true_anchor_time = last_closed_dt + timedelta(minutes=15)
+                        atomic_start = true_anchor_time.strftime("%Y-%m-%d %H:%M:%S")
+                    except:
+                        atomic_start = ist_now.strftime("%Y-%m-%d %H:%M:%S")
 
                     anchor_val = f"{atomic_start}|{direction}|{atr_val}|{slot_id}"
                     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
@@ -550,14 +575,18 @@ if uploaded_file is not None:
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("<h3>🧪 System Diagnostics</h3>", unsafe_allow_html=True)
-# THE FIX 2: UI Safety Check for missing Streamlit Secrets
+
+# THE FIX: Explicit UI Debugger for Telegram failures
 if st.sidebar.button("🔔 Send Test Telegram Alert"):
     if not TELEGRAM_TOKEN:
-        st.sidebar.error("❌ Telegram Secrets Missing! Re-enter them in Streamlit Settings.")
+        st.sidebar.error("❌ Telegram Secrets Missing! Add them in App Settings.")
     else:
-        send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\n<i>Testing HTML Parser:</i>\nAsset: L&amp;T\nReason: ADX Below 20 (< 20)")
-        st.sidebar.success("Ping fired! Check your Telegram.")
-
+        with st.spinner("Pinging Telegram..."):
+            success, msg = send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\n<i>Testing HTML Parser:</i>\nAsset: L&amp;T\nReason: ADX Below 20 (< 20)", test_mode=True)
+            if success:
+                st.sidebar.success("Ping fired successfully! Check your phone.")
+            else:
+                st.sidebar.error(f"❌ Telegram API Failed:\n{msg}")
 
 # ==========================================
 # CAPITAL & PNL CALCULATIONS (NATIVE INR)
@@ -714,7 +743,9 @@ with tab1:
             elif float(val) < 0.50: return 'background-color: rgba(255, 165, 0, 0.4); color: white;'
         except: pass
         return ''
-    if not live_df.empty: st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), use_container_width=True, height=600, hide_index=True)
+    if not live_df.empty: 
+        # THE FIX: Removed deprecated use_container_width=True and used width="stretch"
+        st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), width="stretch", height=600, hide_index=True)
     else: st.info("Waiting for first data sync...")
 
 with tab2:
@@ -784,7 +815,7 @@ with tab3:
                 except: pass
                 return ''
                 
-            st.dataframe(filtered_open.style.map(color_open_ui, subset=['Risk Status', 'Unrealized PnL (₹)']), use_container_width=True, height=600, hide_index=True)
+            st.dataframe(filtered_open.style.map(color_open_ui, subset=['Risk Status', 'Unrealized PnL (₹)']), width="stretch", height=600, hide_index=True)
         else: st.info("No active trades match these filters.")
     else: 
         st.info("No active trades currently open.")
@@ -815,7 +846,7 @@ with tab4:
                 except: pass
                 return ''
                 
-            st.dataframe(filtered_hist.style.map(color_status_pnl, subset=['Status', 'PnL (₹)']), use_container_width=True, height=600, hide_index=True)
+            st.dataframe(filtered_hist.style.map(color_status_pnl, subset=['Status', 'PnL (₹)']), width="stretch", height=600, hide_index=True)
         else: st.info("No closed trades match these filters.")
     else: st.info("No closed trades yet.")
 
@@ -825,14 +856,17 @@ with tab5:
     if not blocked_df.empty: 
         filtered_blocked = render_filters(blocked_df, "Blocked", has_status=False)
         st.markdown(f"**Total Blocked Signals:** {len(filtered_blocked)}")
-        st.dataframe(filtered_blocked, use_container_width=True, height=600, hide_index=True)
+        st.dataframe(filtered_blocked, width="stretch", height=600, hide_index=True)
     else: st.info("No signals have been blocked yet.")
 
 with tab6:
     if not history_df.empty:
         st.markdown(f"### 📈 Equity Curve (Starting Capital: ₹{INITIAL_CAPITAL:,.0f})")
         equity_df = history_df[['Exit Time', 'PnL (₹)']].copy()
-        equity_df['Exit Time'] = pd.to_datetime(equity_df['Exit Time'].str.replace(' (IST)', '', regex=False), errors='coerce')
+        
+        # THE FIX: Hardcoded pandas datetime parser to resolve UI warnings
+        equity_df['Exit Time'] = pd.to_datetime(equity_df['Exit Time'].str.replace(' (IST)', '', regex=False), format='%Y-%m-%d %I:%M %p', errors='coerce')
+        
         equity_df = equity_df.sort_values('Exit Time').dropna()
         equity_df['Cumulative PnL'] = equity_df['PnL (₹)'].cumsum()
         equity_df['Account Equity'] = INITIAL_CAPITAL + equity_df['Cumulative PnL']
