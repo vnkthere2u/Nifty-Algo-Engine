@@ -16,7 +16,7 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, timezone
 from tvDatafeed import TvDatafeed, Interval
 
-# THE FIX: Suppress messy tvDatafeed console warnings
+# Suppress messy tvDatafeed console warnings
 logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 
 # ==========================================
@@ -131,7 +131,7 @@ def send_telegram_csv_backup():
 def get_db_connection():
     conn = sqlite3.connect('nifty_live_trades.db', check_same_thread=False, timeout=30.0)
     c = conn.cursor()
-    # ARCHITECT PATCH 3: Enable WAL mode to prevent SQLite Database Locked errors
+    # Prevent SQLite Database Locked errors
     c.execute("PRAGMA journal_mode=WAL;")
     
     c.execute('''CREATE TABLE IF NOT EXISTS trades 
@@ -166,7 +166,6 @@ def get_db_connection():
 # ==========================================
 # 3. DUAL-ENGINE LOGIC & ADVANCED MATH
 # ==========================================
-# THE FIX: Changed Crude Oil to OANDA WTICOUSD to prevent "No Data" TVC blocks
 WATCHLIST = [
     {'name': 'NIFTY 50', 'tv_symbol': 'NIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEI'},
     {'name': 'BANK NIFTY', 'tv_symbol': 'BANKNIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEBANK'},
@@ -194,7 +193,7 @@ def fetch_and_analyze(item):
     global tv
     df = None
     
-    # THE FIX: Auto-Reconnection Pool for tvDatafeed rate-limiting
+    # Auto-Reconnection Pool for tvDatafeed rate-limiting
     try:
         df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
         if df_tv is not None and not df_tv.empty:
@@ -214,15 +213,22 @@ def fetch_and_analyze(item):
         try:
             df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="5d")
             if df_yf is not None and not df_yf.empty:
-                # ARCHITECT PATCH 2: Prevent tz_localize crash if yFinance index is already naive
+                # Prevent tz_localize crash if yFinance index is already naive
                 df_yf.index = df_yf.index.tz_localize(None) if df_yf.index.tz is not None else df_yf.index
                 df = df_yf
         except Exception: pass
 
     if df is not None and not df.empty:
         try:
-            # ARCHITECT PATCH 5: Explicit copy to prevent pandas SettingWithCopyWarning
+            # Explicit copy to prevent pandas SettingWithCopyWarning
             df = df.copy() 
+            
+            # THE FIX: Universal IST Alignment to prevent Timezone Annihilation Paradox
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
+            else:
+                df.index = df.index + timedelta(hours=5, minutes=30)
+                
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
                 
@@ -405,6 +411,13 @@ def process_market_data():
             
             if anchor_row:
                 anchor_data = anchor_row[0].split('|')
+                
+                # THE FIX: Purge Poisoned Schema
+                if len(anchor_data) < 4:
+                    c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
+                    conn.commit()
+                    continue
+                
                 atomic_start_str = anchor_data[0]
                 anchor_direction = anchor_data[1]
                 anchor_atr = float(anchor_data[2])
@@ -417,14 +430,29 @@ def process_market_data():
                 time_diff = (atomic_now - anchor_dt).total_seconds() / 60.0
                 
                 if time_diff <= 16.0: 
-                    eval_candle = last_closed if time_diff >= 14.0 else current_candle
+                    # THE FIX: API Flip Detection
+                    try:
+                        current_candle_time = pd.to_datetime(current_candle.name)
+                        if current_candle_time.tz is not None: 
+                            current_candle_time = current_candle_time.tz_localize(None)
+                            
+                        if current_candle_time == anchor_dt:
+                            # API has not rolled over. Evaluate the active forming candle.
+                            eval_candle = current_candle
+                            prev_adx = last_closed.get('ADX', 0.0)
+                        else:
+                            # API has rolled over past the window. Evaluate the finalized candle.
+                            eval_candle = last_closed
+                            prev_adx = prev_closed.get('ADX', 0.0)
+                    except:
+                        eval_candle = current_candle
+                        prev_adx = last_closed.get('ADX', 0.0)
                     
                     live_adx = eval_candle.get('ADX', 0.0)
                     live_vol = eval_candle.get('Vol_Ratio', 1.0)
                     live_htf_trend = "🟢 Bullish" if eval_candle['Close'] > eval_candle['EMA39_1H'] else "🔴 Bearish"
                     live_distance = abs(eval_candle['Close'] - eval_candle['EMA39'])
                     
-                    prev_adx = prev_closed['ADX'] if time_diff >= 14.0 else last_closed['ADX']
                     adx_is_rising = live_adx >= prev_adx
                     ema_separation = abs(eval_candle['EMA5'] - eval_candle['EMA39'])
                     min_separation = 0.15 * anchor_atr
@@ -461,7 +489,7 @@ def process_market_data():
                         alerts.append(msg)
                         send_telegram_alert(msg)
                     else:
-                        # ARCHITECT PATCH 4: Safe HTML escaping for dynamic Telegram variables
+                        # Safe HTML escaping for dynamic Telegram variables
                         safe_reasons = [r.replace("<", "&lt;").replace(">", "&gt;") for r in rejection_reasons]
                         reason_str = " | ".join(safe_reasons)
                         
@@ -512,8 +540,10 @@ def start_background_scanner():
             time.sleep(sleep_sec)
             try: 
                 process_market_data()
-            except Exception: 
-                pass
+            except Exception as e: 
+                # THE FIX: Break the Silent Trap
+                print(f"CRITICAL DAEMON CRASH: {e}")
+                traceback.print_exc()
     thread = threading.Thread(target=background_loop, daemon=True)
     thread.start()
     return True
@@ -561,7 +591,7 @@ if uploaded_file is not None:
                     ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
                     if not ui_c.fetchone():
                         ui_c.execute("""INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['entry_time'], row['entry_price'], row['sl'], row['tp'], row['status'], row['exit_time'], row['exit_price'], row['htf_trend'], row['vol_ratio'], row['atr'], row['adx']))
-                # ARCHITECT PATCH 3: Moved commit() outside the loop to prevent Database Lock
+                # Moved commit() outside the loop to prevent Database Lock
                 ui_conn.commit()
                 st.sidebar.success("✅ Trades Restored! Rebooting...")
 
@@ -573,7 +603,7 @@ if uploaded_file is not None:
                     ui_c.execute("SELECT id FROM blocked_signals WHERE ticker=? AND timestamp=?", (row['ticker'], row['timestamp']))
                     if not ui_c.fetchone():
                         ui_c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['timestamp'], row['price'], row['adx'], row['htf_trend'], row['vol_ratio'], row['rejection_reasons']))
-                # ARCHITECT PATCH 3: Moved commit() outside the loop
+                # Moved commit() outside the loop
                 ui_conn.commit()
                 st.sidebar.success("✅ Blocked Signals Restored! Rebooting...")
                 
@@ -587,7 +617,7 @@ if uploaded_file is not None:
 st.sidebar.markdown("---")
 st.sidebar.markdown("<h3>🧪 System Diagnostics</h3>", unsafe_allow_html=True)
 
-# THE FIX: Explicit UI Debugger for Telegram failures
+# Explicit UI Debugger for Telegram failures
 if st.sidebar.button("🔔 Send Test Telegram Alert"):
     if not TELEGRAM_TOKEN:
         st.sidebar.error("❌ Telegram Secrets Missing! Add them in App Settings.")
@@ -755,7 +785,6 @@ with tab1:
         except: pass
         return ''
     if not live_df.empty: 
-        # ARCHITECT PATCH 1: Reverted width="stretch" to use_container_width=True
         st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), use_container_width=True, height=600, hide_index=True)
     else: st.info("Waiting for first data sync...")
 
@@ -770,9 +799,6 @@ with tab2:
                     if chart_df is not None and not chart_df.empty:
                         limit_time = chart_df.index[-1] - timedelta(days=5)
                         chart_df = chart_df[chart_df.index >= limit_time]
-                        
-                        if chart_df.index.tz is not None: chart_df.index = chart_df.index.tz_convert('Asia/Kolkata').tz_localize(None)
-                        else: chart_df.index = chart_df.index + timedelta(hours=5, minutes=30)
                         
                         time_labels = chart_df.index.strftime('%b %d, %H:%M')
                         live_adx_val = chart_df['ADX'].iloc[-1].round(2)
@@ -826,7 +852,6 @@ with tab3:
                 except: pass
                 return ''
                 
-            # ARCHITECT PATCH 1: Reverted width="stretch" to use_container_width=True
             st.dataframe(filtered_open.style.map(color_open_ui, subset=['Risk Status', 'Unrealized PnL (₹)']), use_container_width=True, height=600, hide_index=True)
         else: st.info("No active trades match these filters.")
     else: 
@@ -858,7 +883,6 @@ with tab4:
                 except: pass
                 return ''
                 
-            # ARCHITECT PATCH 1: Reverted width="stretch" to use_container_width=True
             st.dataframe(filtered_hist.style.map(color_status_pnl, subset=['Status', 'PnL (₹)']), use_container_width=True, height=600, hide_index=True)
         else: st.info("No closed trades match these filters.")
     else: st.info("No closed trades yet.")
@@ -869,7 +893,6 @@ with tab5:
     if not blocked_df.empty: 
         filtered_blocked = render_filters(blocked_df, "Blocked", has_status=False)
         st.markdown(f"**Total Blocked Signals:** {len(filtered_blocked)}")
-        # ARCHITECT PATCH 1: Reverted width="stretch" to use_container_width=True
         st.dataframe(filtered_blocked, use_container_width=True, height=600, hide_index=True)
     else: st.info("No signals have been blocked yet.")
 
@@ -878,7 +901,7 @@ with tab6:
         st.markdown(f"### 📈 Equity Curve (Starting Capital: ₹{INITIAL_CAPITAL:,.0f})")
         equity_df = history_df[['Exit Time', 'PnL (₹)']].copy()
         
-        # THE FIX: Hardcoded pandas datetime parser to resolve UI warnings
+        # Hardcoded pandas datetime parser to resolve UI warnings
         equity_df['Exit Time'] = pd.to_datetime(equity_df['Exit Time'].str.replace(' (IST)', '', regex=False), format='%Y-%m-%d %I:%M %p', errors='coerce')
         
         equity_df = equity_df.sort_values('Exit Time').dropna()
