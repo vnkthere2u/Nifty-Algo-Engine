@@ -12,7 +12,6 @@ import traceback
 import logging
 import yfinance as yf
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, timezone
 from tvDatafeed import TvDatafeed, Interval
 
@@ -223,7 +222,7 @@ def fetch_and_analyze(item):
             # Explicit copy to prevent pandas SettingWithCopyWarning
             df = df.copy() 
             
-            # THE FIX: Universal IST Alignment to prevent Timezone Annihilation Paradox
+            # Universal IST Alignment to prevent Timezone Annihilation Paradox
             if df.index.tz is not None:
                 df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
             else:
@@ -412,7 +411,7 @@ def process_market_data():
             if anchor_row:
                 anchor_data = anchor_row[0].split('|')
                 
-                # THE FIX: Purge Poisoned Schema
+                # Purge Poisoned Schema
                 if len(anchor_data) < 4:
                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                     conn.commit()
@@ -430,7 +429,7 @@ def process_market_data():
                 time_diff = (atomic_now - anchor_dt).total_seconds() / 60.0
                 
                 if time_diff <= 16.0: 
-                    # THE FIX: API Flip Detection
+                    # API Flip Detection
                     try:
                         current_candle_time = pd.to_datetime(current_candle.name)
                         if current_candle_time.tz is not None: 
@@ -541,7 +540,6 @@ def start_background_scanner():
             try: 
                 process_market_data()
             except Exception as e: 
-                # THE FIX: Break the Silent Trap
                 print(f"CRITICAL DAEMON CRASH: {e}")
                 traceback.print_exc()
     thread = threading.Thread(target=background_loop, daemon=True)
@@ -591,7 +589,6 @@ if uploaded_file is not None:
                     ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
                     if not ui_c.fetchone():
                         ui_c.execute("""INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['entry_time'], row['entry_price'], row['sl'], row['tp'], row['status'], row['exit_time'], row['exit_price'], row['htf_trend'], row['vol_ratio'], row['atr'], row['adx']))
-                # Moved commit() outside the loop to prevent Database Lock
                 ui_conn.commit()
                 st.sidebar.success("✅ Trades Restored! Rebooting...")
 
@@ -603,7 +600,6 @@ if uploaded_file is not None:
                     ui_c.execute("SELECT id FROM blocked_signals WHERE ticker=? AND timestamp=?", (row['ticker'], row['timestamp']))
                     if not ui_c.fetchone():
                         ui_c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['timestamp'], row['price'], row['adx'], row['htf_trend'], row['vol_ratio'], row['rejection_reasons']))
-                # Moved commit() outside the loop
                 ui_conn.commit()
                 st.sidebar.success("✅ Blocked Signals Restored! Rebooting...")
                 
@@ -617,7 +613,6 @@ if uploaded_file is not None:
 st.sidebar.markdown("---")
 st.sidebar.markdown("<h3>🧪 System Diagnostics</h3>", unsafe_allow_html=True)
 
-# Explicit UI Debugger for Telegram failures
 if st.sidebar.button("🔔 Send Test Telegram Alert"):
     if not TELEGRAM_TOKEN:
         st.sidebar.error("❌ Telegram Secrets Missing! Add them in App Settings.")
@@ -771,11 +766,11 @@ def render_filters(df, tab_name, has_status=False):
         return filtered_df
 
 # ==========================================
-# UI: TABBED INTERFACE
+# UI: TABBED INTERFACE (Chart Tab Removed)
 # ==========================================
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["🔥 Heatmap", "📈 Chart", "🟢 Open", "📚 Ledger", "🚫 Blocked", "💰 Equity"])
+t_heat, t_open, t_ledger, t_blocked, t_equity = st.tabs(["🔥 Heatmap", "🟢 Open", "📚 Ledger", "🚫 Blocked", "💰 Equity"])
 
-with tab1:
+with t_heat:
     st.markdown("<p style='font-size:0.9rem; color:gray; margin-bottom:5px; line-height:1.4;'><b>Legend:</b><br>🔴 Red &lt; 0.1% Gap (Imminent) | 🟠 Orange &lt; 0.5% Gap (Watch Closely)</p>", unsafe_allow_html=True)
     def apply_heatmap(val):
         if pd.isna(val): return ''
@@ -788,51 +783,7 @@ with tab1:
         st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), use_container_width=True, height=600, hide_index=True)
     else: st.info("Waiting for first data sync...")
 
-with tab2:
-    if not live_df.empty:
-        selected_stock = st.selectbox("Select an asset to render:", ["-- Select an Asset --"] + sorted(live_df['Asset'].tolist()), label_visibility="collapsed")
-        if selected_stock != "-- Select an Asset --":
-            selected_item = next(item for item in WATCHLIST if item['name'] == selected_stock)
-            with st.spinner(f"Loading order book for {selected_stock}..."):
-                try:
-                    chart_df = fetch_and_analyze(selected_item)
-                    if chart_df is not None and not chart_df.empty:
-                        limit_time = chart_df.index[-1] - timedelta(days=5)
-                        chart_df = chart_df[chart_df.index >= limit_time]
-                        
-                        time_labels = chart_df.index.strftime('%b %d, %H:%M')
-                        live_adx_val = chart_df['ADX'].iloc[-1].round(2)
-                        live_atr_val = chart_df['ATR'].iloc[-1].round(2)
-                        
-                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-                        
-                        fig.add_trace(go.Candlestick(
-                            x=time_labels, open=chart_df['Open'], high=chart_df['High'], 
-                            low=chart_df['Low'], close=chart_df['Close'], name="Price",
-                            customdata=chart_df['ATR'].round(2),
-                            hovertemplate="Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<br>ATR: %{customdata}<extra></extra>"
-                        ), row=1, col=1)
-                        
-                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'), row=1, col=1)
-                        
-                        fig.add_trace(go.Scatter(x=time_labels, y=chart_df['ADX'], line=dict(color='#ffd700', width=1.5), name='ADX'), row=2, col=1)
-                        fig.add_hline(y=20, line_dash="dot", annotation_text="Trend (20)", annotation_position="top right", line_color="#8b949e", row=2, col=1)
-                        
-                        fig.update_layout(
-                            title=f"{selected_stock} | 15m Timeframe &nbsp;&nbsp;&nbsp; <span style='font-size:14px; color:#ffd700;'>Live ADX: {live_adx_val} | Live ATR: {live_atr_val}</span>",
-                            template="plotly_dark", 
-                            xaxis_rangeslider_visible=False, 
-                            margin=dict(l=0, r=0, t=50, b=0), 
-                            height=700, 
-                            hovermode="x unified"
-                        )
-                        fig.update_xaxes(type='category', nticks=12, tickangle=-45, row=2, col=1)
-                        st.plotly_chart(fig, use_container_width=True)
-                    else: st.error("No valid data returned for the chart.")
-                except Exception as e: st.error(f"Chart data unavailable right now. Try again shortly. {str(e)}")
-
-with tab3:
+with t_open:
     if not open_df_ui.empty: 
         filtered_open = render_filters(open_df_ui, "Open", has_status=False)
         if not filtered_open.empty:
@@ -857,7 +808,7 @@ with tab3:
     else: 
         st.info("No active trades currently open.")
 
-with tab4:
+with t_ledger:
     if not history_df.empty:
         filtered_hist = render_filters(history_df, "Ledger", has_status=True)
         if not filtered_hist.empty:
@@ -887,7 +838,7 @@ with tab4:
         else: st.info("No closed trades match these filters.")
     else: st.info("No closed trades yet.")
 
-with tab5:
+with t_blocked:
     st.markdown("<p style='font-size:0.9rem; color:gray; margin-bottom:5px;'>Signals that were mathematically rejected by institutional filters to protect capital.</p>", unsafe_allow_html=True)
     blocked_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, timestamp as 'Time (IST)', price as Price, rejection_reasons as 'Rejection Reasons', adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM blocked_signals ORDER BY id DESC", ui_conn)
     if not blocked_df.empty: 
@@ -896,7 +847,7 @@ with tab5:
         st.dataframe(filtered_blocked, use_container_width=True, height=600, hide_index=True)
     else: st.info("No signals have been blocked yet.")
 
-with tab6:
+with t_equity:
     if not history_df.empty:
         st.markdown(f"### 📈 Equity Curve (Starting Capital: ₹{INITIAL_CAPITAL:,.0f})")
         equity_df = history_df[['Exit Time', 'PnL (₹)']].copy()
@@ -930,4 +881,4 @@ with tab6:
     else:
         st.info("No closed trades available to plot equity curve yet.")
 
-ui_conn.close()
+ui_conn.close() 
