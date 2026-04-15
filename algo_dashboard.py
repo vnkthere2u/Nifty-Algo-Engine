@@ -242,7 +242,11 @@ def process_market_data():
     alerts = []
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     current_date_str = ist_now.strftime("%Y-%m-%d")
-    scan_time_str = ist_now.strftime("%Y-%m-%d %I:%M %p (IST)")
+    
+    # Mathematical override to lock timestamps perfectly to 5-minute atomic boundaries
+    current_slot_minute = (ist_now.minute // 5) * 5
+    slot_time = ist_now.replace(minute=current_slot_minute, second=0, microsecond=0)
+    scan_time_str = slot_time.strftime("%Y-%m-%d %I:%M %p (IST)")
     
     c.execute("SELECT value FROM system_status WHERE key='last_backup_date'")
     last_backup_row = c.fetchone()
@@ -377,7 +381,7 @@ def process_market_data():
                         true_anchor_time = last_closed_dt + timedelta(minutes=15)
                         atomic_start = true_anchor_time.strftime("%Y-%m-%d %H:%M:%S")
                     except:
-                        atomic_start = ist_now.strftime("%Y-%m-%d %H:%M:%S")
+                        atomic_start = slot_time.strftime("%Y-%m-%d %H:%M:%S")
 
                     anchor_val = f"{atomic_start}|{direction}|{atr_val}|{slot_id}"
                     c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
@@ -406,7 +410,8 @@ def process_market_data():
                 atomic_now = ist_now.replace(tzinfo=None)
                 time_diff = (atomic_now - anchor_dt).total_seconds() / 60.0
                 
-                if time_diff <= 16.0: 
+                # Widened grace period to 20 mins to allow UptimeRobot to deliver the final alert without missing it
+                if time_diff <= 20.0: 
                     # API Flip Detection
                     try:
                         current_candle_time = pd.to_datetime(current_candle.name)
@@ -634,7 +639,7 @@ TRADE_ALLOCATION = 10000.00
 
 live_df = pd.read_sql_query("SELECT ticker as Asset, close_price as 'Latest Price', distance_pct as '% Gap', trend as '15m Trend', htf_trend as '1H Trend', vol_ratio as 'Vol (x)', adx as 'ADX', last_update as 'Time (IST)' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
 
-history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, adx as ADX, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC", ui_conn)
+history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, adx as ADX, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC LIMIT 100", ui_conn)
 
 if not history_df.empty:
     history_df['Yield'] = np.where(history_df['Signal'].str.lower() == 'long', 
@@ -842,7 +847,7 @@ with t_ledger:
 
 with t_blocked:
     st.markdown("<p style='font-size:0.9rem; color:gray; margin-bottom:5px;'>Signals that were mathematically rejected by institutional filters to protect capital.</p>", unsafe_allow_html=True)
-    blocked_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, timestamp as 'Time (IST)', price as Price, rejection_reasons as 'Rejection Reasons', adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM blocked_signals ORDER BY id DESC", ui_conn)
+    blocked_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, timestamp as 'Time (IST)', price as Price, rejection_reasons as 'Rejection Reasons', adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM blocked_signals ORDER BY id DESC LIMIT 100", ui_conn)
     if not blocked_df.empty: 
         filtered_blocked = render_filters(blocked_df, "Blocked", has_status=False)
         st.markdown(f"**Total Blocked Signals:** {len(filtered_blocked)}")
