@@ -71,25 +71,8 @@ def send_telegram_alert(message, test_mode=False):
                 time.sleep(3)
                 continue
             else:
-                if test_mode: return False, f"API Error {response.status_code}: {response.text}"
-                conn = get_db_connection()
-                c = conn.cursor()
-                ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-                err_msg = f"Telegram API Error {response.status_code}: {response.text}"
-                c.execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (ist_now.strftime("%Y-%m-%d %I:%M %p"), err_msg))
-                conn.commit()
-                conn.close()
                 break 
-        except Exception as e: 
-            if test_mode: return False, str(e)
-            try:
-                conn = get_db_connection()
-                c = conn.cursor()
-                ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-                c.execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (ist_now.strftime("%Y-%m-%d %I:%M %p"), f"Telegram Crash: {str(e)}"))
-                conn.commit()
-                conn.close()
-            except: pass
+        except Exception: 
             time.sleep(1)
 
 def send_telegram_csv_backup():
@@ -121,7 +104,7 @@ def send_telegram_csv_backup():
         with open(blocked_filename, 'rb') as f:
             requests.post(url, data=payload_blocked, files={'document': f}, timeout=15)
         os.remove(blocked_filename)
-    except Exception as e: pass
+    except Exception: pass
 
 # ==========================================
 # 2. DATABASE SETUP
@@ -190,22 +173,21 @@ def fetch_and_analyze(item):
     global tv
     df = None
     
-    # FATAL MEMORY FIX: Do not re-instantiate TvDatafeed() to stop zombie threads
+    # Safe fetch without memory leaks
     try:
         df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=160)
         if df_tv is not None and not df_tv.empty:
             df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
             df = df_tv
     except Exception:
-        time.sleep(1) # Allow 1s cooldown for API rate limits
+        time.sleep(1)
         try:
-            # Retry connection with existing socket, do NOT spawn new tv object
             df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=160)
             if df_tv is not None and not df_tv.empty:
                 df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
                 df = df_tv
         except Exception:
-            pass # Fails to yfinance cleanly without leaking a background thread
+            pass 
 
     if (df is None or df.empty) and item['tv_exchange'] == 'NSE':
         try:
@@ -219,7 +201,6 @@ def fetch_and_analyze(item):
         try:
             df = df.copy() 
             
-            # Universal IST Alignment to prevent Timezone Annihilation
             if df.index.tz is not None:
                 df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
             else:
@@ -252,7 +233,7 @@ def fetch_and_analyze(item):
                 
             df.dropna(subset=['EMA39_1H', 'EMA39', 'EMA5', 'ATR'], inplace=True)
             if len(df) >= 5: return df
-        except Exception as e: pass
+        except Exception: pass
     return None
 
 def process_market_data():
@@ -433,11 +414,9 @@ def process_market_data():
                             current_candle_time = current_candle_time.tz_localize(None)
                             
                         if current_candle_time == anchor_dt:
-                            # API has not rolled over. Evaluate the active forming candle.
                             eval_candle = current_candle
                             prev_adx = last_closed.get('ADX', 0.0)
                         else:
-                            # API has rolled over past the window. Evaluate the finalized candle.
                             eval_candle = last_closed
                             prev_adx = prev_closed.get('ADX', 0.0)
                     except:
@@ -485,7 +464,6 @@ def process_market_data():
                         alerts.append(msg)
                         send_telegram_alert(msg)
                     else:
-                        # Safe HTML escaping for dynamic Telegram variables
                         safe_reasons = [r.replace("<", "&lt;").replace(">", "&gt;") for r in rejection_reasons]
                         reason_str = " | ".join(safe_reasons)
                         
@@ -511,38 +489,51 @@ def process_market_data():
     conn.close()
     
     gc.collect() 
-    return alerts
+    return True
 
 
 # ==========================================
-# 4. STREAMLIT UI & PING-DRIVEN ENGINE
+# 4. STREAMLIT UI & TIME-SLOT ENGINE
 # ==========================================
+
 def check_and_run_engine():
-    """Checks if 4+ minutes have passed since the last scan. If yes, executes engine."""
+    """Uses a specific Time-Slot logic to ensure exact 5-minute atomic sync."""
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    
+    # Calculate the current 5-minute slot (e.g., 11:07 becomes 11:05)
+    current_slot_minute = (ist_now.minute // 5) * 5
+    slot_time = ist_now.replace(minute=current_slot_minute, second=0, microsecond=0)
+    slot_str = slot_time.strftime("%Y-%m-%d %I:%M %p (IST)")
+    
     try:
         conn = get_db_connection()
         c = conn.cursor()
-        c.execute("SELECT value FROM system_status WHERE key='last_scan'")
+        c.execute("SELECT value FROM system_status WHERE key='last_processed_slot'")
         row = c.fetchone()
         conn.close()
         
-        ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-        
-        if row:
-            last_scan_str = row[0].replace(" (IST)", "")
-            last_scan_time = datetime.strptime(last_scan_str, "%Y-%m-%d %I:%M %p")
-            seconds_since_scan = (ist_now.replace(tzinfo=None) - last_scan_time).total_seconds()
-            
-            # If UptimeRobot or user refreshed within the last 4 minutes, skip to save RAM
-            if seconds_since_scan < 240:
-                return False
+        # If we have already scanned the market for this exact 5-minute slot, do nothing.
+        if row and row[0] == slot_str:
+            return False 
     except Exception:
-        pass # If error or DB is empty, default to running the scan
+        pass 
         
+    # If the slot is new, run the engine
     process_market_data()
+    
+    # Save the slot so UI refreshes don't run it again
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_processed_slot', ?)", (slot_str,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+        
     return True
 
-# This runs silently every time UptimeRobot pings the app
+# The engine trigger: Only runs if the current 5-minute slot is completely new
 ran_scan = check_and_run_engine()
 
 ui_conn = get_db_connection()
@@ -550,22 +541,24 @@ ui_c = ui_conn.cursor()
 
 st.sidebar.markdown("<h3>⚙️ Control Panel</h3>", unsafe_allow_html=True)
 if ran_scan:
-    st.sidebar.success("✅ Market Data Synced via Ping")
+    st.sidebar.success("✅ Market Data Synced (New Time Slot)")
 else:
-    st.sidebar.info("⏸️ Standing by (Data fresh)")
+    st.sidebar.info("⏸️ Standing by (Slot already processed)")
 
 ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
 last_scan_row = ui_c.fetchone()
 st.sidebar.info(f"⏱️ **Last Database Sync:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
 
+# The Refresh button now perfectly updates the UI without messing up the market sync
 if st.sidebar.button("🔄 Refresh Data"):
-    ui_conn.close() # FATAL LEAK FIX: Close DB connection before Streamlit wipes context
+    ui_conn.close()
     st.rerun()
 
+# Only use this if the bot is completely stuck
 if st.sidebar.button("🔄 Force Manual Data Sync"):
     with st.spinner("Executing Data Sync..."):
         process_market_data()
-        ui_conn.close() # FATAL LEAK FIX
+        ui_conn.close()
         st.rerun()
 
 st.sidebar.markdown("---")
@@ -614,7 +607,7 @@ if uploaded_file is not None:
             else:
                 st.sidebar.error("❌ Unrecognized CSV format.")
             time.sleep(2)
-            ui_conn.close() # FATAL LEAK FIX
+            ui_conn.close() 
             st.rerun()
         except Exception as e: 
             st.sidebar.error(f"Restore failed: {e}")
@@ -775,7 +768,7 @@ def render_filters(df, tab_name, has_status=False):
         return filtered_df
 
 # ==========================================
-# UI: TABBED INTERFACE (Chart Tab Removed)
+# UI: TABBED INTERFACE
 # ==========================================
 t_heat, t_open, t_ledger, t_blocked, t_equity = st.tabs(["🔥 Heatmap", "🟢 Open", "📚 Ledger", "🚫 Blocked", "💰 Equity"])
 
@@ -890,4 +883,4 @@ with t_equity:
     else:
         st.info("No closed trades available to plot equity curve yet.")
 
-ui_conn.close() # Final DB close to prevent trailing WAL files at the end of normal execution
+ui_conn.close() 
