@@ -173,7 +173,6 @@ def fetch_and_analyze(item):
     global tv
     df = None
     
-    # Safe fetch without memory leaks
     try:
         df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=160)
         if df_tv is not None and not df_tv.empty:
@@ -293,23 +292,35 @@ def process_market_data():
                 trade_id, sig_type, sl, tp, entry_price, entry_time_str, db_atr = trade
                 atr_val = db_atr if (db_atr and db_atr > 0) else abs(tp - entry_price) / 3.75
                 
+                # --- ARCHITECT PATCH: The Wick Illusion & Gap Paradox Fix ---
+                in_entry_candle = False
                 try:
                     clean_time_str = entry_time_str.replace(" (IST)", "")
                     entry_dt_ist = pd.to_datetime(clean_time_str, format="%Y-%m-%d %I:%M %p")
+                    
+                    current_candle_time = pd.to_datetime(current_candle.name)
+                    if current_candle_time.tz is not None: current_candle_time = current_candle_time.tz_localize(None)
+                    
+                    # Detect if we are currently inside the exact 15-minute candle where the entry happened
+                    in_entry_candle = (current_candle_time <= entry_dt_ist < current_candle_time + timedelta(minutes=15))
+                    
                     temp_idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
-                    trade_history = df[temp_idx >= entry_dt_ist]
+                    # Exclude the current forming candle from historical checks to prevent tracking ghosts
+                    trade_history = df[temp_idx > current_candle_time] 
                     
                     if not trade_history.empty:
-                        max_high_reached = trade_history['High'].max()
-                        min_low_reached = trade_history['Low'].min()
+                        # Append the live close price if inside the entry candle, otherwise safe to use full high/low
+                        hist_high_eval = current_candle['Close'] if in_entry_candle else current_candle['High']
+                        hist_low_eval = current_candle['Close'] if in_entry_candle else current_candle['Low']
+                        max_high_reached = max(trade_history['High'].max(), hist_high_eval)
+                        min_low_reached = min(trade_history['Low'].min(), hist_low_eval)
                     else:
-                        max_high_reached = current_candle['High']
-                        min_low_reached = current_candle['Low']
-                except Exception:
-                    max_high_reached = current_candle['High']
-                    min_low_reached = current_candle['Low']
+                        max_high_reached = current_candle['Close'] if in_entry_candle else current_candle['High']
+                        min_low_reached = current_candle['Close'] if in_entry_candle else current_candle['Low']
 
-                current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
+                except Exception:
+                    max_high_reached, min_low_reached = current_candle['High'], current_candle['Low']
+
                 sl_before_update = sl 
                 
                 if sig_type == 'long':
@@ -320,17 +331,19 @@ def process_market_data():
                             sl = new_sl
                             send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} LONG hit 1 ATR. SL moved to lock 0.25 ATR profit ({round(new_sl, 2)}).")
                     
-                    if current_open >= tp:
-                        c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
-                        send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)}")
-                    elif current_open <= sl_before_update:
+                    # Gaps are mathematically impossible during the entry candle, skip these checks
+                    if not in_entry_candle and current_candle['Open'] >= tp:
+                        c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_candle['Open'], trade_id))
+                        send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_candle['Open'], 2)}")
+                    elif not in_entry_candle and current_candle['Open'] <= sl_before_update:
                         status_text = 'BREAK-EVEN TP HIT (GAP)' if sl_before_update > entry_price else ('BREAK-EVEN (GAP DOWN)' if sl_before_update == entry_price else 'SL HIT (GAP DOWN)')
-                        c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_open, trade_id))
-                        send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(current_open, 2)}")
-                    elif current_high >= tp:
+                        c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_candle['Open'], trade_id))
+                        send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(current_candle['Open'], 2)}")
+                    # Standard Hits: Blinded to High/Low during entry candle to avoid wick illusions
+                    elif (current_candle['Close'] if in_entry_candle else current_candle['High']) >= tp:
                         c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
                         send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} LONG closed at {round(tp, 2)}")
-                    elif current_low <= sl:
+                    elif (current_candle['Close'] if in_entry_candle else current_candle['Low']) <= sl:
                         status_text = 'BREAK-EVEN TP HIT' if sl > entry_price else ('BREAK-EVEN (0 RISK)' if sl == entry_price else 'SL HIT (LOSS)')
                         c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, sl, trade_id))
                         send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(sl, 2)}")
@@ -343,17 +356,17 @@ def process_market_data():
                             sl = new_sl
                             send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to lock 0.25 ATR profit ({round(new_sl, 2)}).")
 
-                    if current_open <= tp:
-                        c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
-                        send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)}")
-                    elif current_open >= sl_before_update:
+                    if not in_entry_candle and current_candle['Open'] <= tp:
+                        c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_candle['Open'], trade_id))
+                        send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_candle['Open'], 2)}")
+                    elif not in_entry_candle and current_candle['Open'] >= sl_before_update:
                         status_text = 'BREAK-EVEN TP HIT (GAP)' if sl_before_update < entry_price else ('BREAK-EVEN (GAP UP)' if sl_before_update == entry_price else 'SL HIT (GAP UP)')
-                        c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_open, trade_id))
-                        send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(current_open, 2)}")
-                    elif current_low <= tp:
+                        c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_candle['Open'], trade_id))
+                        send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(current_candle['Open'], 2)}")
+                    elif (current_candle['Close'] if in_entry_candle else current_candle['Low']) <= tp:
                         c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
                         send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} SHORT closed at {round(tp, 2)}")
-                    elif current_high >= sl:
+                    elif (current_candle['Close'] if in_entry_candle else current_candle['High']) >= sl:
                         status_text = 'BREAK-EVEN TP HIT' if sl < entry_price else ('BREAK-EVEN (0 RISK)' if sl == entry_price else 'SL HIT (LOSS)')
                         c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, sl, trade_id))
                         send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(sl, 2)}")
@@ -393,7 +406,6 @@ def process_market_data():
             if anchor_row:
                 anchor_data = anchor_row[0].split('|')
                 
-                # Purge Poisoned Schema
                 if len(anchor_data) < 4:
                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                     conn.commit()
@@ -410,7 +422,6 @@ def process_market_data():
                 atomic_now = ist_now.replace(tzinfo=None)
                 time_diff = (atomic_now - anchor_dt).total_seconds() / 60.0
                 
-                # Widened grace period to 20 mins to allow UptimeRobot to deliver the final alert without missing it
                 if time_diff <= 20.0: 
                     # API Flip Detection
                     try:
@@ -452,7 +463,8 @@ def process_market_data():
                     if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
                         
                     if len(rejection_reasons) == 0:
-                        entry = eval_candle['Close']
+                        # Entry Delayed Network Patch: Always use current_candle['Close'] for live market price, never historical
+                        entry = current_candle['Close']
                         if anchor_direction == "LONG":
                             sl, tp = entry - (1.5 * anchor_atr), entry + (3.75 * anchor_atr)
                             c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -502,10 +514,7 @@ def process_market_data():
 # ==========================================
 
 def check_and_run_engine():
-    """Uses a specific Time-Slot logic to ensure exact 5-minute atomic sync."""
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-    
-    # Calculate the current 5-minute slot (e.g., 11:07 becomes 11:05)
     current_slot_minute = (ist_now.minute // 5) * 5
     slot_time = ist_now.replace(minute=current_slot_minute, second=0, microsecond=0)
     slot_str = slot_time.strftime("%Y-%m-%d %I:%M %p (IST)")
@@ -517,16 +526,13 @@ def check_and_run_engine():
         row = c.fetchone()
         conn.close()
         
-        # If we have already scanned the market for this exact 5-minute slot, do nothing.
         if row and row[0] == slot_str:
             return False 
     except Exception:
         pass 
         
-    # If the slot is new, run the engine
     process_market_data()
     
-    # Save the slot so UI refreshes don't run it again
     try:
         conn = get_db_connection()
         c = conn.cursor()
@@ -538,7 +544,6 @@ def check_and_run_engine():
         
     return True
 
-# The engine trigger: Only runs if the current 5-minute slot is completely new
 ran_scan = check_and_run_engine()
 
 ui_conn = get_db_connection()
@@ -554,12 +559,10 @@ ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
 last_scan_row = ui_c.fetchone()
 st.sidebar.info(f"⏱️ **Last Database Sync:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
 
-# The Refresh button now perfectly updates the UI without messing up the market sync
 if st.sidebar.button("🔄 Refresh Data"):
     ui_conn.close()
     st.rerun()
 
-# Only use this if the bot is completely stuck
 if st.sidebar.button("🔄 Force Manual Data Sync"):
     with st.spinner("Executing Data Sync..."):
         process_market_data()
