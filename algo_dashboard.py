@@ -5,7 +5,6 @@ import pandas_ta as ta
 import sqlite3
 import time
 import requests
-import threading
 import os
 import gc 
 import traceback
@@ -130,7 +129,6 @@ def send_telegram_csv_backup():
 def get_db_connection():
     conn = sqlite3.connect('nifty_live_trades.db', check_same_thread=False, timeout=30.0)
     c = conn.cursor()
-    # Prevent SQLite Database Locked errors
     c.execute("PRAGMA journal_mode=WAL;")
     
     c.execute('''CREATE TABLE IF NOT EXISTS trades 
@@ -163,7 +161,7 @@ def get_db_connection():
     return conn
 
 # ==========================================
-# 3. DUAL-ENGINE LOGIC & ADVANCED MATH
+# 3. CORE ENGINE LOGIC & MATH
 # ==========================================
 WATCHLIST = [
     {'name': 'NIFTY 50', 'tv_symbol': 'NIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEI'},
@@ -192,37 +190,36 @@ def fetch_and_analyze(item):
     global tv
     df = None
     
-    # Auto-Reconnection Pool for tvDatafeed rate-limiting
+    # FATAL MEMORY FIX: Do not re-instantiate TvDatafeed() to stop zombie threads
     try:
-        df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
+        df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=160)
         if df_tv is not None and not df_tv.empty:
             df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
             df = df_tv
     except Exception:
+        time.sleep(1) # Allow 1s cooldown for API rate limits
         try:
-            tv = TvDatafeed() 
-            df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
+            # Retry connection with existing socket, do NOT spawn new tv object
+            df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=160)
             if df_tv is not None and not df_tv.empty:
                 df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
                 df = df_tv
         except Exception:
-            pass
+            pass # Fails to yfinance cleanly without leaking a background thread
 
     if (df is None or df.empty) and item['tv_exchange'] == 'NSE':
         try:
             df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="5d")
             if df_yf is not None and not df_yf.empty:
-                # Prevent tz_localize crash if yFinance index is already naive
                 df_yf.index = df_yf.index.tz_localize(None) if df_yf.index.tz is not None else df_yf.index
                 df = df_yf
         except Exception: pass
 
     if df is not None and not df.empty:
         try:
-            # Explicit copy to prevent pandas SettingWithCopyWarning
             df = df.copy() 
             
-            # Universal IST Alignment to prevent Timezone Annihilation Paradox
+            # Universal IST Alignment to prevent Timezone Annihilation
             if df.index.tz is not None:
                 df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
             else:
@@ -516,48 +513,59 @@ def process_market_data():
     gc.collect() 
     return alerts
 
-def get_sleep_time_to_next_5m():
-    now = datetime.now()
-    next_minute = ((now.minute // 5) + 1) * 5
-    if next_minute >= 60:
-        next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    else:
-        next_time = now.replace(minute=next_minute, second=0, microsecond=0)
-    return max(0, (next_time - now).total_seconds())
 
 # ==========================================
-# 4. STREAMLIT DASHBOARD UI
+# 4. STREAMLIT UI & PING-DRIVEN ENGINE
 # ==========================================
+def check_and_run_engine():
+    """Checks if 4+ minutes have passed since the last scan. If yes, executes engine."""
+    try:
+        conn = get_db_connection()
+        c = conn.cursor()
+        c.execute("SELECT value FROM system_status WHERE key='last_scan'")
+        row = c.fetchone()
+        conn.close()
+        
+        ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        
+        if row:
+            last_scan_str = row[0].replace(" (IST)", "")
+            last_scan_time = datetime.strptime(last_scan_str, "%Y-%m-%d %I:%M %p")
+            seconds_since_scan = (ist_now.replace(tzinfo=None) - last_scan_time).total_seconds()
+            
+            # If UptimeRobot or user refreshed within the last 4 minutes, skip to save RAM
+            if seconds_since_scan < 240:
+                return False
+    except Exception:
+        pass # If error or DB is empty, default to running the scan
+        
+    process_market_data()
+    return True
+
+# This runs silently every time UptimeRobot pings the app
+ran_scan = check_and_run_engine()
+
 ui_conn = get_db_connection()
 ui_c = ui_conn.cursor()
 
-@st.cache_resource
-def start_background_scanner():
-    def background_loop():
-        while True:
-            sleep_sec = get_sleep_time_to_next_5m()
-            time.sleep(sleep_sec)
-            try: 
-                process_market_data()
-            except Exception as e: 
-                print(f"CRITICAL DAEMON CRASH: {e}")
-                traceback.print_exc()
-    thread = threading.Thread(target=background_loop, daemon=True)
-    thread.start()
-    return True
-
-engine_running = start_background_scanner()
-
 st.sidebar.markdown("<h3>⚙️ Control Panel</h3>", unsafe_allow_html=True)
-if engine_running: st.sidebar.success("✅ Background Daemon is LIVE")
+if ran_scan:
+    st.sidebar.success("✅ Market Data Synced via Ping")
+else:
+    st.sidebar.info("⏸️ Standing by (Data fresh)")
 
 ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
 last_scan_row = ui_c.fetchone()
 st.sidebar.info(f"⏱️ **Last Database Sync:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
 
+if st.sidebar.button("🔄 Refresh Data"):
+    ui_conn.close() # FATAL LEAK FIX: Close DB connection before Streamlit wipes context
+    st.rerun()
+
 if st.sidebar.button("🔄 Force Manual Data Sync"):
     with st.spinner("Executing Data Sync..."):
         process_market_data()
+        ui_conn.close() # FATAL LEAK FIX
         st.rerun()
 
 st.sidebar.markdown("---")
@@ -606,6 +614,7 @@ if uploaded_file is not None:
             else:
                 st.sidebar.error("❌ Unrecognized CSV format.")
             time.sleep(2)
+            ui_conn.close() # FATAL LEAK FIX
             st.rerun()
         except Exception as e: 
             st.sidebar.error(f"Restore failed: {e}")
@@ -881,4 +890,4 @@ with t_equity:
     else:
         st.info("No closed trades available to plot equity curve yet.")
 
-ui_conn.close() 
+ui_conn.close() # Final DB close to prevent trailing WAL files at the end of normal execution
