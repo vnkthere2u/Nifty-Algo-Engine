@@ -167,10 +167,15 @@ WATCHLIST = [
     {'name': 'VEDANTA', 'tv_symbol': 'VEDL', 'tv_exchange': 'NSE', 'yf_symbol': 'VEDL.NS'}
 ]
 
-tv = TvDatafeed()
+# --- ARCHITECT PATCH: Prevent 100x Websocket Memory Leak ---
+@st.cache_resource
+def get_tv_connection():
+    """Stores a SINGLE TradingView connection in Streamlit's permanent server memory."""
+    return TvDatafeed()
+# -----------------------------------------------------------
 
 def fetch_and_analyze(item):
-    global tv
+    tv = get_tv_connection()
     df = None
     
     try:
@@ -422,6 +427,7 @@ def process_market_data():
                 atomic_now = ist_now.replace(tzinfo=None)
                 time_diff = (atomic_now - anchor_dt).total_seconds() / 60.0
                 
+                # Widened grace period to 20 mins to allow UptimeRobot to deliver the final alert without missing it
                 if time_diff <= 20.0: 
                     # API Flip Detection
                     try:
@@ -463,7 +469,7 @@ def process_market_data():
                     if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
                         
                     if len(rejection_reasons) == 0:
-                        # Entry Delayed Network Patch: Always use current_candle['Close'] for live market price, never historical
+                        # Entry Delayed Network Patch: Always use current_candle['Close'] for live market price
                         entry = current_candle['Close']
                         if anchor_direction == "LONG":
                             sl, tp = entry - (1.5 * anchor_atr), entry + (3.75 * anchor_atr)
