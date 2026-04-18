@@ -82,8 +82,38 @@ def send_telegram_alert(message, test_mode=False):
             else: return False if test_mode else None
         except Exception: time.sleep(1)
 
+def send_telegram_csv_backup():
+    if not TELEGRAM_TOKEN: return
+    try:
+        with contextlib.closing(get_db_connection()) as conn:
+            df_trades = pd.read_sql_query("SELECT * FROM trades", conn)
+            df_blocked = pd.read_sql_query("SELECT * FROM blocked_signals", conn)
+            
+        ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        date_str = ist_now.strftime('%Y-%m-%d')
+        
+        trades_filename = f"Trades_Backup_{date_str}.csv"
+        df_trades.to_csv(trades_filename, index=False)
+        blocked_filename = f"Blocked_Backup_{date_str}.csv"
+        df_blocked.to_csv(blocked_filename, index=False)
+
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        
+        payload_trades = {'chat_id': TELEGRAM_CHAT_ID, 'caption': f"📊 <b>Automated Daily Backup: Trades</b>\nDate: {date_str}", 'parse_mode': 'HTML'}
+        with open(trades_filename, 'rb') as f:
+            requests.post(url, data=payload_trades, files={'document': f}, timeout=15)
+        os.remove(trades_filename)
+        
+        time.sleep(2)
+        
+        payload_blocked = {'chat_id': TELEGRAM_CHAT_ID, 'caption': f"🚫 <b>Automated Daily Backup: Blocked Signals</b>\nDate: {date_str}", 'parse_mode': 'HTML'}
+        with open(blocked_filename, 'rb') as f:
+            requests.post(url, data=payload_blocked, files={'document': f}, timeout=15)
+        os.remove(blocked_filename)
+    except Exception: pass
+
 # ==========================================
-# 2. DATA FETCHING ENGINE
+# 2. DATA FETCHING ENGINE (FULL 18 ASSETS)
 # ==========================================
 WATCHLIST = [
     {'name': 'NIFTY 50', 'tv_symbol': 'NIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEI'},
@@ -93,7 +123,17 @@ WATCHLIST = [
     {'name': 'SILVER', 'tv_symbol': 'XAGUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'SI=F'},
     {'name': 'CRUDE OIL', 'tv_symbol': 'WTICOUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'CL=F'},
     {'name': 'HDFC BANK', 'tv_symbol': 'HDFCBANK', 'tv_exchange': 'NSE', 'yf_symbol': 'HDFCBANK.NS'},
-    {'name': 'RELIANCE', 'tv_symbol': 'RELIANCE', 'tv_exchange': 'NSE', 'yf_symbol': 'RELIANCE.NS'}
+    {'name': 'SBI', 'tv_symbol': 'SBIN', 'tv_exchange': 'NSE', 'yf_symbol': 'SBIN.NS'},
+    {'name': 'RELIANCE', 'tv_symbol': 'RELIANCE', 'tv_exchange': 'NSE', 'yf_symbol': 'RELIANCE.NS'},
+    {'name': 'INFOSYS', 'tv_symbol': 'INFY', 'tv_exchange': 'NSE', 'yf_symbol': 'INFY.NS'},
+    {'name': 'TCS', 'tv_symbol': 'TCS', 'tv_exchange': 'NSE', 'yf_symbol': 'TCS.NS'},
+    {'name': 'ITC', 'tv_symbol': 'ITC', 'tv_exchange': 'NSE', 'yf_symbol': 'ITC.NS'},
+    {'name': 'TATA MOTORS', 'tv_symbol': 'TATAMOTORS', 'tv_exchange': 'NSE', 'yf_symbol': 'TATAMOTORS.NS'},
+    {'name': 'TATA STEEL', 'tv_symbol': 'TATASTEEL', 'tv_exchange': 'NSE', 'yf_symbol': 'TATASTEEL.NS'},
+    {'name': 'L&T', 'tv_symbol': 'LT', 'tv_exchange': 'NSE', 'yf_symbol': 'LT.NS'},
+    {'name': 'BHARTI AIRTEL', 'tv_symbol': 'BHARTIARTL', 'tv_exchange': 'NSE', 'yf_symbol': 'BHARTIARTL.NS'},
+    {'name': 'SUN PHARMA', 'tv_symbol': 'SUNPHARMA', 'tv_exchange': 'NSE', 'yf_symbol': 'SUNPHARMA.NS'},
+    {'name': 'VEDANTA', 'tv_symbol': 'VEDL', 'tv_exchange': 'NSE', 'yf_symbol': 'VEDL.NS'}
 ]
 
 tv = TvDatafeed()
@@ -155,6 +195,16 @@ def process_market_data():
             c = conn.cursor()
             ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
             scan_time_str = ist_now.replace(minute=(ist_now.minute // 5) * 5, second=0, microsecond=0).strftime("%Y-%m-%d %I:%M %p (IST)")
+            
+            current_date_str = ist_now.strftime("%Y-%m-%d")
+            c.execute("SELECT value FROM system_status WHERE key='last_backup_date'")
+            last_backup_row = c.fetchone()
+            last_backup_date = last_backup_row[0] if last_backup_row else ""
+            
+            if current_date_str != last_backup_date and ist_now.hour >= 23 and ist_now.minute >= 30:
+                send_telegram_csv_backup()
+                c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_backup_date', ?)", (current_date_str,))
+                conn.commit()
 
             for item in WATCHLIST:
                 name, exchange = item['name'], item['tv_exchange']
@@ -164,7 +214,7 @@ def process_market_data():
                 if exchange == 'NSE':
                     if ist_now.weekday() >= 5 or not (555 <= (ist_now.hour * 60 + ist_now.minute) <= 935): market_open = False
                 elif exchange in ['OANDA', 'TVC']:
-                    if ist_now.weekday() == 5 or (ist_now.weekday() == 6 and ist_now.hour < 3): market_open = False # Blocks Weekend Ghost Spams
+                    if ist_now.weekday() == 5 or (ist_now.weekday() == 6 and ist_now.hour < 3): market_open = False 
 
                 df = fetch_and_analyze(item)
                 if df is None: continue
@@ -216,13 +266,12 @@ def process_market_data():
                             send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to +0.25 ATR.")
                 conn.commit()
 
-                # 3. REWRITTEN STATE MACHINE (No more infinite ghost loops)
-                signal_id = str(last.name) # The exact timestamp of the crossover candle
+                # 3. REWRITTEN STATE MACHINE 
+                signal_id = str(last.name) 
                 
                 c.execute("SELECT value FROM system_status WHERE key=?", (f"proc_{name}",))
                 proc_row = c.fetchone()
                 
-                # Only check if we have NEVER completely processed or expired this exact candle
                 if not proc_row or proc_row[0] != signal_id:
                     c.execute("SELECT value FROM system_status WHERE key=?", (f"anchor_{name}",))
                     anchor_row = c.fetchone()
@@ -230,16 +279,14 @@ def process_market_data():
                     is_long = (prev['EMA5'] <= prev['EMA39']) and (last['EMA5'] > last['EMA39'])
                     is_short = (prev['EMA5'] >= prev['EMA39']) and (last['EMA5'] < last['EMA39'])
                     
-                    # Create Anchor ONLY if one doesn't exist (Prevents the Reset Bug)
                     if (is_long or is_short) and not anchor_row:
                         direction = "LONG" if is_long else "SHORT"
-                        start_time = ist_now.replace(minute=(ist_now.minute // 5) * 5, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+                        start_time = ist_now.replace(minute=(ist_now.minute // 15) * 15, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
                         anchor_val = f"{start_time}|{direction}|{last['ATR']}|{signal_id}"
                         c.execute("INSERT INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
                         conn.commit()
                         anchor_row = (anchor_val,)
 
-                    # Evaluate Active Anchor
                     if anchor_row:
                         adata = anchor_row[0].split('|')
                         if len(adata) == 4 and adata[3] == signal_id:
@@ -262,28 +309,23 @@ def process_market_data():
                                 if abs(ev_candle['Close'] - ev_candle['EMA39']) > (2.5 * a_atr): rejections.append("Overextended.")
                                 
                                 if not rejections:
-                                    # EXECUTE TRADE
                                     entry = ev_candle['Close']
                                     sl = entry - (1.5 * a_atr) if a_dir == "LONG" else entry + (1.5 * a_atr)
                                     tp = entry + (3.75 * a_atr) if a_dir == "LONG" else entry - (3.75 * a_atr)
                                     c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)", (name, a_dir.lower(), scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), l_htf, round(l_vol, 2), round(a_atr, 2), round(l_adx, 2)))
                                     send_telegram_alert(f"{'🟢' if a_dir=='LONG' else '🔴'} <b>{a_dir} SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\nADX: {round(l_adx, 1)}")
                                     
-                                    # Lock Signal & Incinerate Anchor
                                     c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", signal_id))
                                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                                 else:
-                                    # LOG FAILURE
                                     safe_rej = [r.replace("<", "&lt;").replace(">", "&gt;") for r in rejections]
                                     c.execute("INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (name, a_dir, scan_time_str, round(ev_candle['Close'], 2), round(l_adx, 2), l_htf, round(l_vol, 2), " | ".join(safe_rej)))
                                     
                                     if mins_elapsed >= 14.0:
-                                        # TERMINAL EXPIRE
                                         send_telegram_alert(f"💀 <b>EXPIRED: {name}</b>\n{a_dir} failed to align within 15m.\n" + "\n".join([f"❌ {r}" for r in safe_rej]))
                                         c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", signal_id))
                                         c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                             else:
-                                # FAILSAFE CLEANUP (> 16 mins)
                                 c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", signal_id))
                                 c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                     conn.commit()
