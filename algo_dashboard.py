@@ -153,7 +153,7 @@ WATCHLIST = [
     {'name': 'BITCOIN (24/7)', 'tv_symbol': 'BTCUSDT', 'tv_exchange': 'BINANCE', 'yf_symbol': 'BTC-USD'},
     {'name': 'GOLD', 'tv_symbol': 'XAUUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'GC=F'},
     {'name': 'SILVER', 'tv_symbol': 'XAGUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'SI=F'},
-    {'name': 'CRUDE OIL', 'tv_symbol': 'WTICOUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'CL=F'},
+    {'name': 'CRUDE OIL', 'tv_symbol': 'USOIL', 'tv_exchange': 'TVC', 'yf_symbol': 'CL=F'},
     {'name': 'HDFC BANK', 'tv_symbol': 'HDFCBANK', 'tv_exchange': 'NSE', 'yf_symbol': 'HDFCBANK.NS'},
     {'name': 'SBI', 'tv_symbol': 'SBIN', 'tv_exchange': 'NSE', 'yf_symbol': 'SBIN.NS'},
     {'name': 'RELIANCE', 'tv_symbol': 'RELIANCE', 'tv_exchange': 'NSE', 'yf_symbol': 'RELIANCE.NS'},
@@ -398,8 +398,9 @@ def process_market_data():
                             current_minute = ist_now.minute
                             window_start_minute = (current_minute // 15) * 15
                             window_start_time = ist_now.replace(minute=window_start_minute, second=0, microsecond=0, tzinfo=None)
-                            true_anchor_time = window_start_time + timedelta(minutes=15)
-                            atomic_start = true_anchor_time.strftime("%Y-%m-%d %H:%M:%S")
+                            
+                            # THE FIX: Anchor locked to exact naive IST start minute without future offset
+                            atomic_start = window_start_time.strftime("%Y-%m-%d %H:%M:%S")
 
                             anchor_val = f"{atomic_start}|{direction}|{atr_val}|{slot_id}"
                             c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
@@ -428,20 +429,9 @@ def process_market_data():
                         time_diff = (atomic_now - anchor_dt).total_seconds() / 60.0
                         
                         if time_diff <= 16.0: 
-                            try:
-                                current_candle_time = pd.to_datetime(current_candle.name)
-                                if current_candle_time.tz is not None: 
-                                    current_candle_time = current_candle_time.tz_localize(None)
-                                    
-                                if current_candle_time == anchor_dt:
-                                    eval_candle = current_candle
-                                    prev_adx = last_closed.get('ADX', 0.0)
-                                else:
-                                    eval_candle = last_closed
-                                    prev_adx = prev_closed.get('ADX', 0.0)
-                            except:
-                                eval_candle = current_candle
-                                prev_adx = last_closed.get('ADX', 0.0)
+                            # THE FIX: Restored pure 'Last Gasp' boundary check evaluating last_closed at the 15m mark
+                            eval_candle = last_closed if time_diff >= 14.0 else current_candle
+                            prev_adx = prev_closed.get('ADX', 0.0) if time_diff >= 14.0 else last_closed.get('ADX', 0.0)
                             
                             live_adx = eval_candle.get('ADX', 0.0)
                             live_vol = eval_candle.get('Vol_Ratio', 1.0)
@@ -467,7 +457,7 @@ def process_market_data():
                             if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
                             
                             if len(rejection_reasons) == 0:
-                                entry = latest_price
+                                entry = eval_candle['Close']
                                 if anchor_direction == "LONG":
                                     sl, tp = entry - (1.5 * anchor_atr), entry + (3.75 * anchor_atr)
                                     c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -713,7 +703,7 @@ with contextlib.closing(get_db_connection()) as ui_conn:
             <th></th>
             <th>Trades</th>
             <th>Win</th>
-            <th>Break Even</th>
+            <th>Break Brek</th>
             <th>Loss</th>
         </tr>
         <tr>
