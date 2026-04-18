@@ -40,12 +40,11 @@ st.markdown("""
         .stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid #2b303b; }
         .stTabs [data-baseweb="tab"] { white-space: nowrap !important; padding: 10px 20px; background-color: transparent; color: #8b949e; font-size: 0.95rem; font-weight: 500; border: none; }
         .stTabs [aria-selected="true"] { background-color: rgba(88, 166, 255, 0.1) !important; color: #58a6ff !important; border-bottom: 3px solid #58a6ff !important; border-radius: 6px 6px 0 0; }
-        .stDataFrame { margin-top: -15px; }
     </style>
 """, unsafe_allow_html=True)
 
 # ==========================================
-# 1. TELEGRAM ALERT & BACKUP SETUP
+# 1. CORE ARCHITECTURE & DB SETUP
 # ==========================================
 try:
     TELEGRAM_TOKEN = st.secrets["TELEGRAM_TOKEN"]
@@ -62,90 +61,29 @@ def get_db_connection():
 def setup_database():
     with contextlib.closing(get_db_connection()) as conn:
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS trades 
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
-                     entry_time TEXT, entry_price REAL, sl REAL, tp REAL, status TEXT, 
-                     exit_time TEXT, exit_price REAL)''')
-        try: c.execute("ALTER TABLE trades ADD COLUMN htf_trend TEXT")
-        except sqlite3.OperationalError: pass 
-        try: c.execute("ALTER TABLE trades ADD COLUMN vol_ratio REAL")
-        except sqlite3.OperationalError: pass 
-        try: c.execute("ALTER TABLE trades ADD COLUMN atr REAL")
-        except sqlite3.OperationalError: pass 
-        try: c.execute("ALTER TABLE trades ADD COLUMN adx REAL")
-        except sqlite3.OperationalError: pass 
-        
+        c.execute('''CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, entry_time TEXT, entry_price REAL, sl REAL, tp REAL, status TEXT, exit_time TEXT, exit_price REAL, htf_trend TEXT, vol_ratio REAL, atr REAL, adx REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, value TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS system_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS live_market_data 
-                     (ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL, ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL, htf_trend TEXT, vol_ratio REAL)''')
-        try: c.execute("ALTER TABLE live_market_data ADD COLUMN adx REAL")
-        except sqlite3.OperationalError: pass
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS blocked_signals 
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, 
-                     timestamp TEXT, price REAL, adx REAL, htf_trend TEXT, vol_ratio REAL, rejection_reasons TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS live_market_data (ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL, ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL, htf_trend TEXT, vol_ratio REAL, adx REAL)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS blocked_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, timestamp TEXT, price REAL, adx REAL, htf_trend TEXT, vol_ratio REAL, rejection_reasons TEXT)''')
         conn.commit()
 
 setup_database()
 
 def send_telegram_alert(message, test_mode=False):
-    if not TELEGRAM_TOKEN: 
-        if test_mode: return False, "Telegram Secrets not found in config."
-        return False
-        
-    safe_message = message.replace("&", "&amp;")
+    if not TELEGRAM_TOKEN: return False if test_mode else None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': safe_message, 'parse_mode': 'HTML'}
-    
-    for attempt in range(3):
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message.replace("&", "&amp;"), 'parse_mode': 'HTML'}
+    for _ in range(3):
         try: 
-            response = requests.post(url, data=payload, timeout=10)
-            if response.status_code == 200: 
-                if test_mode: return True, "Success"
-                break
-            elif response.status_code == 429: 
-                time.sleep(3)
-                continue
-            else:
-                if test_mode: return False, f"API Error {response.status_code}: {response.text}"
-                break 
-        except Exception as e: 
-            if test_mode: return False, str(e)
-            time.sleep(1)
-
-def send_telegram_csv_backup():
-    if not TELEGRAM_TOKEN: return
-    try:
-        with contextlib.closing(get_db_connection()) as conn:
-            df_trades = pd.read_sql_query("SELECT * FROM trades", conn)
-            df_blocked = pd.read_sql_query("SELECT * FROM blocked_signals", conn)
-            
-        ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-        date_str = ist_now.strftime('%Y-%m-%d')
-        
-        trades_filename = f"Trades_Backup_{date_str}.csv"
-        df_trades.to_csv(trades_filename, index=False)
-        blocked_filename = f"Blocked_Backup_{date_str}.csv"
-        df_blocked.to_csv(blocked_filename, index=False)
-
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-        
-        payload_trades = {'chat_id': TELEGRAM_CHAT_ID, 'caption': f"📊 <b>Automated Daily Backup: Trades</b>\nDate: {date_str}", 'parse_mode': 'HTML'}
-        with open(trades_filename, 'rb') as f:
-            requests.post(url, data=payload_trades, files={'document': f}, timeout=15)
-        os.remove(trades_filename)
-        
-        time.sleep(2)
-        
-        payload_blocked = {'chat_id': TELEGRAM_CHAT_ID, 'caption': f"🚫 <b>Automated Daily Backup: Blocked Signals</b>\nDate: {date_str}", 'parse_mode': 'HTML'}
-        with open(blocked_filename, 'rb') as f:
-            requests.post(url, data=payload_blocked, files={'document': f}, timeout=15)
-        os.remove(blocked_filename)
-    except Exception: pass
+            resp = requests.post(url, data=payload, timeout=10)
+            if resp.status_code == 200: return True if test_mode else None
+            elif resp.status_code == 429: time.sleep(3)
+            else: return False if test_mode else None
+        except Exception: time.sleep(1)
 
 # ==========================================
-# 3. CORE ENGINE LOGIC & MATH
+# 2. DATA FETCHING ENGINE
 # ==========================================
 WATCHLIST = [
     {'name': 'NIFTY 50', 'tv_symbol': 'NIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEI'},
@@ -153,19 +91,9 @@ WATCHLIST = [
     {'name': 'BITCOIN (24/7)', 'tv_symbol': 'BTCUSDT', 'tv_exchange': 'BINANCE', 'yf_symbol': 'BTC-USD'},
     {'name': 'GOLD', 'tv_symbol': 'XAUUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'GC=F'},
     {'name': 'SILVER', 'tv_symbol': 'XAGUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'SI=F'},
-    {'name': 'CRUDE OIL', 'tv_symbol': 'USOIL', 'tv_exchange': 'TVC', 'yf_symbol': 'CL=F'},
+    {'name': 'CRUDE OIL', 'tv_symbol': 'WTICOUSD', 'tv_exchange': 'OANDA', 'yf_symbol': 'CL=F'},
     {'name': 'HDFC BANK', 'tv_symbol': 'HDFCBANK', 'tv_exchange': 'NSE', 'yf_symbol': 'HDFCBANK.NS'},
-    {'name': 'SBI', 'tv_symbol': 'SBIN', 'tv_exchange': 'NSE', 'yf_symbol': 'SBIN.NS'},
-    {'name': 'RELIANCE', 'tv_symbol': 'RELIANCE', 'tv_exchange': 'NSE', 'yf_symbol': 'RELIANCE.NS'},
-    {'name': 'INFOSYS', 'tv_symbol': 'INFY', 'tv_exchange': 'NSE', 'yf_symbol': 'INFY.NS'},
-    {'name': 'TCS', 'tv_symbol': 'TCS', 'tv_exchange': 'NSE', 'yf_symbol': 'TCS.NS'},
-    {'name': 'ITC', 'tv_symbol': 'ITC', 'tv_exchange': 'NSE', 'yf_symbol': 'ITC.NS'},
-    {'name': 'TATA MOTORS', 'tv_symbol': 'TATAMOTORS', 'tv_exchange': 'NSE', 'yf_symbol': 'TATAMOTORS.NS'},
-    {'name': 'TATA STEEL', 'tv_symbol': 'TATASTEEL', 'tv_exchange': 'NSE', 'yf_symbol': 'TATASTEEL.NS'},
-    {'name': 'L&T', 'tv_symbol': 'LT', 'tv_exchange': 'NSE', 'yf_symbol': 'LT.NS'},
-    {'name': 'BHARTI AIRTEL', 'tv_symbol': 'BHARTIARTL', 'tv_exchange': 'NSE', 'yf_symbol': 'BHARTIARTL.NS'},
-    {'name': 'SUN PHARMA', 'tv_symbol': 'SUNPHARMA', 'tv_exchange': 'NSE', 'yf_symbol': 'SUNPHARMA.NS'},
-    {'name': 'VEDANTA', 'tv_symbol': 'VEDL', 'tv_exchange': 'NSE', 'yf_symbol': 'VEDL.NS'}
+    {'name': 'RELIANCE', 'tv_symbol': 'RELIANCE', 'tv_exchange': 'NSE', 'yf_symbol': 'RELIANCE.NS'}
 ]
 
 tv = TvDatafeed()
@@ -173,22 +101,15 @@ tv = TvDatafeed()
 def fetch_and_analyze(item):
     global tv
     df = None
-    
     try:
         df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
-        if df_tv is not None and not df_tv.empty:
-            df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
-            df = df_tv
+        if df_tv is not None and not df_tv.empty: df = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
     except Exception:
-        time.sleep(1)
         try:
             tv = TvDatafeed() 
             df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
-            if df_tv is not None and not df_tv.empty:
-                df_tv = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
-                df = df_tv
-        except Exception:
-            pass 
+            if df_tv is not None and not df_tv.empty: df = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+        except Exception: pass 
 
     if (df is None or df.empty) and item['tv_exchange'] == 'NSE':
         try:
@@ -201,329 +122,198 @@ def fetch_and_analyze(item):
     if df is not None and not df.empty:
         try:
             df = df.copy() 
-            
-            if df.index.tz is not None:
-                df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
-            else:
-                df.index = df.index + timedelta(hours=5, minutes=30)
-                
+            if df.index.tz is not None: df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
+            else: df.index = df.index + timedelta(hours=5, minutes=30)
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
-                
             df[['Open', 'High', 'Low', 'Close']] = df[['Open', 'High', 'Low', 'Close']].ffill()
             df.dropna(subset=['Close', 'High', 'Low'], inplace=True) 
             
             df['EMA5'] = ta.ema(df['Close'], length=5)
             df['EMA39'] = ta.ema(df['Close'], length=39)
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
-            
             df_1h = df.resample('1h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
-            df_1h['EMA39_1H'] = ta.ema(df_1h['Close'], length=39)
-            df_1h_aligned = df_1h[['EMA39_1H']].reindex(df.index, method='ffill')
-            df['EMA39_1H'] = df_1h_aligned['EMA39_1H']
-            
+            df['EMA39_1H'] = ta.ema(df_1h['Close'], length=39).reindex(df.index, method='ffill')
             adx_data = ta.adx(df['High'], df['Low'], df['Close'], length=14)
-            if adx_data is not None and not adx_data.empty: df['ADX'] = adx_data.iloc[:, 0].ffill().fillna(0.0)
-            else: df['ADX'] = 0.0
-            
-            if 'Volume' in df.columns:
-                df['Volume'] = df['Volume'].fillna(0)
-                df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-                df['Vol_Ratio'] = np.where(df['Vol_MA20'] > 0, df['Volume'] / df['Vol_MA20'], 1.0)
-            else: df['Vol_Ratio'] = 1.0 
-                
+            df['ADX'] = adx_data.iloc[:, 0].ffill().fillna(0.0) if adx_data is not None and not adx_data.empty else 0.0
+            df['Vol_Ratio'] = np.where(df.get('Volume', pd.Series(dtype=float)).rolling(20).mean() > 0, df['Volume'] / df['Volume'].rolling(20).mean(), 1.0) if 'Volume' in df.columns else 1.0 
             df.dropna(subset=['EMA39_1H', 'EMA39', 'EMA5', 'ATR'], inplace=True)
             if len(df) >= 5: return df
         except Exception: pass
     return None
 
-# CACHE FOR UI CHART (Prevents API DDoS)
 @st.cache_data(ttl=300)
 def get_cached_chart_data(item_dict):
     return fetch_and_analyze(item_dict)
 
+# ==========================================
+# 3. THE LIGHTWEIGHT EXECUTION ENGINE
+# ==========================================
 def process_market_data():
     try:
         with contextlib.closing(get_db_connection()) as conn:
             c = conn.cursor()
-            alerts = []
             ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-            current_date_str = ist_now.strftime("%Y-%m-%d")
-            
-            current_slot_minute = (ist_now.minute // 5) * 5
-            slot_time = ist_now.replace(minute=current_slot_minute, second=0, microsecond=0)
-            scan_time_str = slot_time.strftime("%Y-%m-%d %I:%M %p (IST)")
-            
-            c.execute("SELECT value FROM system_status WHERE key='last_backup_date'")
-            last_backup_row = c.fetchone()
-            last_backup_date = last_backup_row[0] if last_backup_row else ""
-            
-            if current_date_str != last_backup_date and ist_now.hour >= 23 and ist_now.minute >= 30:
-                send_telegram_csv_backup()
-                c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_backup_date', ?)", (current_date_str,))
-                conn.commit()
+            scan_time_str = ist_now.replace(minute=(ist_now.minute // 5) * 5, second=0, microsecond=0).strftime("%Y-%m-%d %I:%M %p (IST)")
 
             for item in WATCHLIST:
-                name = item['name']
+                name, exchange = item['name'], item['tv_exchange']
+                
+                # 1. NEW GLOBAL MARKET HOURS & STALE DATA SHIELD
                 market_open = True
-                if item['tv_exchange'] == 'NSE':
-                    if ist_now.weekday() >= 5: market_open = False
-                    else:
-                        minutes_since_midnight = ist_now.hour * 60 + ist_now.minute
-                        if minutes_since_midnight < 555 or minutes_since_midnight > 935: market_open = False
-                        
+                if exchange == 'NSE':
+                    if ist_now.weekday() >= 5 or not (555 <= (ist_now.hour * 60 + ist_now.minute) <= 935): market_open = False
+                elif exchange in ['OANDA', 'TVC']:
+                    if ist_now.weekday() == 5 or (ist_now.weekday() == 6 and ist_now.hour < 3): market_open = False # Blocks Weekend Ghost Spams
+
                 df = fetch_and_analyze(item)
                 if df is None: continue
-                    
-                c.execute("SELECT id, signal_type, sl, tp, entry_price, entry_time, atr FROM trades WHERE ticker=? AND status='OPEN'", (name,))
-                open_trades = c.fetchall()
                 
-                current_candle = df.iloc[-1]
-                last_closed = df.iloc[-2]
-                prev_closed = df.iloc[-3]
+                # Failsafe: If the latest candle is more than 60 mins old, the market is closed or API is dead.
+                try:
+                    last_close_dt = df.index[-1]
+                    if (ist_now.replace(tzinfo=None) - last_close_dt).total_seconds() > 3600: market_open = False
+                except: pass
+
+                curr, last, prev = df.iloc[-1], df.iloc[-2], df.iloc[-3]
                 
-                trend = "🟢 Bullish" if current_candle['EMA5'] > current_candle['EMA39'] else "🔴 Bearish"
-                htf_trend = "🟢 Bullish" if current_candle['Close'] > current_candle['EMA39_1H'] else "🔴 Bearish"
-                vol_ratio = current_candle['Vol_Ratio']
-                adx_val = current_candle['ADX']
-                latest_price = current_candle['Close']
-                ema5_live, ema39_live = current_candle['EMA5'], current_candle['EMA39']
-                dist_pct = abs(ema5_live - ema39_live) / ema39_live * 100
-                
-                c.execute("INSERT OR REPLACE INTO live_market_data (ticker, last_update, close_price, ema5, ema39, trend, distance_pct, htf_trend, vol_ratio, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                          (name, scan_time_str, round(latest_price, 2), round(ema5_live, 2), round(ema39_live, 2), trend, round(dist_pct, 4), htf_trend, round(vol_ratio, 2), round(adx_val, 2)))
+                # Update Dashboard Matrix
+                c.execute("INSERT OR REPLACE INTO live_market_data VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                          (name, scan_time_str, round(curr['Close'], 2), round(curr['EMA5'], 2), round(curr['EMA39'], 2), 
+                           "🟢 Bullish" if curr['EMA5'] > curr['EMA39'] else "🔴 Bearish", abs(curr['EMA5']-curr['EMA39'])/curr['EMA39']*100, 
+                           "🟢 Bullish" if curr['Close'] > curr['EMA39_1H'] else "🔴 Bearish", round(curr.get('Vol_Ratio', 1.0), 2), round(curr.get('ADX', 0.0), 2)))
                 conn.commit()
                 
-                if market_open:
-                    for trade in open_trades:
-                        trade_id, sig_type, sl, tp, entry_price, entry_time_str, db_atr = trade
-                        atr_val = db_atr if (db_atr and db_atr > 0) else abs(tp - entry_price) / 3.75
+                if not market_open: continue
+
+                # 2. MANAGE OPEN TRADES (Sequential Logic Intact)
+                c.execute("SELECT id, signal_type, sl, tp, entry_price, atr FROM trades WHERE ticker=? AND status='OPEN'", (name,))
+                for trade in c.fetchall():
+                    t_id, s_type, sl, tp, e_price, atr_val = trade
+                    atr_val = atr_val if atr_val > 0 else abs(tp - e_price)/3.75
+                    
+                    c_open, c_high, c_low, c_close = curr['Open'], curr['High'], curr['Low'], curr['Close']
+                    trade_closed = False
+                    
+                    if s_type == 'long':
+                        if c_open >= tp: c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, c_open, t_id)); trade_closed = True
+                        elif c_open <= sl: c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", ('BREAK-EVEN (GAP DOWN)' if sl==e_price else 'SL HIT (GAP)', scan_time_str, c_open, t_id)); trade_closed = True
+                        elif c_high >= tp: c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, t_id)); trade_closed = True
+                        elif c_low <= sl: c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", ('BREAK-EVEN TP HIT' if sl>e_price else 'SL HIT', scan_time_str, sl, t_id)); trade_closed = True
                         
-                        try:
-                            clean_time_str = entry_time_str.replace(" (IST)", "")
-                            entry_dt_ist = pd.to_datetime(clean_time_str, format="%Y-%m-%d %I:%M %p")
-                            
-                            current_candle_time = pd.to_datetime(current_candle.name)
-                            if current_candle_time.tz is not None: current_candle_time = current_candle_time.tz_localize(None)
-                            
-                            temp_idx = df.index.tz_localize(None) if df.index.tz is not None else df.index
-                            trade_history = df[(temp_idx >= entry_dt_ist) & (temp_idx < current_candle_time)]
-                            
-                            if not trade_history.empty:
-                                max_high_reached = max(trade_history['High'].max(), latest_price)
-                                min_low_reached = min(trade_history['Low'].min(), latest_price)
-                            else:
-                                max_high_reached = latest_price
-                                min_low_reached = latest_price
-                        except Exception:
-                            max_high_reached = latest_price
-                            min_low_reached = latest_price
+                        if not trade_closed and round(sl, 2) <= round(e_price, 2) and max(c_high, c_close) >= (e_price + 1.0 * atr_val):
+                            c.execute("UPDATE trades SET sl=? WHERE id=?", (e_price + 0.25 * atr_val, t_id))
+                            send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} LONG hit 1 ATR. SL moved to +0.25 ATR.")
 
-                        current_open, current_high, current_low = current_candle['Open'], current_candle['High'], current_candle['Low']
-                        sl_before_update = sl 
-                        trade_closed = False
+                    elif s_type == 'short':
+                        if c_open <= tp: c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, c_open, t_id)); trade_closed = True
+                        elif c_open >= sl: c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", ('BREAK-EVEN (GAP UP)' if sl==e_price else 'SL HIT (GAP)', scan_time_str, c_open, t_id)); trade_closed = True
+                        elif c_low <= tp: c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, t_id)); trade_closed = True
+                        elif c_high >= sl: c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", ('BREAK-EVEN TP HIT' if sl<e_price else 'SL HIT', scan_time_str, sl, t_id)); trade_closed = True
                         
-                        if sig_type == 'long':
-                            # 1. EVALUATE EXITS FIRST
-                            if current_open >= tp:
-                                c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
-                                send_telegram_alert(f"🎯 <b>GAP UP TARGET HIT</b>\n{name} LONG closed at {round(current_open, 2)}")
-                                trade_closed = True
-                            elif current_open <= sl_before_update:
-                                status_text = 'BREAK-EVEN TP HIT (GAP)' if sl_before_update > entry_price else ('BREAK-EVEN (GAP DOWN)' if sl_before_update == entry_price else 'SL HIT (GAP DOWN)')
-                                c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_open, trade_id))
-                                send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(current_open, 2)}")
-                                trade_closed = True
-                            elif current_high >= tp:
-                                c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
-                                send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} LONG closed at {round(tp, 2)}")
-                                trade_closed = True
-                            elif current_low <= sl_before_update:
-                                status_text = 'BREAK-EVEN TP HIT' if sl_before_update > entry_price else ('BREAK-EVEN (0 RISK)' if sl_before_update == entry_price else 'SL HIT (LOSS)')
-                                c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, sl_before_update, trade_id))
-                                send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(sl_before_update, 2)}")
-                                trade_closed = True
-                                
-                            # 2. UPDATE TRAILING STOP SECOND
-                            if not trade_closed and round(sl_before_update, 2) <= round(entry_price, 2):
-                                if max_high_reached >= (entry_price + (1.0 * atr_val)):
-                                    new_sl = entry_price + (0.25 * atr_val)
-                                    c.execute("UPDATE trades SET sl=? WHERE id=?", (new_sl, trade_id))
-                                    send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} LONG hit 1 ATR. SL moved to lock 0.25 ATR profit ({round(new_sl, 2)}).")
+                        if not trade_closed and round(sl, 2) >= round(e_price, 2) and min(c_low, c_close) <= (e_price - 1.0 * atr_val):
+                            c.execute("UPDATE trades SET sl=? WHERE id=?", (e_price - 0.25 * atr_val, t_id))
+                            send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to +0.25 ATR.")
+                conn.commit()
 
-                        elif sig_type == 'short':
-                            # 1. EVALUATE EXITS FIRST
-                            if current_open <= tp:
-                                c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, current_open, trade_id))
-                                send_telegram_alert(f"🎯 <b>GAP DOWN TARGET HIT</b>\n{name} SHORT closed at {round(current_open, 2)}")
-                                trade_closed = True
-                            elif current_open >= sl_before_update:
-                                status_text = 'BREAK-EVEN TP HIT (GAP)' if sl_before_update < entry_price else ('BREAK-EVEN (GAP UP)' if sl_before_update == entry_price else 'SL HIT (GAP UP)')
-                                c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, current_open, trade_id))
-                                send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(current_open, 2)}")
-                                trade_closed = True
-                            elif current_low <= tp:
-                                c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, trade_id))
-                                send_telegram_alert(f"🎯 <b>TARGET HIT</b>\n{name} SHORT closed at {round(tp, 2)}")
-                                trade_closed = True
-                            elif current_high >= sl_before_update:
-                                status_text = 'BREAK-EVEN TP HIT' if sl_before_update < entry_price else ('BREAK-EVEN (0 RISK)' if sl_before_update == entry_price else 'SL HIT (LOSS)')
-                                c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, sl_before_update, trade_id))
-                                send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(sl_before_update, 2)}")
-                                trade_closed = True
-                                
-                            # 2. UPDATE TRAILING STOP SECOND
-                            if not trade_closed and round(sl_before_update, 2) >= round(entry_price, 2):
-                                if min_low_reached <= (entry_price - (1.0 * atr_val)):
-                                    new_sl = entry_price - (0.25 * atr_val)
-                                    c.execute("UPDATE trades SET sl=? WHERE id=?", (new_sl, trade_id))
-                                    send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to lock 0.25 ATR profit ({round(new_sl, 2)}).")
-                    conn.commit()
-
-                    long_cross = (prev_closed['EMA5'] <= prev_closed['EMA39']) and (last_closed['EMA5'] > last_closed['EMA39'])
-                    short_cross = (prev_closed['EMA5'] >= prev_closed['EMA39']) and (last_closed['EMA5'] < last_closed['EMA39'])
-                    
-                    try: slot_id = pd.to_datetime(current_candle.name).strftime("%Y-%m-%d %H:%M:%S")
-                    except: slot_id = scan_time_str 
-                    
-                    c.execute("SELECT value FROM system_status WHERE key=?", (f"last_signal_{name}",))
-                    last_processed = c.fetchone()
-                    already_entered = last_processed and last_processed[0] == slot_id
-                    
-                    if not already_entered:
-                        if long_cross or short_cross:
-                            direction = "LONG" if long_cross else "SHORT"
-                            atr_val = last_closed['ATR']
-                            
-                            current_minute = ist_now.minute
-                            window_start_minute = (current_minute // 15) * 15
-                            window_start_time = ist_now.replace(minute=window_start_minute, second=0, microsecond=0, tzinfo=None)
-                            
-                            # THE FIX: Anchor locked to exact naive IST start minute without future offset
-                            atomic_start = window_start_time.strftime("%Y-%m-%d %H:%M:%S")
-
-                            anchor_val = f"{atomic_start}|{direction}|{atr_val}|{slot_id}"
-                            c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
-                            conn.commit()
-
+                # 3. REWRITTEN STATE MACHINE (No more infinite ghost loops)
+                signal_id = str(last.name) # The exact timestamp of the crossover candle
+                
+                c.execute("SELECT value FROM system_status WHERE key=?", (f"proc_{name}",))
+                proc_row = c.fetchone()
+                
+                # Only check if we have NEVER completely processed or expired this exact candle
+                if not proc_row or proc_row[0] != signal_id:
                     c.execute("SELECT value FROM system_status WHERE key=?", (f"anchor_{name}",))
                     anchor_row = c.fetchone()
                     
+                    is_long = (prev['EMA5'] <= prev['EMA39']) and (last['EMA5'] > last['EMA39'])
+                    is_short = (prev['EMA5'] >= prev['EMA39']) and (last['EMA5'] < last['EMA39'])
+                    
+                    # Create Anchor ONLY if one doesn't exist (Prevents the Reset Bug)
+                    if (is_long or is_short) and not anchor_row:
+                        direction = "LONG" if is_long else "SHORT"
+                        start_time = ist_now.replace(minute=(ist_now.minute // 5) * 5, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+                        anchor_val = f"{start_time}|{direction}|{last['ATR']}|{signal_id}"
+                        c.execute("INSERT INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
+                        conn.commit()
+                        anchor_row = (anchor_val,)
+
+                    # Evaluate Active Anchor
                     if anchor_row:
-                        anchor_data = anchor_row[0].split('|')
-                        
-                        if len(anchor_data) < 4:
-                            c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
-                            conn.commit()
-                            continue
-                        
-                        atomic_start_str = anchor_data[0]
-                        anchor_direction = anchor_data[1]
-                        anchor_atr = float(anchor_data[2])
-                        slot_id = anchor_data[3]
-                        
-                        try: anchor_dt = datetime.strptime(atomic_start_str, "%Y-%m-%d %H:%M:%S")
-                        except: anchor_dt = ist_now.replace(tzinfo=None) - timedelta(minutes=20) 
-                        
-                        atomic_now = ist_now.replace(tzinfo=None)
-                        time_diff = (atomic_now - anchor_dt).total_seconds() / 60.0
-                        
-                        if time_diff <= 16.0: 
-                            # THE FIX: Restored pure 'Last Gasp' boundary check evaluating last_closed at the 15m mark
-                            eval_candle = last_closed if time_diff >= 14.0 else current_candle
-                            prev_adx = prev_closed.get('ADX', 0.0) if time_diff >= 14.0 else last_closed.get('ADX', 0.0)
+                        adata = anchor_row[0].split('|')
+                        if len(adata) == 4 and adata[3] == signal_id:
+                            a_start, a_dir, a_atr = datetime.strptime(adata[0], "%Y-%m-%d %H:%M:%S"), adata[1], float(adata[2])
+                            mins_elapsed = (ist_now.replace(tzinfo=None) - a_start).total_seconds() / 60.0
                             
-                            live_adx = eval_candle.get('ADX', 0.0)
-                            live_vol = eval_candle.get('Vol_Ratio', 1.0)
-                            live_htf_trend = "🟢 Bullish" if eval_candle['Close'] > eval_candle['EMA39_1H'] else "🔴 Bearish"
-                            live_distance = abs(eval_candle['Close'] - eval_candle['EMA39'])
-                            
-                            adx_is_rising = live_adx >= prev_adx
-                            ema_separation = abs(eval_candle['EMA5'] - eval_candle['EMA39'])
-                            min_separation = 0.15 * anchor_atr
-                            
-                            is_trending = live_adx > 20.0 and adx_is_rising
-                            is_properly_fanned = ema_separation >= min_separation
-                            max_extension = 2.5 * anchor_atr
-                            is_not_overextended = live_distance <= max_extension
-                            
-                            required_htf = "🟢 Bullish" if anchor_direction == "LONG" else "🔴 Bearish"
-                            rejection_reasons = []
-                            
-                            if len(open_trades) > 0: rejection_reasons.append("Active trade already open.")
-                            if not is_trending: rejection_reasons.append(f"Weak Trend (ADX: {round(live_adx, 1)}, Rising: {adx_is_rising}).")
-                            if not is_properly_fanned: rejection_reasons.append(f"EMAs Tangled (Chop Zone).")
-                            if live_htf_trend != required_htf: rejection_reasons.append(f"1H Trend Conflict ({live_htf_trend}).")
-                            if not is_not_overextended: rejection_reasons.append(f"Overextended Price Surge.")
-                            
-                            if len(rejection_reasons) == 0:
-                                entry = eval_candle['Close']
-                                if anchor_direction == "LONG":
-                                    sl, tp = entry - (1.5 * anchor_atr), entry + (3.75 * anchor_atr)
-                                    c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                              (name, 'long', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', live_htf_trend, round(live_vol, 2), round(anchor_atr, 2), round(live_adx, 2)))
-                                    msg = f"🟢 <b>LONG SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {live_htf_trend}\nVol Surge: {round(live_vol, 1)}x\nADX: {round(live_adx, 1)}\nATR: {round(anchor_atr, 2)}\nR:R Profile: 1:2.5"
-                                elif anchor_direction == "SHORT":
-                                    sl, tp = entry + (1.5 * anchor_atr), entry - (3.75 * anchor_atr)
-                                    c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                              (name, 'short', scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), 'OPEN', live_htf_trend, round(live_vol, 2), round(anchor_atr, 2), round(live_adx, 2)))
-                                    msg = f"🔴 <b>SHORT SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\n\n<i>Context:</i>\n1H Trend: {live_htf_trend}\nVol Surge: {round(live_vol, 1)}x\nADX: {round(live_adx, 1)}\nATR: {round(anchor_atr, 2)}\nR:R Profile: 1:2.5"
+                            if mins_elapsed <= 16.0:
+                                ev_candle = last if mins_elapsed >= 14.0 else curr
+                                p_adx = prev.get('ADX', 0.0) if mins_elapsed >= 14.0 else last.get('ADX', 0.0)
                                 
-                                c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES (?, ?)", (f"last_signal_{name}", slot_id))
-                                c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
-                                alerts.append(msg)
-                                send_telegram_alert(msg)
-                            else:
-                                safe_reasons = [r.replace("<", "&lt;").replace(">", "&gt;") for r in rejection_reasons]
-                                reason_str = " | ".join(safe_reasons)
+                                l_adx, l_vol = ev_candle.get('ADX', 0.0), ev_candle.get('Vol_Ratio', 1.0)
+                                l_htf = "🟢 Bullish" if ev_candle['Close'] > ev_candle['EMA39_1H'] else "🔴 Bearish"
+                                r_htf = "🟢 Bullish" if a_dir == "LONG" else "🔴 Bearish"
                                 
-                                c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) 
-                                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                                          (name, anchor_direction, scan_time_str, round(eval_candle['Close'], 2), round(live_adx, 2), live_htf_trend, round(live_vol, 2), reason_str))
+                                rejections = []
+                                if len(open_trades) > 0: rejections.append("Active trade open.")
+                                if not (l_adx > 20.0 and l_adx >= p_adx): rejections.append(f"Weak Trend (ADX: {round(l_adx,1)}).")
+                                if abs(ev_candle['EMA5'] - ev_candle['EMA39']) < (0.15 * a_atr): rejections.append("EMAs Tangled.")
+                                if l_htf != r_htf: rejections.append(f"1H Conflict ({l_htf}).")
+                                if abs(ev_candle['Close'] - ev_candle['EMA39']) > (2.5 * a_atr): rejections.append("Overextended.")
                                 
-                                if time_diff >= 14.0:
+                                if not rejections:
+                                    # EXECUTE TRADE
+                                    entry = ev_candle['Close']
+                                    sl = entry - (1.5 * a_atr) if a_dir == "LONG" else entry + (1.5 * a_atr)
+                                    tp = entry + (3.75 * a_atr) if a_dir == "LONG" else entry - (3.75 * a_atr)
+                                    c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)", (name, a_dir.lower(), scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), l_htf, round(l_vol, 2), round(a_atr, 2), round(l_adx, 2)))
+                                    send_telegram_alert(f"{'🟢' if a_dir=='LONG' else '🔴'} <b>{a_dir} SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\nADX: {round(l_adx, 1)}")
+                                    
+                                    # Lock Signal & Incinerate Anchor
+                                    c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", signal_id))
                                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
-                                    expiration_msg = f"💀 <b>SIGNAL EXPIRED: {name}</b>\n{anchor_direction} crossover failed to align within 15m.\n\n<i>Final Rejection Reasons:</i>\n"
-                                    for reason in safe_reasons:
-                                        expiration_msg += f"❌ {reason}\n"
-                                    send_telegram_alert(expiration_msg)
-                        else:
-                            c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
+                                else:
+                                    # LOG FAILURE
+                                    safe_rej = [r.replace("<", "&lt;").replace(">", "&gt;") for r in rejections]
+                                    c.execute("INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (name, a_dir, scan_time_str, round(ev_candle['Close'], 2), round(l_adx, 2), l_htf, round(l_vol, 2), " | ".join(safe_rej)))
+                                    
+                                    if mins_elapsed >= 14.0:
+                                        # TERMINAL EXPIRE
+                                        send_telegram_alert(f"💀 <b>EXPIRED: {name}</b>\n{a_dir} failed to align within 15m.\n" + "\n".join([f"❌ {r}" for r in safe_rej]))
+                                        c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", signal_id))
+                                        c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
+                            else:
+                                # FAILSAFE CLEANUP (> 16 mins)
+                                c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", signal_id))
+                                c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                     conn.commit()
                 time.sleep(1) 
                 
             c.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 500)")
             c.execute("DELETE FROM blocked_signals WHERE id NOT IN (SELECT id FROM blocked_signals ORDER BY id DESC LIMIT 300)")
-            c.execute("INSERT OR REPLACE INTO system_status (key, value) VALUES ('last_scan', ?)", (scan_time_str,))
+            c.execute("INSERT OR REPLACE INTO system_status VALUES ('last_scan', ?)", (scan_time_str,))
             conn.commit()
-    finally:
-        gc.collect() 
+    finally: gc.collect() 
     return True
 
 # ==========================================
-# 4. THREADING DAEMON
+# 4. BACKGROUND THREADING DAEMON
 # ==========================================
 def get_sleep_time_to_next_5m():
     now = datetime.now()
     next_minute = ((now.minute // 5) + 1) * 5
-    if next_minute >= 60:
-        next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    else:
-        next_time = now.replace(minute=next_minute, second=0, microsecond=0)
+    if next_minute >= 60: next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else: next_time = now.replace(minute=next_minute, second=0, microsecond=0)
     return max(0, (next_time - now).total_seconds())
 
 @st.cache_resource
 def start_background_scanner():
     def background_loop():
         while True:
-            sleep_sec = get_sleep_time_to_next_5m()
-            time.sleep(sleep_sec)
-            try: 
-                process_market_data()
-            except Exception: 
-                pass
-    thread = threading.Thread(target=background_loop, daemon=True)
-    thread.start()
+            time.sleep(get_sleep_time_to_next_5m())
+            try: process_market_data()
+            except Exception: pass
+    threading.Thread(target=background_loop, daemon=True).start()
     return True
 
 engine_running = start_background_scanner()
@@ -531,7 +321,6 @@ engine_running = start_background_scanner()
 # ==========================================
 # 5. STREAMLIT DASHBOARD UI
 # ==========================================
-
 with contextlib.closing(get_db_connection()) as ui_conn:
     ui_c = ui_conn.cursor()
 
@@ -542,8 +331,7 @@ with contextlib.closing(get_db_connection()) as ui_conn:
         ui_c.execute("SELECT value FROM system_status WHERE key='last_scan'")
         last_scan_row = ui_c.fetchone()
         st.sidebar.info(f"⏱️ **Last Database Sync:**\n{last_scan_row[0] if last_scan_row else 'Initializing...'}")
-    except Exception:
-        pass
+    except: pass
 
     if st.sidebar.button("🔄 Force Manual Data Sync"):
         with st.spinner("Executing Data Sync..."):
@@ -551,380 +339,97 @@ with contextlib.closing(get_db_connection()) as ui_conn:
             st.rerun()
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("<h3>🛡️ Dual Backup & Restore</h3>", unsafe_allow_html=True)
-
+    st.sidebar.markdown("<h3>🛡️ Backup & Restore</h3>", unsafe_allow_html=True)
     colA, colB = st.sidebar.columns(2)
-    
     try:
-        backup_trades_df = pd.read_sql_query("SELECT * FROM trades", ui_conn)
-        csv_trades = backup_trades_df.to_csv(index=False).encode('utf-8')
-        with colA: st.download_button(label="⬇️ Backup Trades", data=csv_trades, file_name=f"Trades_Backup_{datetime.now().strftime('%Y-%m-%d')}.csv", mime="text/csv")
-
-        backup_blocked_df = pd.read_sql_query("SELECT * FROM blocked_signals", ui_conn)
-        csv_blocked = backup_blocked_df.to_csv(index=False).encode('utf-8')
-        with colB: st.download_button(label="⬇️ Backup Blocked", data=csv_blocked, file_name=f"Blocked_Backup_{datetime.now().strftime('%Y-%m-%d')}.csv", mime="text/csv")
-    except Exception:
-        backup_trades_df = pd.DataFrame()
-        backup_blocked_df = pd.DataFrame()
-
-    st.sidebar.markdown("<b>Restore Database (Upload CSV)</b>", unsafe_allow_html=True)
-    uploaded_file = st.sidebar.file_uploader("Upload CSV", type=None, label_visibility="collapsed")
-
-    if uploaded_file is not None:
-        if st.sidebar.button("⚙️ Execute Auto-Restore"):
-            try:
-                restore_df = pd.read_csv(uploaded_file)
-                csv_columns = restore_df.columns.tolist()
-                
-                if 'entry_time' in csv_columns or 'Entry Time' in csv_columns:
-                    rename_map = {'Asset': 'ticker', 'Signal': 'signal_type', 'Entry Time': 'entry_time', 'Entry': 'entry_price', 'SL': 'sl', 'TP': 'tp', 'ATR': 'atr', 'ADX': 'adx', 'Status': 'status', 'Exit Time': 'exit_time', 'Exit Price': 'exit_price', '1H Trend': 'htf_trend', 'Vol (x)': 'vol_ratio'}
-                    restore_df = restore_df.rename(columns=rename_map)
-                    restore_df = restore_df.fillna({'exit_time': '', 'exit_price': 0.0, 'htf_trend': '', 'vol_ratio': 1.0, 'atr': 0.0, 'adx': 0.0})
-                    for index, row in restore_df.iterrows():
-                        ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
-                        if not ui_c.fetchone():
-                            ui_c.execute("""INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['entry_time'], row['entry_price'], row['sl'], row['tp'], row['status'], row['exit_time'], row['exit_price'], row['htf_trend'], row['vol_ratio'], row['atr'], row['adx']))
-                    ui_conn.commit()
-                    st.sidebar.success("✅ Trades Restored! Rebooting...")
-
-                elif 'rejection_reasons' in csv_columns or 'Rejection Reasons' in csv_columns:
-                    rename_map = {'Asset': 'ticker', 'Signal': 'signal_type', 'Time (IST)': 'timestamp', 'Price': 'price', 'ADX': 'adx', '1H Trend': 'htf_trend', 'Vol (x)': 'vol_ratio', 'Rejection Reasons': 'rejection_reasons'}
-                    restore_df = restore_df.rename(columns=rename_map)
-                    restore_df = restore_df.fillna({'adx': 0.0, 'htf_trend': '', 'vol_ratio': 1.0, 'rejection_reasons': ''})
-                    for index, row in restore_df.iterrows():
-                        ui_c.execute("SELECT id FROM blocked_signals WHERE ticker=? AND timestamp=?", (row['ticker'], row['timestamp']))
-                        if not ui_c.fetchone():
-                            ui_c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['timestamp'], row['price'], row['adx'], row['htf_trend'], row['vol_ratio'], row['rejection_reasons']))
-                    ui_conn.commit()
-                    st.sidebar.success("✅ Blocked Signals Restored! Rebooting...")
-                    
-                else:
-                    st.sidebar.error("❌ Unrecognized CSV format.")
-                time.sleep(2)
-                st.rerun()
-            except Exception as e: 
-                st.sidebar.error(f"Restore failed: {e}")
+        with colA: st.download_button("⬇️ Trades", pd.read_sql_query("SELECT * FROM trades", ui_conn).to_csv(index=False).encode('utf-8'), f"Trades_{datetime.now().strftime('%Y-%m-%d')}.csv", "text/csv")
+        with colB: st.download_button("⬇️ Blocked", pd.read_sql_query("SELECT * FROM blocked_signals", ui_conn).to_csv(index=False).encode('utf-8'), f"Blocked_{datetime.now().strftime('%Y-%m-%d')}.csv", "text/csv")
+    except: pass
 
     st.sidebar.markdown("---")
-    st.sidebar.markdown("<h3>🧪 System Diagnostics</h3>", unsafe_allow_html=True)
-
     if st.sidebar.button("🔔 Send Test Telegram Alert"):
-        if not TELEGRAM_TOKEN:
-            st.sidebar.error("❌ Telegram Secrets Missing! Add them in App Settings.")
+        if not TELEGRAM_TOKEN: st.sidebar.error("❌ Telegram Secrets Missing!")
         else:
             with st.spinner("Pinging Telegram..."):
-                success, msg = send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\n<i>Testing HTML Parser:</i>\nAsset: L&amp;T\nReason: ADX Below 20 (&lt; 20)", test_mode=True)
-                if success:
-                    st.sidebar.success("Ping fired successfully! Check your phone.")
-                else:
-                    st.sidebar.error(f"❌ Telegram API Failed:\n{msg}")
+                if send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\nTesting HTML: ADX (&lt; 20)", test_mode=True): st.sidebar.success("Ping fired successfully!")
+                else: st.sidebar.error("❌ Telegram API Failed. Check Token/ID.")
 
-    # ==========================================
-    # CAPITAL & PNL CALCULATIONS (NATIVE INR)
-    # ==========================================
-    INITIAL_CAPITAL = 200000.00
-    TRADE_ALLOCATION = 10000.00
-
+    # Matrix Calculations
+    INITIAL_CAPITAL, TRADE_ALLOCATION = 200000.00, 10000.00
     try:
         live_df = pd.read_sql_query("SELECT ticker as Asset, close_price as 'Latest Price', distance_pct as '% Gap', trend as '15m Trend', htf_trend as '1H Trend', vol_ratio as 'Vol (x)', adx as 'ADX', last_update as 'Time (IST)' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
-        history_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, adx as ADX, status as Status, exit_time as 'Exit Time', exit_price as 'Exit Price', htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status!='OPEN' ORDER BY id DESC LIMIT 100", ui_conn)
-        open_df_ui = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, entry_time as 'Entry Time', entry_price as 'Entry', sl as SL, tp as TP, atr as ATR, adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
-    except Exception:
-        live_df = pd.DataFrame()
-        history_df = pd.DataFrame()
-        open_df_ui = pd.DataFrame()
+        history_df = pd.read_sql_query("SELECT * FROM trades WHERE status!='OPEN' ORDER BY id DESC LIMIT 100", ui_conn)
+        open_df_ui = pd.read_sql_query("SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC", ui_conn)
+    except: live_df, history_df, open_df_ui = pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
+    realized_pnl = 0.0
     if not history_df.empty:
-        history_df['Yield'] = np.where(history_df['Signal'].str.lower() == 'long', 
-                                         (history_df['Exit Price'] - history_df['Entry']) / history_df['Entry'], 
-                                         (history_df['Entry'] - history_df['Exit Price']) / history_df['Entry'])
+        history_df['Yield'] = np.where(history_df['signal_type'].str.lower() == 'long', (history_df['exit_price'] - history_df['entry_price']) / history_df['entry_price'], (history_df['entry_price'] - history_df['exit_price']) / history_df['entry_price'])
         history_df['PnL (₹)'] = history_df['Yield'] * TRADE_ALLOCATION
-        
-        is_zero_be = history_df['Status'].str.contains('BREAK-EVEN', regex=True) & ~history_df['Status'].str.contains('TP HIT', regex=True)
-        history_df.loc[is_zero_be, 'PnL (₹)'] = 0.0
-        history_df['PnL (₹)'] = history_df['PnL (₹)'].round(2)
+        history_df.loc[history_df['status'].str.contains('BREAK-EVEN') & ~history_df['status'].str.contains('TP HIT'), 'PnL (₹)'] = 0.0
         realized_pnl = history_df['PnL (₹)'].sum()
-    else: realized_pnl = 0.0
-
-    current_equity = INITIAL_CAPITAL + realized_pnl
 
     total_unrealized_pnl = 0.0
     if not open_df_ui.empty and not live_df.empty:
-        open_df_ui = pd.merge(open_df_ui, live_df[['Asset', 'Latest Price']], on='Asset', how='left')
-        open_df_ui['Yield'] = np.where(open_df_ui['Signal'].str.lower() == 'long',
-                                       (open_df_ui['Latest Price'] - open_df_ui['Entry']) / open_df_ui['Entry'],
-                                       (open_df_ui['Entry'] - open_df_ui['Latest Price']) / open_df_ui['Entry'])
+        open_df_ui = pd.merge(open_df_ui, live_df[['Asset', 'Latest Price']], left_on='ticker', right_on='Asset', how='left')
+        open_df_ui['Yield'] = np.where(open_df_ui['signal_type'].str.lower() == 'long', (open_df_ui['Latest Price'] - open_df_ui['entry_price']) / open_df_ui['entry_price'], (open_df_ui['entry_price'] - open_df_ui['Latest Price']) / open_df_ui['entry_price'])
         open_df_ui['Unrealized PnL (₹)'] = (open_df_ui['Yield'] * TRADE_ALLOCATION).round(2)
         total_unrealized_pnl = open_df_ui['Unrealized PnL (₹)'].sum()
-        
-        open_df_ui['Risk Status'] = np.where( ((open_df_ui['Signal'].str.lower() == 'long') & (open_df_ui['SL'] >= open_df_ui['Entry'])) | 
-                                              ((open_df_ui['Signal'].str.lower() == 'short') & (open_df_ui['SL'] <= open_df_ui['Entry'])), 
-                                              '🛡️ RISK-FREE', '⚠️ AT RISK')
+        open_df_ui['Risk Status'] = np.where(((open_df_ui['signal_type'].str.lower() == 'long') & (open_df_ui['sl'] >= open_df_ui['entry_price'])) | ((open_df_ui['signal_type'].str.lower() == 'short') & (open_df_ui['sl'] <= open_df_ui['entry_price'])), '🛡️ RISK-FREE', '⚠️ AT RISK')
 
-    # ==========================================
-    # UI: NEW GRID METRICS MATRIX 
-    # ==========================================
     st.markdown("<h1 style='background: -webkit-linear-gradient(45deg, #ffd700, #ffaa00); -webkit-background-clip: text; -webkit-text-fill-color: transparent;'>⚡ Algo Engine by Vinayak</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='color: #8b949e; font-size: 0.95rem; margin-top: -10px;'>Multi Asset Market Tracker</p>", unsafe_allow_html=True)
-
-    if not backup_trades_df.empty:
-        closed_df = backup_trades_df[backup_trades_df['status'] != 'OPEN']
-        open_df = backup_trades_df[backup_trades_df['status'] == 'OPEN']
-        
-        total_closed = len(closed_df)
-        
-        win_mask = closed_df['status'].str.contains('TP|WIN', regex=True, na=False)
-        be_mask = closed_df['status'].str.contains('BREAK-EVEN', regex=True, na=False) & ~win_mask
-        loss_mask = closed_df['status'].str.contains('LOSS|SL HIT', regex=True, na=False)
-        
-        win_count = len(closed_df[win_mask])
-        be_count = len(closed_df[be_mask])
-        loss_count = len(closed_df[loss_mask])
-        
-        win_pct = f"{(win_count / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
-        be_pct = f"{(be_count / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
-        loss_pct = f"{(loss_count / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
-        
-        combined_win_be_pct = f"{((win_count + be_count) / total_closed * 100):.1f}%" if total_closed > 0 else "0.0%"
-        
-        total_open = len(open_df)
-        
-        risk_free_count = 0
-        if not open_df_ui.empty:
-            risk_free_count = len(open_df_ui[open_df_ui['Risk Status'] == '🛡️ RISK-FREE'])
-    else:
-        total_closed, win_count, be_count, loss_count = 0, 0, 0, 0
-        win_pct, be_pct, loss_pct, combined_win_be_pct = "0.0%", "0.0%", "0.0%", "0.0%"
-        total_open, risk_free_count = 0, 0
+    
+    t_closed = len(history_df)
+    w_count = len(history_df[history_df['status'].str.contains('TP|WIN', na=False)]) if t_closed else 0
+    b_count = len(history_df[history_df['status'].str.contains('BREAK-EVEN', na=False) & ~history_df['status'].str.contains('TP|WIN', na=False)]) if t_closed else 0
+    l_count = len(history_df[history_df['status'].str.contains('LOSS|SL HIT', na=False)]) if t_closed else 0
+    r_free = len(open_df_ui[open_df_ui['Risk Status'] == '🛡️ RISK-FREE']) if not open_df_ui.empty else 0
 
     st.markdown(f"""
     <table class="metrics-matrix">
-        <tr>
-            <th></th>
-            <th>Trades</th>
-            <th>Win</th>
-            <th>Break Brek</th>
-            <th>Loss</th>
-        </tr>
-        <tr>
-            <td class="row-title">CLOSED TRADES</td>
-            <td class="val">{total_closed}</td>
-            <td class="val color-win">{win_count}</td>
-            <td class="val color-be">{be_count}</td>
-            <td class="val color-loss">{loss_count}</td>
-        </tr>
-        <tr>
-            <td class="row-title" style="border-bottom: 2px solid #2b303b;">WIN RATE %</td>
-            <td class="pct" style="border-bottom: 2px solid #2b303b; font-weight:bold; color:#f0f6fc;">{combined_win_be_pct} <span style='font-size:0.7rem; color:#8b949e;'>(Win+BE)</span></td>
-            <td class="pct color-win" style="border-bottom: 2px solid #2b303b;">{win_pct}</td>
-            <td class="pct color-be" style="border-bottom: 2px solid #2b303b;">{be_pct}</td>
-            <td class="pct color-loss" style="border-bottom: 2px solid #2b303b;">{loss_pct}</td>
-        </tr>
-        <tr>
-            <td class="row-title" style="border-bottom: 2px solid #2b303b;">CAPITAL & PNL</td>
-            <td class="val" style="border-bottom: 2px solid #2b303b; font-size: 1.2rem;">₹{INITIAL_CAPITAL:,.0f}</td>
-            <td colspan="3" class="pct" style="border-bottom: 2px solid #2b303b; text-align: left; padding-left: 20px;">
-                Realized: <b class="{'color-win' if realized_pnl > 0 else 'color-loss'}">₹{realized_pnl:,.2f}</b> | 
-                Equity: <b style="color: #f0f6fc;">₹{current_equity:,.2f}</b> | 
-                Unrealized: <b class="{'color-win' if total_unrealized_pnl > 0 else 'color-loss'}">₹{total_unrealized_pnl:,.2f}</b>
-            </td>
-        </tr>
-        <tr>
-            <td class="row-title">OPEN TRADES</td>
-            <td class="val color-open">{total_open}</td>
-            <td colspan="3" class="pct color-be" style="text-align: left; padding-left: 20px;">🛡️ {risk_free_count} Risk-Free | ⚠️ {total_open - risk_free_count} At Risk</td>
-        </tr>
+        <tr><th></th><th>Trades</th><th>Win</th><th>Break Even</th><th>Loss</th></tr>
+        <tr><td class="row-title">CLOSED TRADES</td><td class="val">{t_closed}</td><td class="val color-win">{w_count}</td><td class="val color-be">{b_count}</td><td class="val color-loss">{l_count}</td></tr>
+        <tr><td class="row-title" style="border-bottom: 2px solid #2b303b;">CAPITAL & PNL</td><td class="val" style="border-bottom: 2px solid #2b303b; font-size: 1.2rem;">₹{INITIAL_CAPITAL:,.0f}</td><td colspan="3" class="pct" style="border-bottom: 2px solid #2b303b; text-align: left; padding-left: 20px;">Realized: <b class="{'color-win' if realized_pnl > 0 else 'color-loss'}">₹{realized_pnl:,.2f}</b> | Equity: <b style="color: #f0f6fc;">₹{INITIAL_CAPITAL+realized_pnl:,.2f}</b> | Unrealized: <b class="{'color-win' if total_unrealized_pnl > 0 else 'color-loss'}">₹{total_unrealized_pnl:,.2f}</b></td></tr>
+        <tr><td class="row-title">OPEN TRADES</td><td class="val color-open">{len(open_df_ui)}</td><td colspan="3" class="pct color-be" style="text-align: left; padding-left: 20px;">🛡️ {r_free} Risk-Free | ⚠️ {len(open_df_ui) - r_free} At Risk</td></tr>
     </table>
     """, unsafe_allow_html=True)
 
-    def render_filters(df, tab_name, has_status=False):
-        if df.empty: return df
-        with st.expander(f"🔍 Filter {tab_name} Data"):
-            cols = st.columns(4) if has_status else st.columns(3)
-            assets = ['All'] + sorted(df['Asset'].unique().tolist())
-            signals = ['All'] + sorted(df['Signal'].unique().tolist())
-            
-            sel_asset = cols[0].selectbox("Asset", assets, key=f"asset_{tab_name}")
-            sel_sig = cols[1].selectbox("Signal", signals, key=f"sig_{tab_name}")
-            
-            if has_status:
-                statuses = ['All'] + sorted(df['Status'].unique().tolist())
-                sel_status = cols[2].selectbox("Status", statuses, key=f"status_{tab_name}")
-                date_str = cols[3].text_input("Date (YYYY-MM-DD)", key=f"date_{tab_name}")
-            else:
-                date_str = cols[2].text_input("Date (YYYY-MM-DD)", key=f"date_{tab_name}")
-
-            filtered_df = df.copy()
-            if sel_asset != 'All': filtered_df = filtered_df[filtered_df['Asset'] == sel_asset]
-            if sel_sig != 'All': filtered_df = filtered_df[filtered_df['Signal'] == sel_sig]
-            if has_status and sel_status != 'All': filtered_df = filtered_df[filtered_df['Status'] == sel_status]
-            if date_str:
-                date_col = 'Entry Time' if 'Entry Time' in filtered_df.columns else 'Time (IST)'
-                filtered_df = filtered_df[filtered_df[date_col].str.contains(date_str, na=False)]
-            return filtered_df
-
-    # ==========================================
-    # UI: TABBED INTERFACE
-    # ==========================================
-    t_heat, t_chart, t_open, t_ledger, t_blocked, t_equity = st.tabs(["🔥 Heatmap", "📈 Chart", "🟢 Open", "📚 Ledger", "🚫 Blocked", "💰 Equity"])
+    t_heat, t_chart, t_open, t_ledger, t_blocked = st.tabs(["🔥 Heatmap", "📈 Chart", "🟢 Open", "📚 Ledger", "🚫 Blocked"])
 
     with t_heat:
-        st.markdown("<p style='font-size:0.9rem; color:gray; margin-bottom:5px; line-height:1.4;'><b>Legend:</b><br>🔴 Red &lt; 0.1% Gap (Imminent) | 🟠 Orange &lt; 0.5% Gap (Watch Closely)</p>", unsafe_allow_html=True)
-        def apply_heatmap(val):
-            if pd.isna(val): return ''
-            try:
-                if float(val) < 0.10: return 'background-color: rgba(255, 0, 0, 0.4); color: white;'
-                elif float(val) < 0.50: return 'background-color: rgba(255, 165, 0, 0.4); color: white;'
-            except: pass
-            return ''
-        if not live_df.empty: 
-            st.dataframe(live_df.style.map(apply_heatmap, subset=['% Gap']), width="stretch", height=600, hide_index=True)
-        else: st.info("Waiting for first data sync...")
+        if not live_df.empty: st.dataframe(live_df.style.map(lambda v: 'background-color: rgba(255,0,0,0.4); color: white;' if pd.notna(v) and float(v)<0.10 else ('background-color: rgba(255,165,0,0.4); color: white;' if pd.notna(v) and float(v)<0.50 else ''), subset=['% Gap']), width="stretch", height=600, hide_index=True)
+        else: st.info("Waiting for data sync...")
 
     with t_chart:
         if not live_df.empty:
-            selected_stock = st.selectbox("Select an asset to render:", ["-- Select an Asset --"] + sorted(live_df['Asset'].tolist()), label_visibility="collapsed")
-            if selected_stock != "-- Select an Asset --":
-                selected_item = next(item for item in WATCHLIST if item['name'] == selected_stock)
-                with st.spinner(f"Loading order book for {selected_stock}..."):
+            sel_stock = st.selectbox("Select Asset:", ["-- Select --"] + sorted(live_df['Asset'].tolist()), label_visibility="collapsed")
+            if sel_stock != "-- Select --":
+                with st.spinner("Loading chart..."):
                     try:
-                        chart_df = get_cached_chart_data(selected_item)
-                        if chart_df is not None and not chart_df.empty:
-                            limit_time = chart_df.index[-1] - timedelta(days=5)
-                            chart_df = chart_df[chart_df.index >= limit_time]
-                            
-                            if chart_df.index.tz is not None: chart_df.index = chart_df.index.tz_convert('Asia/Kolkata').tz_localize(None)
-                            else: chart_df.index = chart_df.index + timedelta(hours=5, minutes=30)
-                            
-                            time_labels = chart_df.index.strftime('%b %d, %H:%M')
-                            live_adx_val = chart_df['ADX'].iloc[-1].round(2)
-                            live_atr_val = chart_df['ATR'].iloc[-1].round(2)
-                            
+                        chart_df = get_cached_chart_data(next(i for i in WATCHLIST if i['name'] == sel_stock))
+                        if chart_df is not None:
+                            chart_df = chart_df[chart_df.index >= (chart_df.index[-1] - timedelta(days=5))]
                             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
-                            
-                            fig.add_trace(go.Candlestick(
-                                x=time_labels, open=chart_df['Open'], high=chart_df['High'], 
-                                low=chart_df['Low'], close=chart_df['Close'], name="Price",
-                                customdata=chart_df['ATR'].round(2),
-                                hovertemplate="Open: %{open}<br>High: %{high}<br>Low: %{low}<br>Close: %{close}<br>ATR: %{customdata}<extra></extra>"
-                            ), row=1, col=1)
-                            
-                            fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'), row=1, col=1)
-                            fig.add_trace(go.Scatter(x=time_labels, y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'), row=1, col=1)
-                            
-                            fig.add_trace(go.Scatter(x=time_labels, y=chart_df['ADX'], line=dict(color='#ffd700', width=1.5), name='ADX'), row=2, col=1)
-                            fig.add_hline(y=20, line_dash="dot", annotation_text="Trend (20)", annotation_position="top right", line_color="#8b949e", row=2, col=1)
-                            
-                            fig.update_layout(
-                                title=f"{selected_stock} | 15m Timeframe &nbsp;&nbsp;&nbsp; <span style='font-size:14px; color:#ffd700;'>Live ADX: {live_adx_val} | Live ATR: {live_atr_val}</span>",
-                                template="plotly_dark", 
-                                xaxis_rangeslider_visible=False, 
-                                margin=dict(l=0, r=0, t=50, b=0), 
-                                height=700, 
-                                hovermode="x unified"
-                            )
-                            fig.update_xaxes(type='category', nticks=12, tickangle=-45, row=2, col=1)
+                            fig.add_trace(go.Candlestick(x=chart_df.index.strftime('%b %d %H:%M'), open=chart_df['Open'], high=chart_df['High'], low=chart_df['Low'], close=chart_df['Close'], name="Price"), row=1, col=1)
+                            fig.add_trace(go.Scatter(x=chart_df.index.strftime('%b %d %H:%M'), y=chart_df['EMA5'], line=dict(color='#00ff00', width=1.5), name='EMA 5'), row=1, col=1)
+                            fig.add_trace(go.Scatter(x=chart_df.index.strftime('%b %d %H:%M'), y=chart_df['EMA39'], line=dict(color='#ff0000', width=2), name='EMA 39'), row=1, col=1)
+                            fig.add_trace(go.Scatter(x=chart_df.index.strftime('%b %d %H:%M'), y=chart_df['ADX'], line=dict(color='#ffd700', width=1.5), name='ADX'), row=2, col=1)
+                            fig.add_hline(y=20, line_dash="dot", annotation_text="Trend (20)", row=2, col=1)
+                            fig.update_layout(title=f"{sel_stock} | Live ADX: {chart_df['ADX'].iloc[-1]:.2f} | Live ATR: {chart_df['ATR'].iloc[-1]:.2f}", template="plotly_dark", xaxis_rangeslider_visible=False, height=700)
                             st.plotly_chart(fig, use_container_width=True)
-                        else: st.error("No valid data returned for the chart.")
-                    except Exception as e: st.error(f"Chart data unavailable right now. Try again shortly. {str(e)}")
+                    except: st.error("Chart data unavailable.")
 
     with t_open:
-        if not open_df_ui.empty: 
-            filtered_open = render_filters(open_df_ui, "Open", has_status=False)
-            if not filtered_open.empty:
-                total_open_pnl = filtered_open['Unrealized PnL (₹)'].sum()
-                st.markdown(f"**Total Filtered Trades:** {len(filtered_open)} &nbsp;&nbsp;|&nbsp;&nbsp; **Filtered Unrealized PnL:** ₹{total_open_pnl:,.2f}")
-                
-                cols = ['Risk Status', 'Unrealized PnL (₹)'] + [col for col in filtered_open.columns if col not in ['Risk Status', 'Unrealized PnL (₹)', 'Latest Price', 'Yield']]
-                filtered_open = filtered_open[cols]
-                
-                def color_open_ui(val):
-                    val_str = str(val)
-                    if 'RISK-FREE' in val_str: return 'background-color: rgba(163, 113, 247, 0.2); color: #a371f7; font-weight: bold;'
-                    if 'AT RISK' in val_str: return 'color: #8b949e;'
-                    try:
-                        if float(val) > 0: return 'color: #3fb950; font-weight: bold;'
-                        elif float(val) < 0: return 'color: #f85149; font-weight: bold;'
-                    except: pass
-                    return ''
-                    
-                st.dataframe(filtered_open.style.map(color_open_ui, subset=['Risk Status', 'Unrealized PnL (₹)']), width="stretch", height=600, hide_index=True)
-            else: st.info("No active trades match these filters.")
-        else: 
-            st.info("No active trades currently open.")
+        if not open_df_ui.empty: st.dataframe(open_df_ui[['ticker', 'signal_type', 'entry_time', 'entry_price', 'sl', 'tp', 'Latest Price', 'Risk Status', 'Unrealized PnL (₹)']], width="stretch", height=600, hide_index=True)
+        else: st.info("No active trades.")
 
     with t_ledger:
-        if not history_df.empty:
-            filtered_hist = render_filters(history_df, "Ledger", has_status=True)
-            if not filtered_hist.empty:
-                total_hist_pnl = filtered_hist['PnL (₹)'].sum()
-                st.markdown(f"**Total Filtered Trades:** {len(filtered_hist)} &nbsp;&nbsp;|&nbsp;&nbsp; **Filtered Realized PnL:** ₹{total_hist_pnl:,.2f}")
-                
-                cols = list(filtered_hist.columns)
-                cols.remove('PnL (₹)')
-                cols.remove('Yield')
-                exit_idx = cols.index('Exit Price') + 1
-                cols.insert(exit_idx, 'PnL (₹)')
-                filtered_hist = filtered_hist[cols]
-                
-                def color_status_pnl(val):
-                    val_str = str(val).upper()
-                    if 'WIN' in val_str or 'TP' in val_str: return 'background-color: rgba(63, 185, 80, 0.2); color: #3fb950; font-weight: bold;'
-                    elif 'LOSS' in val_str or 'SL HIT' in val_str: return 'background-color: rgba(248, 81, 73, 0.2); color: #f85149; font-weight: bold;'
-                    elif 'BREAK' in val_str: return 'background-color: rgba(163, 113, 247, 0.2); color: #a371f7; font-weight: bold;'
-                    try:
-                        if float(val) > 0: return 'color: #3fb950; font-weight: bold;'
-                        elif float(val) < 0: return 'color: #f85149; font-weight: bold;'
-                        elif float(val) == 0: return 'color: #a371f7;'
-                    except: pass
-                    return ''
-                    
-                st.dataframe(filtered_hist.style.map(color_status_pnl, subset=['Status', 'PnL (₹)']), width="stretch", height=600, hide_index=True)
-            else: st.info("No closed trades match these filters.")
-        else: st.info("No closed trades yet.")
+        if not history_df.empty: st.dataframe(history_df[['ticker', 'signal_type', 'entry_time', 'entry_price', 'sl', 'tp', 'exit_time', 'exit_price', 'status', 'PnL (₹)']], width="stretch", height=600, hide_index=True)
+        else: st.info("No closed trades.")
 
     with t_blocked:
-        st.markdown("<p style='font-size:0.9rem; color:gray; margin-bottom:5px;'>Signals that were mathematically rejected by institutional filters to protect capital.</p>", unsafe_allow_html=True)
         try:
-            blocked_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, timestamp as 'Time (IST)', price as Price, rejection_reasons as 'Rejection Reasons', adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM blocked_signals ORDER BY id DESC LIMIT 100", ui_conn)
-        except Exception:
-            blocked_df = pd.DataFrame()
-            
-        if not blocked_df.empty: 
-            filtered_blocked = render_filters(blocked_df, "Blocked", has_status=False)
-            st.markdown(f"**Total Blocked Signals:** {len(filtered_blocked)}")
-            st.dataframe(filtered_blocked, width="stretch", height=600, hide_index=True)
-        else: st.info("No signals have been blocked yet.")
-
-    with t_equity:
-        if not history_df.empty:
-            st.markdown(f"### 📈 Equity Curve (Starting Capital: ₹{INITIAL_CAPITAL:,.0f})")
-            equity_df = history_df[['Exit Time', 'PnL (₹)']].copy()
-            
-            equity_df['Exit Time'] = pd.to_datetime(equity_df['Exit Time'].str.replace(' (IST)', '', regex=False), format='%Y-%m-%d %I:%M %p', errors='coerce')
-            
-            equity_df = equity_df.sort_values('Exit Time').dropna()
-            equity_df['Cumulative PnL'] = equity_df['PnL (₹)'].cumsum()
-            equity_df['Account Equity'] = INITIAL_CAPITAL + equity_df['Cumulative PnL']
-            
-            start_time = equity_df['Exit Time'].min() - pd.Timedelta(hours=1)
-            start_row = pd.DataFrame({'Exit Time': [start_time], 'Account Equity': [INITIAL_CAPITAL]})
-            equity_df = pd.concat([start_row, equity_df], ignore_index=True)
-            
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=equity_df['Exit Time'], y=equity_df['Account Equity'], mode='lines+markers', line=dict(color='#ffd700', width=3), marker=dict(size=6, color='#ffd700'), fill='tozeroy', fillcolor='rgba(255, 215, 0, 0.1)'))
-            
-            min_eq = equity_df['Account Equity'].min()
-            max_eq = equity_df['Account Equity'].max()
-            padding = (max_eq - min_eq) * 0.1 if max_eq != min_eq else 1000
-            fig.update_layout(
-                template="plotly_dark", 
-                margin=dict(l=0, r=0, t=20, b=0), 
-                height=500, hovermode="x unified", 
-                yaxis_tickformat="₹,.0f", 
-                yaxis_title="Capital (₹)",
-                yaxis_range=[min_eq - padding, max_eq + padding]
-            )
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("No closed trades available to plot equity curve yet.")
+            b_df = pd.read_sql_query("SELECT ticker, signal_type, timestamp, price, rejection_reasons FROM blocked_signals ORDER BY id DESC LIMIT 100", ui_conn)
+            if not b_df.empty: st.dataframe(b_df, width="stretch", height=600, hide_index=True)
+            else: st.info("No blocked signals.")
+        except: pass
