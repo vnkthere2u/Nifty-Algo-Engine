@@ -77,7 +77,6 @@ def setup_database():
         except: pass
         try: c.execute("ALTER TABLE live_market_data ADD COLUMN adx REAL")
         except: pass
-        
         conn.commit()
 
 setup_database()
@@ -110,6 +109,7 @@ def send_telegram_csv_backup():
         df_blocked.to_csv(blocked_filename, index=False)
 
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        
         payload_trades = {'chat_id': TELEGRAM_CHAT_ID, 'caption': f"📊 <b>Automated Daily Backup: Trades</b>\nDate: {date_str}", 'parse_mode': 'HTML'}
         with open(trades_filename, 'rb') as f: requests.post(url, data=payload_trades, files={'document': f}, timeout=15)
         os.remove(trades_filename)
@@ -147,7 +147,7 @@ WATCHLIST = [
 
 @st.cache_resource
 def get_tv_connection():
-    # Locks the socket connection so Streamlit UI refreshes don't spawn 100s of ghost connections
+    # Singleton TradingView socket to prevent memory/connection leaks
     return TvDatafeed()
 
 def fetch_and_analyze(item):
@@ -229,6 +229,7 @@ def process_market_data():
                 df = fetch_and_analyze(item)
                 if df is None: continue
                 
+                # Stale Data Shield (Prevents Infinite Weekend Spams)
                 try:
                     last_close_dt = df.index[-1]
                     if (ist_now.replace(tzinfo=None) - last_close_dt).total_seconds() > 3600: market_open = False
@@ -273,6 +274,7 @@ def process_market_data():
                             send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to +0.25 ATR.")
                 conn.commit()
 
+                # Signal Processor to avoid Ghost Overwrites
                 signal_id = str(last.name) 
                 c.execute("SELECT value FROM system_status WHERE key=?", (f"proc_{name}",))
                 proc_row = c.fetchone()
@@ -394,7 +396,46 @@ with contextlib.closing(get_db_connection()) as ui_conn:
         with colB: st.download_button("⬇️ Blocked", pd.read_sql_query("SELECT * FROM blocked_signals", ui_conn).to_csv(index=False).encode('utf-8'), f"Blocked_{datetime.now().strftime('%Y-%m-%d')}.csv", "text/csv")
     except: pass
 
+    # --- RESTORE DATABASE LOGIC ---
+    st.sidebar.markdown("<b>Restore Database (Upload CSV)</b>", unsafe_allow_html=True)
+    uploaded_file = st.sidebar.file_uploader("Upload CSV", type=None, label_visibility="collapsed")
+
+    if uploaded_file is not None:
+        if st.sidebar.button("⚙️ Execute Auto-Restore"):
+            try:
+                restore_df = pd.read_csv(uploaded_file)
+                csv_columns = restore_df.columns.tolist()
+                
+                if 'entry_time' in csv_columns or 'Entry Time' in csv_columns:
+                    rename_map = {'Asset': 'ticker', 'Signal': 'signal_type', 'Entry Time': 'entry_time', 'Entry': 'entry_price', 'SL': 'sl', 'TP': 'tp', 'ATR': 'atr', 'ADX': 'adx', 'Status': 'status', 'Exit Time': 'exit_time', 'Exit Price': 'exit_price', '1H Trend': 'htf_trend', 'Vol (x)': 'vol_ratio'}
+                    restore_df = restore_df.rename(columns=rename_map)
+                    restore_df = restore_df.fillna({'exit_time': '', 'exit_price': 0.0, 'htf_trend': '', 'vol_ratio': 1.0, 'atr': 0.0, 'adx': 0.0})
+                    for index, row in restore_df.iterrows():
+                        ui_c.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?", (row['ticker'], row['entry_time']))
+                        if not ui_c.fetchone():
+                            ui_c.execute("""INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, exit_time, exit_price, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['entry_time'], row['entry_price'], row['sl'], row['tp'], row['status'], row['exit_time'], row['exit_price'], row['htf_trend'], row['vol_ratio'], row['atr'], row['adx']))
+                    ui_conn.commit()
+                    st.sidebar.success("✅ Trades Restored! Rebooting...")
+
+                elif 'rejection_reasons' in csv_columns or 'Rejection Reasons' in csv_columns:
+                    rename_map = {'Asset': 'ticker', 'Signal': 'signal_type', 'Time (IST)': 'timestamp', 'Price': 'price', 'ADX': 'adx', '1H Trend': 'htf_trend', 'Vol (x)': 'vol_ratio', 'Rejection Reasons': 'rejection_reasons'}
+                    restore_df = restore_df.rename(columns=rename_map)
+                    restore_df = restore_df.fillna({'adx': 0.0, 'htf_trend': '', 'vol_ratio': 1.0, 'rejection_reasons': ''})
+                    for index, row in restore_df.iterrows():
+                        ui_c.execute("SELECT id FROM blocked_signals WHERE ticker=? AND timestamp=?", (row['ticker'], row['timestamp']))
+                        if not ui_c.fetchone():
+                            ui_c.execute("""INSERT INTO blocked_signals (ticker, signal_type, timestamp, price, adx, htf_trend, vol_ratio, rejection_reasons) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""", (row['ticker'], row['signal_type'], row['timestamp'], row['price'], row['adx'], row['htf_trend'], row['vol_ratio'], row['rejection_reasons']))
+                    ui_conn.commit()
+                    st.sidebar.success("✅ Blocked Signals Restored! Rebooting...")
+                else:
+                    st.sidebar.error("❌ Unrecognized CSV format.")
+                time.sleep(2)
+                st.rerun()
+            except Exception as e: 
+                st.sidebar.error(f"Restore failed: {e}")
+
     st.sidebar.markdown("---")
+    st.sidebar.markdown("<h3>🧪 System Diagnostics</h3>", unsafe_allow_html=True)
     if st.sidebar.button("🔔 Send Test Telegram Alert"):
         if not TELEGRAM_TOKEN: st.sidebar.error("❌ Telegram Secrets Missing!")
         else:
@@ -402,7 +443,9 @@ with contextlib.closing(get_db_connection()) as ui_conn:
                 if send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>\nTesting HTML: ADX (&lt; 20)", test_mode=True): st.sidebar.success("Ping fired successfully!")
                 else: st.sidebar.error("❌ Telegram API Failed. Check Token/ID.")
 
+    # ==========================================
     # Matrix Calculations
+    # ==========================================
     INITIAL_CAPITAL, TRADE_ALLOCATION = 200000.00, 10000.00
     try:
         live_df = pd.read_sql_query("SELECT ticker as Asset, close_price as 'Latest Price', distance_pct as '% Gap', trend as '15m Trend', htf_trend as '1H Trend', vol_ratio as 'Vol (x)', adx as 'ADX', last_update as 'Time (IST)' FROM live_market_data ORDER BY distance_pct ASC", ui_conn)
@@ -477,7 +520,7 @@ with contextlib.closing(get_db_connection()) as ui_conn:
 
     with t_blocked:
         try:
-            b_df = pd.read_sql_query("SELECT ticker, signal_type, timestamp, price, rejection_reasons FROM blocked_signals ORDER BY id DESC LIMIT 100", ui_conn)
+            b_df = pd.read_sql_query("SELECT ticker as Asset, signal_type as Signal, timestamp as 'Time (IST)', price as Price, rejection_reasons as 'Rejection Reasons', adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)' FROM blocked_signals ORDER BY id DESC LIMIT 100", ui_conn)
             if not b_df.empty: st.dataframe(b_df, width="stretch", height=600, hide_index=True)
             else: st.info("No blocked signals.")
         except: pass
