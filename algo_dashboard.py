@@ -66,6 +66,18 @@ def setup_database():
         c.execute('''CREATE TABLE IF NOT EXISTS system_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS live_market_data (ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL, ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL, htf_trend TEXT, vol_ratio REAL, adx REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_signals (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT, timestamp TEXT, price REAL, adx REAL, htf_trend TEXT, vol_ratio REAL, rejection_reasons TEXT)''')
+        
+        try: c.execute("ALTER TABLE trades ADD COLUMN htf_trend TEXT")
+        except: pass
+        try: c.execute("ALTER TABLE trades ADD COLUMN vol_ratio REAL")
+        except: pass
+        try: c.execute("ALTER TABLE trades ADD COLUMN atr REAL")
+        except: pass
+        try: c.execute("ALTER TABLE trades ADD COLUMN adx REAL")
+        except: pass
+        try: c.execute("ALTER TABLE live_market_data ADD COLUMN adx REAL")
+        except: pass
+        
         conn.commit()
 
 setup_database()
@@ -98,17 +110,14 @@ def send_telegram_csv_backup():
         df_blocked.to_csv(blocked_filename, index=False)
 
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-        
         payload_trades = {'chat_id': TELEGRAM_CHAT_ID, 'caption': f"📊 <b>Automated Daily Backup: Trades</b>\nDate: {date_str}", 'parse_mode': 'HTML'}
-        with open(trades_filename, 'rb') as f:
-            requests.post(url, data=payload_trades, files={'document': f}, timeout=15)
+        with open(trades_filename, 'rb') as f: requests.post(url, data=payload_trades, files={'document': f}, timeout=15)
         os.remove(trades_filename)
         
         time.sleep(2)
         
         payload_blocked = {'chat_id': TELEGRAM_CHAT_ID, 'caption': f"🚫 <b>Automated Daily Backup: Blocked Signals</b>\nDate: {date_str}", 'parse_mode': 'HTML'}
-        with open(blocked_filename, 'rb') as f:
-            requests.post(url, data=payload_blocked, files={'document': f}, timeout=15)
+        with open(blocked_filename, 'rb') as f: requests.post(url, data=payload_blocked, files={'document': f}, timeout=15)
         os.remove(blocked_filename)
     except Exception: pass
 
@@ -136,20 +145,18 @@ WATCHLIST = [
     {'name': 'VEDANTA', 'tv_symbol': 'VEDL', 'tv_exchange': 'NSE', 'yf_symbol': 'VEDL.NS'}
 ]
 
-tv = TvDatafeed()
+@st.cache_resource
+def get_tv_connection():
+    # Locks the socket connection so Streamlit UI refreshes don't spawn 100s of ghost connections
+    return TvDatafeed()
 
 def fetch_and_analyze(item):
-    global tv
+    tv_conn = get_tv_connection()
     df = None
     try:
-        df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
+        df_tv = tv_conn.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
         if df_tv is not None and not df_tv.empty: df = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
-    except Exception:
-        try:
-            tv = TvDatafeed() 
-            df_tv = tv.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
-            if df_tv is not None and not df_tv.empty: df = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
-        except Exception: pass 
+    except Exception: pass 
 
     if (df is None or df.empty) and item['tv_exchange'] == 'NSE':
         try:
@@ -164,8 +171,10 @@ def fetch_and_analyze(item):
             df = df.copy() 
             if df.index.tz is not None: df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
             else: df.index = df.index + timedelta(hours=5, minutes=30)
+            
             for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
                 if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+                
             df[['Open', 'High', 'Low', 'Close']] = df[['Open', 'High', 'Low', 'Close']].ffill()
             df.dropna(subset=['Close', 'High', 'Low'], inplace=True) 
             
@@ -174,9 +183,11 @@ def fetch_and_analyze(item):
             df['ATR'] = ta.atr(df['High'], df['Low'], df['Close'], length=14)
             df_1h = df.resample('1h').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'}).dropna()
             df['EMA39_1H'] = ta.ema(df_1h['Close'], length=39).reindex(df.index, method='ffill')
+            
             adx_data = ta.adx(df['High'], df['Low'], df['Close'], length=14)
             df['ADX'] = adx_data.iloc[:, 0].ffill().fillna(0.0) if adx_data is not None and not adx_data.empty else 0.0
             df['Vol_Ratio'] = np.where(df.get('Volume', pd.Series(dtype=float)).rolling(20).mean() > 0, df['Volume'] / df['Volume'].rolling(20).mean(), 1.0) if 'Volume' in df.columns else 1.0 
+            
             df.dropna(subset=['EMA39_1H', 'EMA39', 'EMA5', 'ATR'], inplace=True)
             if len(df) >= 5: return df
         except Exception: pass
@@ -187,7 +198,7 @@ def get_cached_chart_data(item_dict):
     return fetch_and_analyze(item_dict)
 
 # ==========================================
-# 3. THE LIGHTWEIGHT EXECUTION ENGINE
+# 3. THE EXECUTION ENGINE
 # ==========================================
 def process_market_data():
     try:
@@ -195,8 +206,8 @@ def process_market_data():
             c = conn.cursor()
             ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
             scan_time_str = ist_now.replace(minute=(ist_now.minute // 5) * 5, second=0, microsecond=0).strftime("%Y-%m-%d %I:%M %p (IST)")
-            
             current_date_str = ist_now.strftime("%Y-%m-%d")
+            
             c.execute("SELECT value FROM system_status WHERE key='last_backup_date'")
             last_backup_row = c.fetchone()
             last_backup_date = last_backup_row[0] if last_backup_row else ""
@@ -209,7 +220,6 @@ def process_market_data():
             for item in WATCHLIST:
                 name, exchange = item['name'], item['tv_exchange']
                 
-                # 1. NEW GLOBAL MARKET HOURS & STALE DATA SHIELD
                 market_open = True
                 if exchange == 'NSE':
                     if ist_now.weekday() >= 5 or not (555 <= (ist_now.hour * 60 + ist_now.minute) <= 935): market_open = False
@@ -219,7 +229,6 @@ def process_market_data():
                 df = fetch_and_analyze(item)
                 if df is None: continue
                 
-                # Failsafe: If the latest candle is more than 60 mins old, the market is closed or API is dead.
                 try:
                     last_close_dt = df.index[-1]
                     if (ist_now.replace(tzinfo=None) - last_close_dt).total_seconds() > 3600: market_open = False
@@ -227,7 +236,6 @@ def process_market_data():
 
                 curr, last, prev = df.iloc[-1], df.iloc[-2], df.iloc[-3]
                 
-                # Update Dashboard Matrix
                 c.execute("INSERT OR REPLACE INTO live_market_data VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                           (name, scan_time_str, round(curr['Close'], 2), round(curr['EMA5'], 2), round(curr['EMA39'], 2), 
                            "🟢 Bullish" if curr['EMA5'] > curr['EMA39'] else "🔴 Bearish", abs(curr['EMA5']-curr['EMA39'])/curr['EMA39']*100, 
@@ -236,7 +244,6 @@ def process_market_data():
                 
                 if not market_open: continue
 
-                # 2. MANAGE OPEN TRADES (Sequential Logic Intact)
                 c.execute("SELECT id, signal_type, sl, tp, entry_price, atr FROM trades WHERE ticker=? AND status='OPEN'", (name,))
                 for trade in c.fetchall():
                     t_id, s_type, sl, tp, e_price, atr_val = trade
@@ -266,9 +273,7 @@ def process_market_data():
                             send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to +0.25 ATR.")
                 conn.commit()
 
-                # 3. REWRITTEN STATE MACHINE 
                 signal_id = str(last.name) 
-                
                 c.execute("SELECT value FROM system_status WHERE key=?", (f"proc_{name}",))
                 proc_row = c.fetchone()
                 
@@ -346,7 +351,8 @@ def get_sleep_time_to_next_5m():
     next_minute = ((now.minute // 5) + 1) * 5
     if next_minute >= 60: next_time = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
     else: next_time = now.replace(minute=next_minute, second=0, microsecond=0)
-    return max(0, (next_time - now).total_seconds())
+    seconds = (next_time - now).total_seconds()
+    return seconds if seconds > 0 else 300
 
 @st.cache_resource
 def start_background_scanner():
