@@ -109,7 +109,6 @@ def send_telegram_csv_backup():
         df_blocked.to_csv(blocked_filename, index=False)
 
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-        
         payload_trades = {'chat_id': TELEGRAM_CHAT_ID, 'caption': f"📊 <b>Automated Daily Backup: Trades</b>\nDate: {date_str}", 'parse_mode': 'HTML'}
         with open(trades_filename, 'rb') as f: requests.post(url, data=payload_trades, files={'document': f}, timeout=15)
         os.remove(trades_filename)
@@ -122,7 +121,7 @@ def send_telegram_csv_backup():
     except Exception: pass
 
 # ==========================================
-# 2. DATA FETCHING ENGINE (FULL 18 ASSETS)
+# 2. DATA FETCHING ENGINE (THREAD-SAFE)
 # ==========================================
 WATCHLIST = [
     {'name': 'NIFTY 50', 'tv_symbol': 'NIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEI'},
@@ -145,22 +144,27 @@ WATCHLIST = [
     {'name': 'VEDANTA', 'tv_symbol': 'VEDL', 'tv_exchange': 'NSE', 'yf_symbol': 'VEDL.NS'}
 ]
 
+# THE FIX: Cryptographic Lock to prevent UI and Daemon threads from causing Core Dumps
+api_lock = threading.Lock()
+
 @st.cache_resource
 def get_tv_connection():
-    # Singleton TradingView socket to prevent memory/connection leaks
     return TvDatafeed()
 
 def fetch_and_analyze(item):
-    tv_conn = get_tv_connection()
     df = None
     try:
-        df_tv = tv_conn.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
-        if df_tv is not None and not df_tv.empty: df = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+        # Prevents thread collision
+        with api_lock:
+            tv_conn = get_tv_connection()
+            df_tv = tv_conn.get_hist(symbol=item['tv_symbol'], exchange=item['tv_exchange'], interval=Interval.in_15_minute, n_bars=250)
+            if df_tv is not None and not df_tv.empty: df = df_tv.rename(columns={'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
     except Exception: pass 
 
     if (df is None or df.empty) and item['tv_exchange'] == 'NSE':
         try:
-            df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="5d")
+            with api_lock:
+                df_yf = yf.Ticker(item['yf_symbol']).history(interval="15m", period="5d")
             if df_yf is not None and not df_yf.empty:
                 df_yf.index = df_yf.index.tz_localize(None) if df_yf.index.tz is not None else df_yf.index
                 df = df_yf
@@ -229,7 +233,6 @@ def process_market_data():
                 df = fetch_and_analyze(item)
                 if df is None: continue
                 
-                # Stale Data Shield (Prevents Infinite Weekend Spams)
                 try:
                     last_close_dt = df.index[-1]
                     if (ist_now.replace(tzinfo=None) - last_close_dt).total_seconds() > 3600: market_open = False
@@ -274,7 +277,6 @@ def process_market_data():
                             send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to +0.25 ATR.")
                 conn.commit()
 
-                # Signal Processor to avoid Ghost Overwrites
                 signal_id = str(last.name) 
                 c.execute("SELECT value FROM system_status WHERE key=?", (f"proc_{name}",))
                 proc_row = c.fetchone()
@@ -336,6 +338,9 @@ def process_market_data():
                                 c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", signal_id))
                                 c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                     conn.commit()
+                
+                # Immediate Memory Cleanup 
+                del df
                 time.sleep(1) 
                 
             c.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 500)")
@@ -346,7 +351,7 @@ def process_market_data():
     return True
 
 # ==========================================
-# 4. BACKGROUND THREADING DAEMON
+# 4. BACKGROUND THREADING DAEMON (CRASH-PROOFED)
 # ==========================================
 def get_sleep_time_to_next_5m():
     now = datetime.now()
@@ -361,8 +366,15 @@ def start_background_scanner():
     def background_loop():
         while True:
             time.sleep(get_sleep_time_to_next_5m())
-            try: process_market_data()
-            except Exception: pass
+            try: 
+                process_market_data()
+            except Exception as e:
+                # Fatal Error Catcher: Will write to DB if thread crashes
+                try:
+                    with contextlib.closing(get_db_connection()) as conn:
+                        conn.execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (str(datetime.now()), f"THREAD CRASH: {str(e)}"))
+                        conn.commit()
+                except: pass
     threading.Thread(target=background_loop, daemon=True).start()
     return True
 
