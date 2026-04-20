@@ -144,7 +144,6 @@ WATCHLIST = [
     {'name': 'VEDANTA', 'tv_symbol': 'VEDL', 'tv_exchange': 'NSE', 'yf_symbol': 'VEDL.NS'}
 ]
 
-# FIX: Removed @st.cache_resource which broke background threading. Standard Python globals are used.
 api_lock = threading.Lock()
 global_tv = None
 
@@ -206,7 +205,6 @@ def fetch_and_analyze(item):
             adx_data = ta.adx(df['High'], df['Low'], df['Close'], length=14)
             df['ADX'] = adx_data.iloc[:, 0].ffill().fillna(0.0) if adx_data is not None and not adx_data.empty else 0.0
             
-            # Safe Volume calculation
             vol_col = df.get('Volume', pd.Series(dtype=float))
             vol_ma = vol_col.rolling(20).mean()
             df['Vol_Ratio'] = np.where(vol_ma > 0, vol_col / vol_ma, 1.0)
@@ -215,6 +213,10 @@ def fetch_and_analyze(item):
             if len(df) >= 5: return df
         except Exception: pass
     return None
+
+@st.cache_data(ttl=300)
+def get_cached_chart_data(item_dict):
+    return fetch_and_analyze(item_dict)
 
 # ==========================================
 # 3. THE EXECUTION ENGINE
@@ -263,6 +265,7 @@ def process_market_data():
                 
                 if not market_open: continue
 
+                # MANAGE OPEN TRADES
                 c.execute("SELECT id, signal_type, sl, tp, entry_price, atr FROM trades WHERE ticker=? AND status='OPEN'", (name,))
                 for trade in c.fetchall():
                     t_id, s_type, sl, tp, e_price, atr_val = trade
@@ -292,34 +295,33 @@ def process_market_data():
                             send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to +0.25 ATR.")
                 conn.commit()
 
-                # FIX: Separated the Anchor Creation and Evaluation to stop premature deletions
-                signal_id = str(last.name) 
-                c.execute("SELECT value FROM system_status WHERE key=?", (f"proc_{name}",))
-                proc_row = c.fetchone()
-                
+                # THE FIX: Disconnected Anchor Evaluation from the "Processed" Lock
                 c.execute("SELECT value FROM system_status WHERE key=?", (f"anchor_{name}",))
                 anchor_row = c.fetchone()
+                signal_id = str(last.name) 
                 
-                is_long = (prev['EMA5'] <= prev['EMA39']) and (last['EMA5'] > last['EMA39'])
-                is_short = (prev['EMA5'] >= prev['EMA39']) and (last['EMA5'] < last['EMA39'])
-                
-                # 1. CREATE ANCHOR (If crossover and we haven't anchored this exact candle yet)
-                if (is_long or is_short) and not anchor_row:
+                # 1. CREATE NEW ANCHOR (Only if one doesn't exist)
+                if not anchor_row:
+                    c.execute("SELECT value FROM system_status WHERE key=?", (f"proc_{name}",))
+                    proc_row = c.fetchone()
+                    
                     if not proc_row or proc_row[0] != signal_id:
-                        direction = "LONG" if is_long else "SHORT"
-                        start_time = ist_now.replace(minute=(ist_now.minute // 15) * 15, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
-                        anchor_val = f"{start_time}|{direction}|{last['ATR']}|{signal_id}"
-                        c.execute("INSERT INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
-                        # Instantly lock this candle so we don't duplicate
-                        c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", signal_id))
-                        conn.commit()
-                        anchor_row = (anchor_val,)
+                        is_long = (prev['EMA5'] <= prev['EMA39']) and (last['EMA5'] > last['EMA39'])
+                        is_short = (prev['EMA5'] >= prev['EMA39']) and (last['EMA5'] < last['EMA39'])
+                        
+                        if is_long or is_short:
+                            direction = "LONG" if is_long else "SHORT"
+                            start_time = ist_now.replace(minute=(ist_now.minute // 15) * 15, second=0, microsecond=0).strftime("%Y-%m-%d %H:%M:%S")
+                            anchor_val = f"{start_time}|{direction}|{last['ATR']}|{signal_id}"
+                            c.execute("INSERT INTO system_status (key, value) VALUES (?, ?)", (f"anchor_{name}", anchor_val))
+                            conn.commit()
+                            anchor_row = (anchor_val,) # Instantly load it for Minute 0 evaluation
 
-                # 2. EVALUATE ANCHOR
+                # 2. EVALUATE EXISTING ANCHOR (Runs silently every 5 mins without locking itself out)
                 if anchor_row:
                     adata = anchor_row[0].split('|')
                     if len(adata) == 4:
-                        a_start, a_dir, a_atr = datetime.strptime(adata[0], "%Y-%m-%d %H:%M:%S"), adata[1], float(adata[2])
+                        a_start, a_dir, a_atr, a_sig_id = datetime.strptime(adata[0], "%Y-%m-%d %H:%M:%S"), adata[1], float(adata[2]), adata[3]
                         mins_elapsed = (ist_now.replace(tzinfo=None) - a_start).total_seconds() / 60.0
                         
                         if mins_elapsed <= 16.0:
@@ -343,6 +345,8 @@ def process_market_data():
                                 tp = entry + (3.75 * a_atr) if a_dir == "LONG" else entry - (3.75 * a_atr)
                                 c.execute("INSERT INTO trades (ticker, signal_type, entry_time, entry_price, sl, tp, status, htf_trend, vol_ratio, atr, adx) VALUES (?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)", (name, a_dir.lower(), scan_time_str, round(entry, 2), round(sl, 2), round(tp, 2), l_htf, round(l_vol, 2), round(a_atr, 2), round(l_adx, 2)))
                                 send_telegram_alert(f"{'🟢' if a_dir=='LONG' else '🔴'} <b>{a_dir} SIGNAL: {name}</b>\nTime: {scan_time_str}\nEntry: {round(entry, 2)}\nSL: {round(sl, 2)}\nTP: {round(tp, 2)}\nADX: {round(l_adx, 1)}")
+                                
+                                c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", a_sig_id))
                                 c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                             else:
                                 safe_rej = [r.replace("<", "&lt;").replace(">", "&gt;") for r in rejections]
@@ -350,10 +354,12 @@ def process_market_data():
                                 
                                 if mins_elapsed >= 14.0:
                                     send_telegram_alert(f"💀 <b>EXPIRED: {name}</b>\n{a_dir} failed to align within 15m.\n" + "\n".join([f"❌ {r}" for r in safe_rej]))
+                                    c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", a_sig_id))
                                     c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
                         else:
+                            c.execute("INSERT OR REPLACE INTO system_status VALUES (?, ?)", (f"proc_{name}", a_sig_id))
                             c.execute("DELETE FROM system_status WHERE key=?", (f"anchor_{name}",))
-                conn.commit()
+                    conn.commit()
                 time.sleep(1) 
                 
             c.execute("DELETE FROM system_logs WHERE id NOT IN (SELECT id FROM system_logs ORDER BY id DESC LIMIT 500)")
@@ -379,8 +385,14 @@ def start_background_scanner():
     def background_loop():
         while True:
             time.sleep(get_sleep_time_to_next_5m())
-            try: process_market_data()
-            except Exception: pass
+            try: 
+                process_market_data()
+            except Exception as e: 
+                try:
+                    with contextlib.closing(get_db_connection()) as conn:
+                        conn.execute("INSERT INTO system_logs (timestamp, message) VALUES (?, ?)", (str(datetime.now()), f"CRASH: {str(e)}"))
+                        conn.commit()
+                except: pass
     threading.Thread(target=background_loop, daemon=True).start()
     return True
 
@@ -515,7 +527,7 @@ with contextlib.closing(get_db_connection()) as ui_conn:
             if sel_stock != "-- Select --":
                 with st.spinner("Loading chart..."):
                     try:
-                        chart_df = fetch_and_analyze(next(i for i in WATCHLIST if i['name'] == sel_stock))
+                        chart_df = get_cached_chart_data(next(i for i in WATCHLIST if i['name'] == sel_stock))
                         if chart_df is not None:
                             chart_df = chart_df[chart_df.index >= (chart_df.index[-1] - timedelta(days=5))]
                             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
