@@ -121,7 +121,7 @@ def send_telegram_csv_backup():
     except Exception: pass
 
 # ==========================================
-# 2. DATA FETCHING ENGINE (THREAD-SAFE)
+# 2. DATA FETCHING ENGINE 
 # ==========================================
 WATCHLIST = [
     {'name': 'NIFTY 50', 'tv_symbol': 'NIFTY', 'tv_exchange': 'NSE', 'yf_symbol': '^NSEI'},
@@ -252,14 +252,12 @@ def process_market_data():
                 
                 if not market_open: continue
 
-                # THE USER LOGIC FIX: PREVENT UNNECESSARY API FETCHES
                 c.execute("SELECT count(*) FROM trades WHERE ticker=? AND status='OPEN'", (name,))
                 open_trade_count = c.fetchone()[0]
                 
                 c.execute("SELECT value FROM system_status WHERE key=?", (f"anchor_{name}",))
                 anchor_row = c.fetchone()
                 
-                # If it is NOT the 15m boundary, and we have NO active trades/anchors to manage, SKIP FETCHING!
                 if not is_15m_boundary and open_trade_count == 0 and not anchor_row:
                     continue
 
@@ -281,41 +279,60 @@ def process_market_data():
                            "🟢 Bullish" if curr['Close'] > curr['EMA39_1H'] else "🔴 Bearish", round(curr.get('Vol_Ratio', 1.0), 2), round(curr.get('ADX', 0.0), 2)))
                 conn.commit()
 
-                # MANAGE OPEN TRADES
+                # =======================================================
+                # REWRITTEN OPEN TRADE MANAGER (Zero Paradox "Snapshot" Logic)
+                # =======================================================
                 if open_trade_count > 0:
                     c.execute("SELECT id, signal_type, sl, tp, entry_price, atr FROM trades WHERE ticker=? AND status='OPEN'", (name,))
                     for trade in c.fetchall():
                         t_id, s_type, sl, tp, e_price, atr_val = trade
                         atr_val = atr_val if atr_val > 0 else abs(tp - e_price)/3.75
                         
-                        c_open, c_high, c_low, c_close = curr['Open'], curr['High'], curr['Low'], curr['Close']
+                        live_price = curr['Close']
                         trade_closed = False
                         
                         if s_type == 'long':
-                            if c_open >= tp: c.execute("UPDATE trades SET status='TP HIT (GAP UP)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, c_open, t_id)); trade_closed = True
-                            elif c_open <= sl: c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", ('BREAK-EVEN (GAP DOWN)' if sl==e_price else 'SL HIT (GAP)', scan_time_str, c_open, t_id)); trade_closed = True
-                            elif c_high >= tp: c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, t_id)); trade_closed = True
-                            elif c_low <= sl: c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", ('BREAK-EVEN TP HIT' if sl>e_price else 'SL HIT', scan_time_str, sl, t_id)); trade_closed = True
+                            # Evaluate Exits First
+                            if live_price >= tp:
+                                status_text = 'TP HIT (WIN)' if live_price < (tp + atr_val) else 'TP HIT (GAP UP)'
+                                c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, live_price, t_id))
+                                send_telegram_alert(f"🎯 <b>{status_text}</b>\n{name} LONG closed at {round(live_price, 2)}"); trade_closed = True
+                            elif live_price <= sl:
+                                status_text = 'BREAK-EVEN TP HIT' if sl > e_price else ('BREAK-EVEN (0 RISK)' if sl == e_price else 'SL HIT (LOSS)')
+                                if live_price < (sl - atr_val): status_text += ' (GAP DOWN)'
+                                c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, live_price, t_id))
+                                send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} LONG closed at {round(live_price, 2)}"); trade_closed = True
                             
-                            if not trade_closed and round(sl, 2) <= round(e_price, 2) and max(c_high, c_close) >= (e_price + 1.0 * atr_val):
-                                c.execute("UPDATE trades SET sl=? WHERE id=?", (e_price + 0.25 * atr_val, t_id))
-                                send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} LONG hit 1 ATR. SL moved to +0.25 ATR.")
+                            # Manage Trailing Stop Second
+                            if not trade_closed and round(sl, 2) <= round(e_price, 2) and live_price >= (e_price + 1.0 * atr_val):
+                                new_sl = e_price + 0.25 * atr_val
+                                c.execute("UPDATE trades SET sl=? WHERE id=?", (new_sl, t_id))
+                                send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} LONG hit 1 ATR. SL moved to {round(new_sl, 2)} (+0.25 ATR).")
 
                         elif s_type == 'short':
-                            if c_open <= tp: c.execute("UPDATE trades SET status='TP HIT (GAP DOWN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, c_open, t_id)); trade_closed = True
-                            elif c_open >= sl: c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", ('BREAK-EVEN (GAP UP)' if sl==e_price else 'SL HIT (GAP)', scan_time_str, c_open, t_id)); trade_closed = True
-                            elif c_low <= tp: c.execute("UPDATE trades SET status='TP HIT (WIN)', exit_time=?, exit_price=? WHERE id=?", (scan_time_str, tp, t_id)); trade_closed = True
-                            elif c_high >= sl: c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", ('BREAK-EVEN TP HIT' if sl<e_price else 'SL HIT', scan_time_str, sl, t_id)); trade_closed = True
+                            # Evaluate Exits First
+                            if live_price <= tp:
+                                status_text = 'TP HIT (WIN)' if live_price > (tp - atr_val) else 'TP HIT (GAP DOWN)'
+                                c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, live_price, t_id))
+                                send_telegram_alert(f"🎯 <b>{status_text}</b>\n{name} SHORT closed at {round(live_price, 2)}"); trade_closed = True
+                            elif live_price >= sl:
+                                status_text = 'BREAK-EVEN TP HIT' if sl < e_price else ('BREAK-EVEN (0 RISK)' if sl == e_price else 'SL HIT (LOSS)')
+                                if live_price > (sl + atr_val): status_text += ' (GAP UP)'
+                                c.execute("UPDATE trades SET status=?, exit_time=?, exit_price=? WHERE id=?", (status_text, scan_time_str, live_price, t_id))
+                                send_telegram_alert(f"🛑 <b>{status_text}</b>\n{name} SHORT closed at {round(live_price, 2)}"); trade_closed = True
                             
-                            if not trade_closed and round(sl, 2) >= round(e_price, 2) and min(c_low, c_close) <= (e_price - 1.0 * atr_val):
-                                c.execute("UPDATE trades SET sl=? WHERE id=?", (e_price - 0.25 * atr_val, t_id))
-                                send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to +0.25 ATR.")
+                            # Manage Trailing Stop Second
+                            if not trade_closed and round(sl, 2) >= round(e_price, 2) and live_price <= (e_price - 1.0 * atr_val):
+                                new_sl = e_price - 0.25 * atr_val
+                                c.execute("UPDATE trades SET sl=? WHERE id=?", (new_sl, t_id))
+                                send_telegram_alert(f"🛡️ <b>PROFIT LOCKED</b>\n{name} SHORT hit 1 ATR. SL moved to {round(new_sl, 2)} (+0.25 ATR).")
                     conn.commit()
 
+                # =======================================================
                 # STATE MACHINE: 15-MINUTE ANCHOR LOGIC
+                # =======================================================
                 signal_id = str(last.name) 
                 
-                # 1. CREATE NEW ANCHOR (Only happens at 15m boundaries when crossover is present)
                 if not anchor_row and is_15m_boundary:
                     c.execute("SELECT value FROM system_status WHERE key=?", (f"proc_{name}",))
                     proc_row = c.fetchone()
@@ -332,7 +349,6 @@ def process_market_data():
                             conn.commit()
                             anchor_row = (anchor_val,) 
 
-                # 2. EVALUATE EXISTING ANCHOR (Runs at 0, 5, 10, 15m marks if active)
                 if anchor_row:
                     adata = anchor_row[0].split('|')
                     if len(adata) == 4:
@@ -349,7 +365,11 @@ def process_market_data():
                             
                             rejections = []
                             if open_trade_count > 0: rejections.append("Active trade open.")
-                            if not (l_adx > 20.0 and l_adx >= p_adx): rejections.append(f"Weak Trend (ADX: {round(l_adx,1)}).")
+                            
+                            # THE FIX: Split ADX rejection rule to be 100% explicit on why it failed
+                            if l_adx <= 20.0: rejections.append(f"Weak Trend (ADX: {round(l_adx,1)} < 20).")
+                            elif l_adx < p_adx: rejections.append(f"Falling Momentum (ADX {round(l_adx,1)} < Prev {round(p_adx,1)}).")
+                            
                             if abs(ev_candle['EMA5'] - ev_candle['EMA39']) < (0.15 * a_atr): rejections.append("EMAs Tangled.")
                             if l_htf != r_htf: rejections.append(f"1H Conflict ({l_htf}).")
                             if abs(ev_candle['Close'] - ev_candle['EMA39']) > (2.5 * a_atr): rejections.append("Overextended.")
