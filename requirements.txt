@@ -1,7 +1,12 @@
-streamlit==1.55.0
-pandas>=2.3.2
-pandas-ta==0.4.71b0
-requests
-yfinance
-tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git
-plotly
+# requirements.txt — Algo Engine Terminal v2.1
+# Deploy this single file on Streamlit Community Cloud
+ 
+streamlit>=1.35.0
+streamlit-autorefresh>=1.0.1
+pandas>=2.0.0
+numpy>=1.26.0
+pandas_ta>=0.3.14b
+requests>=2.31.0
+yfinance>=0.2.40
+tvDatafeed>=2.0.0
+plotly>=5.20.0
