@@ -1,3 +1,7 @@
+# requirements.txt — Algo Engine Terminal v2.1
+# tvdatafeed removed — not on PyPI, Streamlit Cloud blocks git installs.
+# yfinance covers all 18 assets (NSE, crypto, commodities).
+ 
 streamlit>=1.35.0
 streamlit-autorefresh>=1.0.1
 pandas>=2.0.0,<3.0.0
@@ -5,5 +9,4 @@ numpy>=1.26.0,<2.0.0
 pandas_ta>=0.3.14b
 requests>=2.31.0
 yfinance>=0.2.40
-tvdatafeed @ git+https://github.com/StreamAlpha/tvdatafeed.git
 plotly>=5.20.0
