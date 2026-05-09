@@ -1,28 +1,16 @@
 """
-================================================================================
-  ALGO ENGINE TERMINAL — PRODUCTION v3.0
-  Algo by Vinayak | Engineered for Streamlit Community Cloud (1GB RAM)
+ALGO ENGINE TERMINAL — v3.1
+Algo by Vinayak
 
-  v3.0 IMPROVEMENTS over v2.1:
-  [L1] Progressive trailing stop — 3 levels (+1R→BE, +2R→+1R, +3R→+2R)
-       instead of single level. Eliminates massive profit giveback.
-  [L2] ADX velocity requires 1-point minimum drop to reject. Was rejecting
-       on floating-point micro-artefacts like 45.2 vs 45.3.
-  [L3] Vol_Ratio filter added (< 0.8x avg → reject). Volume now actually
-       used as confirmation. Eliminates thin-air crossovers.
-  [L4] signal_id rounded to nearest 15min. Prevents yfinance timestamp
-       microsecond drift from generating duplicate signals on same candle.
-  [L5] Post-loss cooldown: 15-minute moratorium after SL HIT per ticker.
-  [R1] Chart uses 5d-only fetch, separate from 15d engine function.
-       Saves ~66% chart memory.
-  [R2] Dynamic dataframe heights based on row count.
-  [R3] Architectural note block removed from production code.
-  [U1] Win Rate % and Expectancy added to metrics matrix.
-  [U2] ATR column added to heatmap (essential for position sizing).
-  [U3] EMA39_1H dashed line overlay added to chart (HTF reference).
-  [U4] Open trades: Time In Trade + Distance to SL/TP % columns.
-  [U5] Next scan countdown added to sidebar.
-================================================================================
+FIXES in v3.1:
+  [BUG-1]  Ternary Streamlit calls (st.x() if cond else st.y()) render the
+           DeltaGenerator repr as code. All replaced with proper if/else blocks.
+  [BUG-2]  market_open: continue was firing BEFORE the fetch, so 17 of 18
+           assets never wrote to live_market_data outside NSE hours. Fix:
+           decouple "signals_live" flag from heatmap update. All 18 assets
+           always fetched on 15m boundary. market_status column added to DB.
+  [UI-1]   Full institutional terminal redesign: session status bar, metric
+           cards, color-coded scanner, open trade cards, better chart layout.
 """
 
 import streamlit as st
@@ -47,60 +35,100 @@ logging.getLogger('urllib3').setLevel(logging.CRITICAL)
 logging.getLogger('peewee').setLevel(logging.CRITICAL)
 
 
-# ==========================================
-# INLINE INDICATORS  (replaces pandas_ta)
-# ==========================================
+# ── INLINE INDICATORS ─────────────────────────────────────────────────────────
+def _ema(s, n):
+    return s.ewm(span=n, adjust=False, min_periods=n).mean()
 
-def _ema(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(span=length, adjust=False, min_periods=length).mean()
+def _atr(h, l, c, n=14):
+    pc = c.shift(1)
+    tr = pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
+    return tr.ewm(span=n, adjust=False, min_periods=n).mean()
 
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
-    pc = close.shift(1)
-    tr = pd.concat([high - low, (high - pc).abs(), (low - pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=length, adjust=False, min_periods=length).mean()
-
-def _adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
-    up, down = high.diff(), -(low.diff())
-    pdm   = pd.Series(np.where((up > down) & (up > 0),   up,   0.0), index=high.index)
-    mdm   = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=high.index)
-    atr_s = _atr(high, low, close, length)
-    pdi   = 100 * pdm.ewm(span=length, adjust=False, min_periods=length).mean() / atr_s
-    mdi   = 100 * mdm.ewm(span=length, adjust=False, min_periods=length).mean() / atr_s
-    denom = (pdi + mdi).replace(0, np.nan)
-    dx    = (100 * (pdi - mdi).abs() / denom).fillna(0)
-    return dx.ewm(span=length, adjust=False, min_periods=length).mean()
+def _adx(h, l, c, n=14):
+    up, dn = h.diff(), -(l.diff())
+    pdm = pd.Series(np.where((up>dn)&(up>0), up, 0.0), index=h.index)
+    mdm = pd.Series(np.where((dn>up)&(dn>0), dn, 0.0), index=h.index)
+    atr_ = _atr(h, l, c, n)
+    pdi  = 100*pdm.ewm(span=n,adjust=False,min_periods=n).mean()/atr_
+    mdi  = 100*mdm.ewm(span=n,adjust=False,min_periods=n).mean()/atr_
+    dx   = (100*(pdi-mdi).abs()/((pdi+mdi).replace(0,np.nan))).fillna(0)
+    return dx.ewm(span=n, adjust=False, min_periods=n).mean()
 
 
-# ==========================================
-# 0. PAGE CONFIG & CSS
-# ==========================================
-st.set_page_config(page_title="Algo Engine Terminal", layout="wide", initial_sidebar_state="expanded")
+# ── PAGE CONFIG ───────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Algo Engine", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""<style>
-.block-container{padding-top:1.2rem!important;padding-bottom:0.5rem!important;max-width:99%!important}
-.metrics-matrix{width:100%;border-collapse:collapse;margin:8px 0 16px;
-  background:linear-gradient(145deg,#16181c,#0e1117);border-radius:8px;overflow:hidden;
-  border:1px solid #2b303b;box-shadow:0 4px 15px rgba(0,0,0,.2);text-align:center;font-family:sans-serif}
-.metrics-matrix th{background:#121418;color:#8b949e;font-size:.82rem;font-weight:600;
-  text-transform:uppercase;padding:10px 6px;border:1px solid #2b303b;letter-spacing:.5px}
-.metrics-matrix td{padding:8px 6px;border:1px solid #2b303b}
-.metrics-matrix .val{font-size:1.65rem;font-weight:700;color:#f0f6fc}
-.metrics-matrix .pct{font-size:.95rem;font-weight:500}
-.metrics-matrix .row-title{font-size:.88rem;color:#8b949e;font-weight:600;text-align:left;padding-left:14px}
-.color-win{color:#3fb950}.color-loss{color:#f85149}.color-be{color:#a371f7}.color-open{color:#58a6ff}
+/* ── Base ── */
+.block-container{padding:0.8rem 1rem 0.5rem!important;max-width:100%!important}
+[data-testid="stSidebar"]{background:#0d1117!important}
+
+/* ── Session badges ── */
+.sess-bar{display:flex;gap:10px;flex-wrap:wrap;margin:4px 0 10px}
+.sess{display:inline-flex;align-items:center;gap:5px;padding:4px 12px;
+      border-radius:20px;font-size:.78rem;font-weight:600;letter-spacing:.4px}
+.sess-live{background:rgba(63,185,80,.15);color:#3fb950;border:1px solid rgba(63,185,80,.3)}
+.sess-closed{background:rgba(110,118,129,.12);color:#6e7681;border:1px solid rgba(110,118,129,.25)}
+.sess-always{background:rgba(88,166,255,.12);color:#58a6ff;border:1px solid rgba(88,166,255,.25)}
+
+/* ── Metric cards ── */
+.metrics-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.mc{flex:1;min-width:110px;background:#161b22;border:1px solid #21262d;
+    border-radius:8px;padding:10px 14px;text-align:center}
+.mc-label{font-size:.70rem;color:#8b949e;font-weight:600;text-transform:uppercase;
+          letter-spacing:.6px;margin-bottom:4px}
+.mc-value{font-size:1.55rem;font-weight:700;color:#f0f6fc;line-height:1.1}
+.mc-sub{font-size:.72rem;color:#8b949e;margin-top:3px}
+.mc-win .mc-value{color:#3fb950}
+.mc-loss .mc-value{color:#f85149}
+.mc-neutral .mc-value{color:#58a6ff}
+.mc-gold .mc-value{color:#ffd700}
+
+/* ── Scanner table ── */
+.scanner-hot td:first-child{border-left:3px solid #f85149!important}
+.scanner-warm td:first-child{border-left:3px solid #e3b341!important}
+.scanner-anchor td:first-child{border-left:3px solid #a371f7!important}
+
+/* ── Trade cards ── */
+.trade-card{background:#161b22;border:1px solid #21262d;border-radius:8px;
+            padding:12px 16px;margin-bottom:8px}
+.trade-card-long{border-left:4px solid #3fb950!important}
+.trade-card-short{border-left:4px solid #f85149!important}
+.tc-row{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px}
+.tc-asset{font-size:1rem;font-weight:700;color:#f0f6fc}
+.tc-dir-long{font-size:.78rem;background:rgba(63,185,80,.15);color:#3fb950;
+             padding:2px 8px;border-radius:12px;font-weight:600}
+.tc-dir-short{font-size:.78rem;background:rgba(248,81,73,.15);color:#f85149;
+              padding:2px 8px;border-radius:12px;font-weight:600}
+.tc-stat{font-size:.78rem;color:#8b949e}
+.tc-stat b{color:#f0f6fc}
+.tc-pnl-pos{color:#3fb950;font-weight:700;font-size:1rem}
+.tc-pnl-neg{color:#f85149;font-weight:700;font-size:1rem}
+.tc-badge-free{background:rgba(63,185,80,.12);color:#3fb950;border:1px solid rgba(63,185,80,.25);
+               padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:600}
+.tc-badge-risk{background:rgba(248,81,73,.12);color:#f85149;border:1px solid rgba(248,81,73,.25);
+               padding:2px 8px;border-radius:12px;font-size:.72rem;font-weight:600}
+
+/* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"]{gap:2px;border-bottom:1px solid #21262d!important;background:transparent}
+.stTabs [data-baseweb="tab"]{padding:8px 16px;background:transparent;color:#6e7681;
+                              font-size:.88rem;font-weight:500;border:none!important}
+.stTabs [aria-selected="true"]{background:rgba(88,166,255,.08)!important;color:#58a6ff!important;
+                                border-bottom:2px solid #58a6ff!important;border-radius:4px 4px 0 0}
+
+/* ── Sidebar ── */
 .health-ok{color:#3fb950;font-weight:600}.health-warn{color:#f0883e;font-weight:600}
-.countdown{font-size:.78rem;color:#8b949e;margin-top:3px}
-.stTabs [data-baseweb="tab-list"]{gap:3px;border-bottom:1px solid #2b303b}
-.stTabs [data-baseweb="tab"]{white-space:nowrap!important;padding:9px 18px;background:transparent;
-  color:#8b949e;font-size:.93rem;font-weight:500;border:none}
-.stTabs [aria-selected="true"]{background:rgba(88,166,255,.1)!important;color:#58a6ff!important;
-  border-bottom:3px solid #58a6ff!important;border-radius:6px 6px 0 0}
+.countdown{font-size:.76rem;color:#6e7681;margin-top:2px}
+
+/* ── Misc ── */
+div[data-testid="stDataFrame"]{border:1px solid #21262d;border-radius:6px;overflow:hidden}
+.section-title{font-size:.78rem;color:#6e7681;font-weight:600;text-transform:uppercase;
+               letter-spacing:.8px;margin:8px 0 6px;padding-bottom:4px;
+               border-bottom:1px solid #21262d}
 </style>""", unsafe_allow_html=True)
 
 
-# ==========================================
-# 1. CONFIG & DB
-# ==========================================
+# ── CONFIG & DB ───────────────────────────────────────────────────────────────
 try:
     TELEGRAM_TOKEN   = st.secrets["TELEGRAM_TOKEN"]
     TELEGRAM_CHAT_ID = st.secrets["TELEGRAM_CHAT_ID"]
@@ -114,7 +142,7 @@ INITIAL_CAPITAL    = 200_000.0
 TRADE_ALLOCATION   = 10_000.0
 
 
-def get_db_connection() -> sqlite3.Connection:
+def get_db_connection():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -134,10 +162,12 @@ def setup_database():
         c.execute('''CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, value TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS system_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
+        # market_status column added for all-18-assets visibility
         c.execute('''CREATE TABLE IF NOT EXISTS live_market_data (
             ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL,
             ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL,
-            htf_trend TEXT, vol_ratio REAL, adx REAL, atr REAL)''')
+            htf_trend TEXT, vol_ratio REAL, adx REAL, atr REAL,
+            market_status TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS blocked_signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT,
             timestamp TEXT, price REAL, adx REAL, htf_trend TEXT, vol_ratio REAL,
@@ -149,6 +179,7 @@ def setup_database():
             "ALTER TABLE trades ADD COLUMN adx REAL",
             "ALTER TABLE live_market_data ADD COLUMN adx REAL",
             "ALTER TABLE live_market_data ADD COLUMN atr REAL",
+            "ALTER TABLE live_market_data ADD COLUMN market_status TEXT",
         ]:
             try: c.execute(sql)
             except Exception: pass
@@ -157,7 +188,7 @@ def setup_database():
 
 setup_database()
 
-def _db_is_fresh() -> bool:
+def _db_is_fresh():
     try:
         with contextlib.closing(get_db_connection()) as conn:
             return conn.execute("SELECT count(*) FROM trades").fetchone()[0] == 0
@@ -167,14 +198,12 @@ def _db_is_fresh() -> bool:
 _FRESH_DB = _db_is_fresh()
 
 
-# ==========================================
-# 2. COMMUNICATION
-# ==========================================
-
-def send_telegram_alert(message: str, test_mode: bool = False):
-    if not TELEGRAM_TOKEN: return False if test_mode else None
+# ── COMMUNICATION ─────────────────────────────────────────────────────────────
+def send_telegram_alert(message, test_mode=False):
+    if not TELEGRAM_TOKEN:
+        return False if test_mode else None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message.replace("&","&amp;"), 'parse_mode':'HTML'}
+    payload = {'chat_id':TELEGRAM_CHAT_ID,'text':message.replace("&","&amp;"),'parse_mode':'HTML'}
     for _ in range(3):
         try:
             r = requests.post(url, data=payload, timeout=10)
@@ -191,25 +220,23 @@ def send_telegram_csv_backup():
         with contextlib.closing(get_db_connection()) as conn:
             dft = pd.read_sql_query("SELECT * FROM trades", conn)
             dfb = pd.read_sql_query("SELECT * FROM blocked_signals", conn)
-        ist_now  = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-        date_str = ist_now.strftime('%Y-%m-%d')
-        api_url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
+        ist = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+        ds  = ist.strftime('%Y-%m-%d')
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
         for df, lbl in [(dft,"Trades"),(dfb,"Blocked")]:
-            buf = io.BytesIO(); df.to_csv(buf, index=False); buf.seek(0)
+            buf = io.BytesIO(); df.to_csv(buf,index=False); buf.seek(0)
             try:
-                requests.post(api_url,
+                requests.post(url,
                     data={'chat_id':TELEGRAM_CHAT_ID,
-                          'caption':f"📊 <b>Daily Backup: {lbl}</b>\n{date_str}",'parse_mode':'HTML'},
-                    files={'document':(f"{lbl}_{date_str}.csv", buf,'text/csv')},timeout=20)
+                          'caption':f"📊 <b>Daily Backup: {lbl}</b>\n{ds}",'parse_mode':'HTML'},
+                    files={'document':(f"{lbl}_{ds}.csv",buf,'text/csv')},timeout=20)
             except Exception: pass
             del buf, df
             time.sleep(2)
     except Exception: pass
 
 
-# ==========================================
-# 3. WATCHLIST
-# ==========================================
+# ── WATCHLIST ─────────────────────────────────────────────────────────────────
 WATCHLIST = [
     {'name':'NIFTY 50',      'yf_symbol':'^NSEI',        'asset_class':'NSE'},
     {'name':'BANK NIFTY',    'yf_symbol':'^NSEBANK',     'asset_class':'NSE'},
@@ -232,17 +259,14 @@ WATCHLIST = [
 ]
 
 
-# ==========================================
-# 4. DATA ENGINE
-# ==========================================
+# ── DATA ENGINE ───────────────────────────────────────────────────────────────
 _api_lock = threading.Lock()
 
 
-def _yf_download(symbol: str, period: str) -> pd.DataFrame | None:
+def _yf_download(symbol, period):
     try:
         with _api_lock:
-            df = yf.download(symbol, interval="15m", period=period,
-                             progress=False, auto_adjust=True)
+            df = yf.download(symbol, interval="15m", period=period, progress=False, auto_adjust=True)
         if df is None or df.empty: return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -251,7 +275,7 @@ def _yf_download(symbol: str, period: str) -> pd.DataFrame | None:
         return None
 
 
-def _add_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
+def _add_indicators(df):
     try:
         if df.index.tz is not None:
             df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
@@ -271,7 +295,7 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
         df['ADX'] = _adx(df['High'], df['Low'], df['Close'], 14).ffill().fillna(0.0)
         if 'Volume' in df.columns:
             vm = df['Volume'].rolling(20).mean()
-            df['Vol_Ratio'] = np.where(vm > 0, df['Volume'] / vm, 1.0)
+            df['Vol_Ratio'] = np.where(vm > 0, df['Volume']/vm, 1.0)
             del vm
         else:
             df['Vol_Ratio'] = 1.0
@@ -281,98 +305,119 @@ def _add_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
         return None
 
 
-def fetch_and_analyze(item: dict) -> pd.DataFrame | None:
-    """15d fetch for signal engine — gives 94+ 1H bars for NSE, 360+ for crypto."""
+def fetch_and_analyze(item):
     df = _yf_download(item['yf_symbol'], '15d')
     return _add_indicators(df) if df is not None else None
 
 
 @st.cache_data(ttl=300)
-def get_chart_data(yf_symbol: str) -> pd.DataFrame | None:
-    """[R1] 5d-only chart fetch. Separate from 15d engine function. Cached 5 min."""
+def get_chart_data(yf_symbol):
     df = _yf_download(yf_symbol, '5d')
     return _add_indicators(df) if df is not None else None
 
 
-# ==========================================
-# 5. EXECUTION ENGINE
-# ==========================================
+# ── EXECUTION ENGINE ──────────────────────────────────────────────────────────
+def _is_signals_live(ac, ist_now):
+    """Returns True if market is open for signal processing."""
+    if ac == 'NSE':
+        m = ist_now.hour * 60 + ist_now.minute
+        return ist_now.weekday() < 5 and 555 <= m <= 935
+    elif ac == 'COMMODITY':
+        return not (ist_now.weekday() == 5 or (ist_now.weekday() == 6 and ist_now.hour < 3))
+    return True  # CRYPTO always live
 
-def process_market_data() -> bool:
+
+def process_market_data():
     if not _PROCESS_LOCK.acquire(blocking=False): return False
     try:
         with contextlib.closing(get_db_connection()) as conn:
             c = conn.cursor()
-            ist_now          = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-            slot_min         = (ist_now.minute // 5) * 5
-            scan_time_str    = ist_now.replace(minute=slot_min, second=0, microsecond=0
-                                   ).strftime("%Y-%m-%d %I:%M %p (IST)")
-            current_date_str = ist_now.strftime("%Y-%m-%d")
-            is_15m           = (slot_min % 15 == 0)
+            ist_now       = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+            slot_min      = (ist_now.minute // 5) * 5
+            scan_time_str = ist_now.replace(minute=slot_min,second=0,microsecond=0
+                                ).strftime("%Y-%m-%d %I:%M %p (IST)")
+            date_str      = ist_now.strftime("%Y-%m-%d")
+            is_15m        = (slot_min % 15 == 0)
 
             # Daily backup
             c.execute("SELECT value FROM system_status WHERE key='last_backup_date'")
             lbr = c.fetchone()
-            if (not lbr or lbr[0] != current_date_str) and ist_now.hour >= 23 and ist_now.minute >= 30:
+            if (not lbr or lbr[0] != date_str) and ist_now.hour >= 23 and ist_now.minute >= 30:
                 send_telegram_csv_backup()
-                c.execute("INSERT OR REPLACE INTO system_status VALUES('last_backup_date',?)", (current_date_str,))
+                c.execute("INSERT OR REPLACE INTO system_status VALUES('last_backup_date',?)", (date_str,))
                 conn.commit()
 
             for item in WATCHLIST:
                 name, ac = item['name'], item['asset_class']
 
-                # Market hours gate
-                market_open = True
-                if ac == 'NSE':
-                    m = ist_now.hour * 60 + ist_now.minute
-                    if ist_now.weekday() >= 5 or not (555 <= m <= 935): market_open = False
-                elif ac == 'COMMODITY':
-                    if ist_now.weekday() == 5 or (ist_now.weekday() == 6 and ist_now.hour < 3):
-                        market_open = False
-                if not market_open: continue
+                # Determine signal eligibility BEFORE fetching
+                signals_live = _is_signals_live(ac, ist_now)
 
                 c.execute("SELECT count(*) FROM trades WHERE ticker=? AND status='OPEN'", (name,))
                 otc = c.fetchone()[0]
                 c.execute("SELECT value FROM system_status WHERE key=?", (f"anchor_{name}",))
                 anc = c.fetchone()
-                if not is_15m and otc == 0 and not anc: continue
+
+                # [BUG-2 FIX] Smart Hunter gate — but on 15m we fetch ALL assets for heatmap
+                # Previously: if not market_open: continue  ← was blocking heatmap writes
+                # Now: skip only if (not 15m boundary) AND (no anchor) AND (no open trade)
+                if not is_15m and otc == 0 and not anc:
+                    continue
 
                 df = fetch_and_analyze(item)
                 time.sleep(_INTER_ASSET_SLEEP)
                 if df is None: continue
 
+                # Check data freshness
+                data_fresh = True
                 try:
                     if (ist_now.replace(tzinfo=None) - df.index[-1]).total_seconds() > 3600:
-                        del df; continue
-                except Exception: pass
+                        data_fresh = False
+                except Exception:
+                    data_fresh = False
+
+                # Market status label for heatmap
+                if ac == 'CRYPTO':
+                    mkt_status = "🔵 24/7"
+                elif signals_live and data_fresh:
+                    mkt_status = "🟢 LIVE"
+                else:
+                    mkt_status = "🔴 CLOSED"
 
                 curr, last, prev = df.iloc[-1], df.iloc[-2], df.iloc[-3]
 
-                # Update heatmap — includes ATR
-                c.execute("""INSERT OR REPLACE INTO live_market_data VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (
+                # Always update heatmap (all 18 assets visible)
+                c.execute("""INSERT OR REPLACE INTO live_market_data
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (
                     name, scan_time_str,
                     round(curr['Close'],2), round(curr['EMA5'],2), round(curr['EMA39'],2),
-                    "🟢 Bullish" if curr['EMA5']>curr['EMA39'] else "🔴 Bearish",
+                    "🟢 Bull" if curr['EMA5']>curr['EMA39'] else "🔴 Bear",
                     abs(curr['EMA5']-curr['EMA39'])/curr['EMA39']*100,
-                    "🟢 Bullish" if curr['Close']>curr['EMA39_1H'] else "🔴 Bearish",
+                    "🟢 Bull" if curr['Close']>curr['EMA39_1H'] else "🔴 Bear",
                     round(curr.get('Vol_Ratio',1.0),2),
                     round(curr.get('ADX',0.0),2),
-                    round(curr.get('ATR',0.0),4)))
+                    round(curr.get('ATR',0.0),4),
+                    mkt_status))
                 conn.commit()
+
+                # Signal processing only for live markets with fresh data
+                if not signals_live or not data_fresh:
+                    del df
+                    continue
 
                 # ── Open Trade Manager ────────────────────────────────────
                 if otc > 0:
                     c.execute("SELECT id,signal_type,sl,tp,entry_price,atr FROM trades WHERE ticker=? AND status='OPEN'", (name,))
                     for t_id, s_type, sl, tp, e_price, atr_val in c.fetchall():
-                        atr_val    = atr_val if (atr_val and atr_val > 0) else abs(tp-e_price)/3.75
-                        lp         = curr['Close']
-                        closed     = False
+                        atr_val = atr_val if (atr_val and atr_val > 0) else abs(tp-e_price)/3.75
+                        lp      = curr['Close']
+                        closed  = False
 
                         if s_type == 'long':
                             if lp >= tp:
-                                stxt = 'TP HIT (WIN)' if lp < (tp+atr_val) else 'TP HIT (GAP UP)'
+                                stxt = 'TP HIT (WIN)' if lp<(tp+atr_val) else 'TP HIT (GAP UP)'
                                 c.execute("UPDATE trades SET status=?,exit_time=?,exit_price=? WHERE id=?",
-                                          (stxt, scan_time_str, lp, t_id))
+                                          (stxt,scan_time_str,lp,t_id))
                                 send_telegram_alert(f"🎯 <b>{stxt}</b>\n{name} LONG @ {round(lp,2)}")
                                 closed = True
                             elif lp <= sl:
@@ -380,16 +425,15 @@ def process_market_data() -> bool:
                                         ('BREAK-EVEN (0 RISK)' if sl==e_price else 'SL HIT (LOSS)'))
                                 if lp < (sl-atr_val): stxt += ' (GAP DOWN)'
                                 c.execute("UPDATE trades SET status=?,exit_time=?,exit_price=? WHERE id=?",
-                                          (stxt, scan_time_str, lp, t_id))
+                                          (stxt,scan_time_str,lp,t_id))
                                 send_telegram_alert(f"🛑 <b>{stxt}</b>\n{name} LONG @ {round(lp,2)}")
                                 closed = True
-                            # [L1] 3-level progressive trail
                             if not closed:
                                 pr = (lp-e_price)/atr_val; sr = (sl-e_price)/atr_val
                                 nsl = nlbl = None
-                                if   pr >= 3.0 and sr < 2.0: nsl,nlbl = round(e_price+2.0*atr_val,2), "+3R → SL to +2R"
-                                elif pr >= 2.0 and sr < 1.0: nsl,nlbl = round(e_price+1.0*atr_val,2), "+2R → SL to +1R"
-                                elif pr >= 1.0 and sr < 0.25:nsl,nlbl = round(e_price+0.25*atr_val,2),"+1R → SL to BE+0.25R"
+                                if   pr>=3.0 and sr<2.0:  nsl,nlbl = round(e_price+2.0*atr_val,2),"+3R→SL+2R"
+                                elif pr>=2.0 and sr<1.0:  nsl,nlbl = round(e_price+1.0*atr_val,2),"+2R→SL+1R"
+                                elif pr>=1.0 and sr<0.25: nsl,nlbl = round(e_price+0.25*atr_val,2),"+1R→BE+0.25R"
                                 if nsl:
                                     c.execute("UPDATE trades SET sl=? WHERE id=?",(nsl,t_id))
                                     send_telegram_alert(f"🛡️ <b>TRAIL: {name}</b>\n{nlbl} → SL: {nsl}")
@@ -398,7 +442,7 @@ def process_market_data() -> bool:
                             if lp <= tp:
                                 stxt = 'TP HIT (WIN)' if lp>(tp-atr_val) else 'TP HIT (GAP DOWN)'
                                 c.execute("UPDATE trades SET status=?,exit_time=?,exit_price=? WHERE id=?",
-                                          (stxt, scan_time_str, lp, t_id))
+                                          (stxt,scan_time_str,lp,t_id))
                                 send_telegram_alert(f"🎯 <b>{stxt}</b>\n{name} SHORT @ {round(lp,2)}")
                                 closed = True
                             elif lp >= sl:
@@ -406,27 +450,25 @@ def process_market_data() -> bool:
                                         ('BREAK-EVEN (0 RISK)' if sl==e_price else 'SL HIT (LOSS)'))
                                 if lp > (sl+atr_val): stxt += ' (GAP UP)'
                                 c.execute("UPDATE trades SET status=?,exit_time=?,exit_price=? WHERE id=?",
-                                          (stxt, scan_time_str, lp, t_id))
+                                          (stxt,scan_time_str,lp,t_id))
                                 send_telegram_alert(f"🛑 <b>{stxt}</b>\n{name} SHORT @ {round(lp,2)}")
                                 closed = True
-                            # [L1] 3-level progressive trail
                             if not closed:
                                 pr = (e_price-lp)/atr_val; sr = (e_price-sl)/atr_val
                                 nsl = nlbl = None
-                                if   pr >= 3.0 and sr < 2.0: nsl,nlbl = round(e_price-2.0*atr_val,2), "+3R → SL to +2R"
-                                elif pr >= 2.0 and sr < 1.0: nsl,nlbl = round(e_price-1.0*atr_val,2), "+2R → SL to +1R"
-                                elif pr >= 1.0 and sr < 0.25:nsl,nlbl = round(e_price-0.25*atr_val,2),"+1R → SL to BE+0.25R"
+                                if   pr>=3.0 and sr<2.0:  nsl,nlbl = round(e_price-2.0*atr_val,2),"+3R→SL+2R"
+                                elif pr>=2.0 and sr<1.0:  nsl,nlbl = round(e_price-1.0*atr_val,2),"+2R→SL+1R"
+                                elif pr>=1.0 and sr<0.25: nsl,nlbl = round(e_price-0.25*atr_val,2),"+1R→BE+0.25R"
                                 if nsl:
                                     c.execute("UPDATE trades SET sl=? WHERE id=?",(nsl,t_id))
                                     send_telegram_alert(f"🛡️ <b>TRAIL: {name}</b>\n{nlbl} → SL: {nsl}")
                     conn.commit()
 
                 # ── Anchor Logic ──────────────────────────────────────────
-                # [L4] Round to 15min for stable dedup
                 signal_id = str(last.name.round('15min')) if hasattr(last.name,'round') else str(last.name)
 
                 if not anc and is_15m:
-                    c.execute("SELECT value FROM system_status WHERE key=?", (f"proc_{name}",))
+                    c.execute("SELECT value FROM system_status WHERE key=?",(f"proc_{name}",))
                     proc = c.fetchone()
                     if not proc or proc[0] != signal_id:
                         is_long  = (prev['EMA5']<=prev['EMA39']) and (last['EMA5']>last['EMA39'])
@@ -437,7 +479,7 @@ def process_market_data() -> bool:
                                             ).strftime("%Y-%m-%d %H:%M:%S")
                             anc_val   = f"{st_str}|{direction}|{last['ATR']}|{signal_id}"
                             c.execute("INSERT OR REPLACE INTO system_status VALUES(?,?)",
-                                      (f"anchor_{name}", anc_val))
+                                      (f"anchor_{name}",anc_val))
                             conn.commit()
                             anc = (anc_val,)
 
@@ -445,42 +487,35 @@ def process_market_data() -> bool:
                 if anc:
                     ad = anc[0].split('|')
                     if len(ad) == 4:
-                        a_start = datetime.strptime(ad[0], "%Y-%m-%d %H:%M:%S")
-                        a_dir, a_atr, a_sid = ad[1], float(ad[2]), ad[3]
+                        a_start = datetime.strptime(ad[0],"%Y-%m-%d %H:%M:%S")
+                        a_dir,a_atr,a_sid = ad[1],float(ad[2]),ad[3]
                         me = (ist_now.replace(tzinfo=None)-a_start).total_seconds()/60.0
 
                         if me <= 16.0:
-                            evc   = last if me >= 14.0 else curr
+                            evc   = last if me>=14.0 else curr
                             p_adx = prev.get('ADX',0.0) if me>=14.0 else last.get('ADX',0.0)
                             l_adx = evc.get('ADX',0.0)
                             l_vol = evc.get('Vol_Ratio',1.0)
-                            l_htf = "🟢 Bullish" if evc['Close']>evc['EMA39_1H'] else "🔴 Bearish"
-                            r_htf = "🟢 Bullish" if a_dir=="LONG" else "🔴 Bearish"
-
+                            l_htf = "🟢 Bull" if evc['Close']>evc['EMA39_1H'] else "🔴 Bear"
+                            r_htf = "🟢 Bull" if a_dir=="LONG" else "🔴 Bear"
                             rej = []
 
-                            # [L5] Post-loss cooldown
+                            # Post-loss cooldown
                             c.execute("""SELECT status,exit_time FROM trades
-                                WHERE ticker=? AND status NOT LIKE 'OPEN' ORDER BY id DESC LIMIT 1""", (name,))
+                                WHERE ticker=? AND status NOT LIKE 'OPEN' ORDER BY id DESC LIMIT 1""",(name,))
                             lt = c.fetchone()
                             if lt and lt[0] and lt[1] and ('LOSS' in str(lt[0]) or 'SL HIT' in str(lt[0])):
                                 try:
-                                    dt_exit = datetime.strptime(lt[1], "%Y-%m-%d %I:%M %p (IST)")
-                                    msince  = (ist_now.replace(tzinfo=None)-dt_exit).total_seconds()/60
-                                    if msince < 15: rej.append(f"Post-loss cooldown ({int(15-msince)}m left).")
+                                    msince = (ist_now.replace(tzinfo=None)-datetime.strptime(lt[1],"%Y-%m-%d %I:%M %p (IST)")).total_seconds()/60
+                                    if msince < 15: rej.append(f"Post-loss cooldown ({int(15-msince)}m).")
                                 except Exception: pass
 
                             if otc > 0: rej.append("Active trade open.")
-
-                            # [L2] ADX: require 1-point drop minimum
                             if l_adx <= 20.0:
                                 rej.append(f"Weak Trend (ADX {round(l_adx,1)} ≤ 20).")
                             elif l_adx < (p_adx - 1.0):
-                                rej.append(f"Falling Momentum (ADX {round(l_adx,1)} ↓ from {round(p_adx,1)}).")
-
-                            # [L3] Volume filter
-                            if l_vol < 0.8: rej.append(f"Low Volume ({round(l_vol,2)}x < 0.8x avg).")
-
+                                rej.append(f"Falling Momentum (ADX {round(l_adx,1)} ↓ {round(p_adx,1)}).")
+                            if l_vol < 0.8: rej.append(f"Low Volume ({round(l_vol,2)}x).")
                             if abs(evc['EMA5']-evc['EMA39']) < (0.15*a_atr): rej.append("EMAs Tangled.")
                             if l_htf != r_htf: rej.append(f"1H Conflict ({l_htf}).")
                             if abs(evc['Close']-evc['EMA39']) > (2.5*a_atr): rej.append("Overextended.")
@@ -528,22 +563,18 @@ def process_market_data() -> bool:
     return True
 
 
-# ==========================================
-# 6. BACKGROUND DAEMON
-# ==========================================
-
-def _sleep_to_next_5m() -> float:
-    now   = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-    ns    = ((now.minute // 5) + 1) * 5
-    nxt   = (now.replace(minute=0, second=2, microsecond=0)+timedelta(hours=1)
-             if ns >= 60 else now.replace(minute=ns, second=2, microsecond=0))
-    return max((nxt - now).total_seconds(), 10.0)
+# ── BACKGROUND DAEMON ─────────────────────────────────────────────────────────
+def _sleep_to_next_5m():
+    now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    ns  = ((now.minute//5)+1)*5
+    nxt = (now.replace(minute=0,second=2,microsecond=0)+timedelta(hours=1)
+           if ns>=60 else now.replace(minute=ns,second=2,microsecond=0))
+    return max((nxt-now).total_seconds(), 10.0)
 
 
 @st.cache_resource
-def _start_background_scanner() -> dict:
-    health = {"last_run_ts":None, "run_count":0, "last_error":None, "next_run_secs":0}
-
+def _start_background_scanner():
+    health = {"last_run_ts":None,"run_count":0,"last_error":None,"next_run_secs":0}
     def _loop():
         while True:
             secs = _sleep_to_next_5m()
@@ -560,10 +591,9 @@ def _start_background_scanner() -> dict:
                 try:
                     with contextlib.closing(get_db_connection()) as conn:
                         conn.execute("INSERT INTO system_logs(timestamp,message) VALUES(?,?)",
-                                     (str(datetime.now()), f"DAEMON: {e}"))
+                                     (str(datetime.now()),f"DAEMON: {e}"))
                         conn.commit()
                 except Exception: pass
-
     threading.Thread(target=_loop, daemon=True, name="AlgoDaemon").start()
     return health
 
@@ -571,305 +601,504 @@ def _start_background_scanner() -> dict:
 _daemon_health = _start_background_scanner()
 
 
-# ==========================================
-# 7. UI HELPERS
-# ==========================================
-
-def _db_query(sql: str, params=()) -> pd.DataFrame:
+# ── UI HELPERS ────────────────────────────────────────────────────────────────
+def _db_query(sql, params=()):
     with contextlib.closing(get_db_connection()) as c:
         return pd.read_sql_query(sql, c, params=params)
 
-def _db_scalar(sql: str, params=()):
+def _db_scalar(sql, params=()):
     with contextlib.closing(get_db_connection()) as conn:
         row = conn.execute(sql, params).fetchone()
         return row[0] if row else None
 
-def _dyn_height(n: int, rpx: int = 36, hdr: int = 40, lo: int = 80, hi: int = 560) -> int:
-    """[R2] Dynamic height: avoids 600px tables for 2 rows."""
-    return min(max(hdr + n * rpx, lo), hi)
+def _dyn_height(n, rpx=34, hdr=38, lo=80, hi=520):
+    return min(max(hdr + n*rpx, lo), hi)
+
+def _fmt_pnl(v):
+    sign = "+" if v >= 0 else ""
+    return f"{sign}₹{v:,.0f}"
 
 
-# ==========================================
-# 8. DASHBOARD RENDER
-# ==========================================
+# ── KEEP-ALIVE ────────────────────────────────────────────────────────────────
 st_autorefresh(interval=60_000, limit=None, key="keepalive")
 
-if _FRESH_DB:
-    st.warning("⚠️ **Empty database detected.** Use **Restore Database** in the sidebar "
-               "with your latest backup CSV to recover trade history.", icon="🗄️")
 
-# ── SIDEBAR ──────────────────────────────────────────────────────────────────
-st.sidebar.markdown("<h3>⚙️ Control Panel</h3>", unsafe_allow_html=True)
+# ── SIDEBAR ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Control Panel")
 
-rc2  = _daemon_health.get("run_count", 0)
-lerr = _daemon_health.get("last_error")
-nsec = _daemon_health.get("next_run_secs", 0)
+    rc2  = _daemon_health.get("run_count", 0)
+    lerr = _daemon_health.get("last_error")
+    nsec = _daemon_health.get("next_run_secs", 0)
 
-if lerr is None:
-    st.sidebar.markdown(f'<span class="health-ok">✅ Daemon LIVE</span> — {rc2} cycles',
-                        unsafe_allow_html=True)
-else:
-    st.sidebar.markdown(f'<span class="health-warn">⚠️ {str(lerr)[:55]}</span>', unsafe_allow_html=True)
-
-ls = _db_scalar("SELECT value FROM system_status WHERE key='last_scan'")
-st.sidebar.info(f"⏱️ **Last Sync:** {ls or 'Initializing...'}")
-if nsec > 0:
-    st.sidebar.markdown(f'<div class="countdown">⏳ Next scan in ~{nsec}s</div>', unsafe_allow_html=True)
-
-if st.sidebar.button("🔄 Force Manual Sync"):
-    if _PROCESS_LOCK.locked():
-        st.sidebar.warning("⏳ Daemon running. Wait.")
+    if lerr is None:
+        st.markdown(f'<span class="health-ok">✅ Daemon LIVE</span> — {rc2} cycles',
+                    unsafe_allow_html=True)
     else:
-        with st.spinner("Syncing..."): process_market_data()
-        st.rerun()
+        st.markdown(f'<span class="health-warn">⚠️ {str(lerr)[:55]}</span>', unsafe_allow_html=True)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("<h3>🛡️ Backup & Restore</h3>", unsafe_allow_html=True)
-ca, cb = st.sidebar.columns(2)
-try:
-    with ca: st.download_button("⬇️ Trades",
-                _db_query("SELECT * FROM trades").to_csv(index=False).encode(),
-                f"Trades_{datetime.now().strftime('%Y-%m-%d')}.csv","text/csv")
-    with cb: st.download_button("⬇️ Blocked",
-                _db_query("SELECT * FROM blocked_signals").to_csv(index=False).encode(),
-                f"Blocked_{datetime.now().strftime('%Y-%m-%d')}.csv","text/csv")
-except Exception: pass
+    ls = _db_scalar("SELECT value FROM system_status WHERE key='last_scan'")
+    st.caption(f"Last sync: {ls or 'Initializing...'}")
+    if nsec > 0:
+        st.markdown(f'<div class="countdown">⏳ Next scan in ~{nsec}s</div>', unsafe_allow_html=True)
 
-st.sidebar.markdown("<b>Restore (Upload CSV)</b>", unsafe_allow_html=True)
-uf = st.sidebar.file_uploader("Upload CSV", type=None, label_visibility="collapsed")
-if uf is not None and st.sidebar.button("⚙️ Execute Auto-Restore"):
+    if st.button("🔄 Force Sync"):
+        if _PROCESS_LOCK.locked():
+            st.warning("Daemon running — wait.")
+        else:
+            with st.spinner("Syncing..."): process_market_data()
+            st.rerun()
+
+    st.divider()
+    st.markdown("### 🛡️ Backup & Restore")
+
+    ca, cb = st.columns(2)
     try:
-        rdf  = pd.read_csv(uf)
-        rcol = rdf.columns.tolist()
-        with contextlib.closing(get_db_connection()) as rc:
-            cur = rc.cursor()
-            if 'entry_time' in rcol or 'Entry Time' in rcol:
-                rmap = {'Asset':'ticker','Signal':'signal_type','Entry Time':'entry_time',
-                        'Entry':'entry_price','SL':'sl','TP':'tp','ATR':'atr','ADX':'adx',
-                        'Status':'status','Exit Time':'exit_time','Exit Price':'exit_price',
-                        '1H Trend':'htf_trend','Vol (x)':'vol_ratio'}
-                rdf = rdf.rename(columns=rmap).fillna({'exit_time':'','exit_price':0.0,
-                        'htf_trend':'','vol_ratio':1.0,'atr':0.0,'adx':0.0})
-                for _, row in rdf.iterrows():
-                    cur.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?",(row['ticker'],row['entry_time']))
-                    if not cur.fetchone():
-                        cur.execute("""INSERT INTO trades(ticker,signal_type,entry_time,entry_price,sl,tp,
-                            status,exit_time,exit_price,htf_trend,vol_ratio,atr,adx) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                            tuple(row[k] for k in ['ticker','signal_type','entry_time','entry_price','sl','tp',
-                                  'status','exit_time','exit_price','htf_trend','vol_ratio','atr','adx']))
-                rc.commit()
-                st.sidebar.success("✅ Trades Restored!")
-            elif 'rejection_reasons' in rcol or 'Rejection Reasons' in rcol:
-                rmap = {'Asset':'ticker','Signal':'signal_type','Time (IST)':'timestamp',
-                        'Price':'price','ADX':'adx','1H Trend':'htf_trend',
-                        'Vol (x)':'vol_ratio','Rejection Reasons':'rejection_reasons'}
-                rdf = rdf.rename(columns=rmap).fillna({'adx':0.0,'htf_trend':'','vol_ratio':1.0,'rejection_reasons':''})
-                for _, row in rdf.iterrows():
-                    cur.execute("SELECT id FROM blocked_signals WHERE ticker=? AND timestamp=?",(row['ticker'],row['timestamp']))
-                    if not cur.fetchone():
-                        cur.execute("""INSERT INTO blocked_signals(ticker,signal_type,timestamp,price,
-                            adx,htf_trend,vol_ratio,rejection_reasons) VALUES(?,?,?,?,?,?,?,?)""",
-                            tuple(row[k] for k in ['ticker','signal_type','timestamp','price',
-                                  'adx','htf_trend','vol_ratio','rejection_reasons']))
-                rc.commit()
-                st.sidebar.success("✅ Blocked Signals Restored!")
-            else:
-                st.sidebar.error("❌ Unrecognized CSV format.")
-        time.sleep(1); st.rerun()
-    except Exception as e:
-        st.sidebar.error(f"Restore failed: {e}")
+        with ca:
+            st.download_button("⬇️ Trades",
+                _db_query("SELECT * FROM trades").to_csv(index=False).encode(),
+                f"Trades_{datetime.now().strftime('%Y-%m-%d')}.csv","text/csv",
+                use_container_width=True)
+        with cb:
+            st.download_button("⬇️ Blocked",
+                _db_query("SELECT * FROM blocked_signals").to_csv(index=False).encode(),
+                f"Blocked_{datetime.now().strftime('%Y-%m-%d')}.csv","text/csv",
+                use_container_width=True)
+    except Exception: pass
 
-st.sidebar.markdown("---")
-if st.sidebar.button("🔔 Test Telegram"):
-    ok = send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>", test_mode=True)
-    st.sidebar.success("✅ Sent!") if ok else st.sidebar.error("❌ Failed. Check secrets.")
+    uf = st.file_uploader("Restore CSV", type=None, label_visibility="visible")
+    if uf is not None:
+        if st.button("⚙️ Execute Restore", use_container_width=True):
+            try:
+                rdf  = pd.read_csv(uf)
+                rcol = rdf.columns.tolist()
+                with contextlib.closing(get_db_connection()) as rc:
+                    cur = rc.cursor()
+                    if 'entry_time' in rcol or 'Entry Time' in rcol:
+                        rmap = {'Asset':'ticker','Signal':'signal_type','Entry Time':'entry_time',
+                                'Entry':'entry_price','SL':'sl','TP':'tp','ATR':'atr','ADX':'adx',
+                                'Status':'status','Exit Time':'exit_time','Exit Price':'exit_price',
+                                '1H Trend':'htf_trend','Vol (x)':'vol_ratio'}
+                        rdf = rdf.rename(columns=rmap).fillna({'exit_time':'','exit_price':0.0,
+                                'htf_trend':'','vol_ratio':1.0,'atr':0.0,'adx':0.0})
+                        for _, row in rdf.iterrows():
+                            cur.execute("SELECT id FROM trades WHERE ticker=? AND entry_time=?",
+                                        (row['ticker'],row['entry_time']))
+                            if not cur.fetchone():
+                                cur.execute("""INSERT INTO trades(ticker,signal_type,entry_time,entry_price,sl,tp,
+                                    status,exit_time,exit_price,htf_trend,vol_ratio,atr,adx) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    tuple(row[k] for k in ['ticker','signal_type','entry_time','entry_price','sl','tp',
+                                          'status','exit_time','exit_price','htf_trend','vol_ratio','atr','adx']))
+                        rc.commit()
+                        st.success("✅ Trades restored!")
+                    elif 'rejection_reasons' in rcol or 'Rejection Reasons' in rcol:
+                        rmap = {'Asset':'ticker','Signal':'signal_type','Time (IST)':'timestamp',
+                                'Price':'price','ADX':'adx','1H Trend':'htf_trend',
+                                'Vol (x)':'vol_ratio','Rejection Reasons':'rejection_reasons'}
+                        rdf = rdf.rename(columns=rmap).fillna({'adx':0.0,'htf_trend':'','vol_ratio':1.0,'rejection_reasons':''})
+                        for _, row in rdf.iterrows():
+                            cur.execute("SELECT id FROM blocked_signals WHERE ticker=? AND timestamp=?",
+                                        (row['ticker'],row['timestamp']))
+                            if not cur.fetchone():
+                                cur.execute("""INSERT INTO blocked_signals(ticker,signal_type,timestamp,price,
+                                    adx,htf_trend,vol_ratio,rejection_reasons) VALUES(?,?,?,?,?,?,?,?)""",
+                                    tuple(row[k] for k in ['ticker','signal_type','timestamp','price',
+                                          'adx','htf_trend','vol_ratio','rejection_reasons']))
+                        rc.commit()
+                        st.success("✅ Blocked signals restored!")
+                    else:
+                        st.error("❌ Unrecognized CSV format.")
+                time.sleep(1); st.rerun()
+            except Exception as e:
+                st.error(f"Restore failed: {e}")
+
+    st.divider()
+    # [BUG-1 FIX] Use proper if/else, not ternary
+    if st.button("🔔 Test Telegram", use_container_width=True):
+        ok = send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>", test_mode=True)
+        if ok:
+            st.success("✅ Ping sent!")
+        else:
+            st.error("❌ Failed. Check TELEGRAM_TOKEN in secrets.")
 
 
 # ── MAIN BODY ─────────────────────────────────────────────────────────────────
+
+if _FRESH_DB:
+    st.warning("⚠️ **Empty database.** Restore from backup using the sidebar.", icon="🗄️")
+
+# ── HEADER ────────────────────────────────────────────────────────────────────
+ist_now_ui = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+time_str   = ist_now_ui.strftime("%d %b %Y  %H:%M IST")
+
+hcol1, hcol2 = st.columns([3, 1])
+with hcol1:
+    st.markdown(
+        "<h2 style='margin:0;background:-webkit-linear-gradient(45deg,#ffd700,#f0883e);"
+        "-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-size:1.5rem'>"
+        "⚡ ALGO ENGINE TERMINAL</h2>", unsafe_allow_html=True)
+with hcol2:
+    st.markdown(f"<p style='text-align:right;color:#6e7681;font-size:.8rem;margin:6px 0 0'>{time_str}</p>",
+                unsafe_allow_html=True)
+
+# ── SESSION STATUS BAR ────────────────────────────────────────────────────────
+m_now = ist_now_ui.hour * 60 + ist_now_ui.minute
+wd    = ist_now_ui.weekday()
+nse_live  = wd < 5 and 555 <= m_now <= 935
+mcx_live  = wd < 5 and 570 <= m_now <= 1410  # MCX: 09:30-23:30 IST weekdays
+cme_live  = wd != 5 and not (wd == 6 and ist_now_ui.hour < 3)
+
+nse_cls  = "sess-live" if nse_live else "sess-closed"
+mcx_cls  = "sess-live" if mcx_live else "sess-closed"
+cme_cls  = "sess-live" if cme_live else "sess-closed"
+
+st.markdown(f"""<div class="sess-bar">
+  <span class="sess {nse_cls}">{'🟢' if nse_live else '🔴'} NSE {'09:15–15:30' if nse_live else 'CLOSED'}</span>
+  <span class="sess {mcx_cls}">{'🟢' if mcx_live else '🔴'} MCX {'LIVE' if mcx_live else 'CLOSED'}</span>
+  <span class="sess {cme_cls}">{'🟢' if cme_live else '🔴'} COMEX {'LIVE' if cme_live else 'CLOSED'}</span>
+  <span class="sess sess-always">🔵 CRYPTO 24/7</span>
+</div>""", unsafe_allow_html=True)
+
+
+# ── DATA LOAD ─────────────────────────────────────────────────────────────────
 try:
     live_df    = _db_query(
-        "SELECT ticker as Asset, close_price as Price, distance_pct as '% Gap', "
-        "atr as ATR, trend as '15m Trend', htf_trend as '1H Trend', "
-        "vol_ratio as 'Vol (x)', adx as ADX, last_update as 'Updated (IST)' "
-        "FROM live_market_data ORDER BY distance_pct ASC")
+        "SELECT ticker as Asset, market_status as Status, close_price as Price, "
+        "distance_pct as '% Gap', atr as ATR, trend as '15m', htf_trend as '1H', "
+        "adx as ADX, vol_ratio as 'Vol', last_update as Updated "
+        "FROM live_market_data ORDER BY "
+        "CASE WHEN market_status LIKE '%LIVE%' OR market_status LIKE '%24/7%' THEN 0 ELSE 1 END, "
+        "distance_pct ASC")
     history_df = _db_query("SELECT * FROM trades WHERE status!='OPEN' ORDER BY id DESC LIMIT 100")
-    open_df_ui = _db_query("SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC")
+    open_df    = _db_query("SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC")
+    # Active anchors for scanner highlight
+    anc_df     = _db_query("SELECT key FROM system_status WHERE key LIKE 'anchor_%'")
+    active_anchors = set(k.replace('anchor_','') for k in anc_df['key'].tolist()) if not anc_df.empty else set()
 except Exception:
-    live_df = history_df = open_df_ui = pd.DataFrame()
+    live_df = history_df = open_df = pd.DataFrame()
+    active_anchors = set()
 
-# PnL
+# ── PNL CALCS ─────────────────────────────────────────────────────────────────
 realized_pnl = 0.0
 if not history_df.empty:
     history_df['Yield'] = np.where(
         history_df['signal_type'].str.lower()=='long',
         (history_df['exit_price']-history_df['entry_price'])/history_df['entry_price'],
         (history_df['entry_price']-history_df['exit_price'])/history_df['entry_price'])
-    history_df['PnL (₹)'] = history_df['Yield'] * TRADE_ALLOCATION
-    bm = history_df['status'].str.contains('BREAK-EVEN',na=False) & ~history_df['status'].str.contains('TP|WIN',na=False)
-    history_df.loc[bm,'PnL (₹)'] = 0.0
-    realized_pnl = history_df['PnL (₹)'].sum()
+    history_df['PnL'] = history_df['Yield'] * TRADE_ALLOCATION
+    bm = (history_df['status'].str.contains('BREAK-EVEN',na=False) &
+          ~history_df['status'].str.contains('TP|WIN',na=False))
+    history_df.loc[bm,'PnL'] = 0.0
+    realized_pnl = history_df['PnL'].sum()
 
-total_unrealized_pnl = 0.0
-if not open_df_ui.empty and not live_df.empty:
-    open_df_ui = pd.merge(open_df_ui, live_df[['Asset','Price']].rename(columns={'Price':'Latest Price'}),
-                          left_on='ticker', right_on='Asset', how='left')
-    open_df_ui['Yield'] = np.where(
-        open_df_ui['signal_type'].str.lower()=='long',
-        (open_df_ui['Latest Price']-open_df_ui['entry_price'])/open_df_ui['entry_price'],
-        (open_df_ui['entry_price']-open_df_ui['Latest Price'])/open_df_ui['entry_price'])
-    open_df_ui['Unrlzd PnL (₹)'] = (open_df_ui['Yield']*TRADE_ALLOCATION).round(2)
-    total_unrealized_pnl = open_df_ui['Unrlzd PnL (₹)'].sum()
-
-    def _tin(s):  # [U4] time in trade
-        try:
-            m = (datetime.now()-datetime.strptime(s,"%Y-%m-%d %I:%M %p (IST)")).total_seconds()/60
-            return f"{int(m//60)}h{int(m%60)}m" if m>=60 else f"{int(m)}m"
-        except: return "—"
-    def _dpct(row, col):  # [U4] distance to level
-        try: return f"{abs((row[col]-row['Latest Price'])/row['Latest Price']*100):.1f}%"
-        except: return "—"
-
-    open_df_ui['Time In'] = open_df_ui['entry_time'].apply(_tin)
-    open_df_ui['→ SL']    = open_df_ui.apply(lambda r: _dpct(r,'sl'), axis=1)
-    open_df_ui['→ TP']    = open_df_ui.apply(lambda r: _dpct(r,'tp'), axis=1)
-    open_df_ui['Status']  = np.where(
-        ((open_df_ui['signal_type'].str.lower()=='long')  & (open_df_ui['sl']>=open_df_ui['entry_price'])) |
-        ((open_df_ui['signal_type'].str.lower()=='short') & (open_df_ui['sl']<=open_df_ui['entry_price'])),
+total_unrealized = 0.0
+if not open_df.empty and not live_df.empty:
+    price_map = live_df.set_index('Asset')['Price'].to_dict()
+    open_df['LivePrice'] = open_df['ticker'].map(price_map)
+    open_df['Yield'] = np.where(
+        open_df['signal_type'].str.lower()=='long',
+        (open_df['LivePrice']-open_df['entry_price'])/open_df['entry_price'],
+        (open_df['entry_price']-open_df['LivePrice'])/open_df['entry_price'])
+    open_df['Unrlzd PnL'] = (open_df['Yield']*TRADE_ALLOCATION).round(2)
+    total_unrealized = open_df['Unrlzd PnL'].sum()
+    open_df['Risk'] = np.where(
+        ((open_df['signal_type'].str.lower()=='long')  & (open_df['sl']>=open_df['entry_price'])) |
+        ((open_df['signal_type'].str.lower()=='short') & (open_df['sl']<=open_df['entry_price'])),
         '🛡️ FREE','⚠️ RISK')
 
-# Counts & stats
-tc   = len(history_df)
-wc   = len(history_df[history_df['status'].str.contains('TP|WIN',na=False)]) if tc else 0
-bc   = len(history_df[history_df['status'].str.contains('BREAK-EVEN',na=False) &
-           ~history_df['status'].str.contains('TP|WIN',na=False)]) if tc else 0
-lc   = len(history_df[history_df['status'].str.contains('LOSS|SL HIT',na=False)]) if tc else 0
-rf   = len(open_df_ui[open_df_ui['Status']=='🛡️ FREE']) if not open_df_ui.empty else 0
-dec  = wc + lc
-wr   = f"{wc/dec*100:.0f}%" if dec else "—"
+    def _tin(s):
+        try:
+            m = (datetime.now()-datetime.strptime(s,"%Y-%m-%d %I:%M %p (IST)")).total_seconds()/60
+            return f"{int(m//60)}h {int(m%60)}m" if m>=60 else f"{int(m)}m"
+        except: return "—"
+    def _dpct(row, col):
+        try: return f"{abs((row[col]-row['LivePrice'])/row['LivePrice']*100):.1f}%"
+        except: return "—"
+
+    open_df['Time In'] = open_df['entry_time'].apply(_tin)
+    open_df['→ SL']    = open_df.apply(lambda r: _dpct(r,'sl'), axis=1)
+    open_df['→ TP']    = open_df.apply(lambda r: _dpct(r,'tp'), axis=1)
+
+# ── STATS ─────────────────────────────────────────────────────────────────────
+tc  = len(history_df)
+wc  = len(history_df[history_df['status'].str.contains('TP|WIN',na=False)]) if tc else 0
+bc  = len(history_df[history_df['status'].str.contains('BREAK-EVEN',na=False) &
+         ~history_df['status'].str.contains('TP|WIN',na=False)]) if tc else 0
+lc  = len(history_df[history_df['status'].str.contains('LOSS|SL HIT',na=False)]) if tc else 0
+dec = wc + lc
+wr  = f"{wc/dec*100:.0f}%" if dec else "—"
+
 if dec:
-    aw = history_df[history_df['status'].str.contains('TP|WIN',na=False)]['PnL (₹)'].mean() if wc else 0
-    al = history_df[history_df['status'].str.contains('LOSS|SL HIT',na=False)]['PnL (₹)'].mean() if lc else 0
-    exp_str = f"₹{(wc/dec*aw + lc/dec*al):,.0f}/trade"
+    aw  = history_df[history_df['status'].str.contains('TP|WIN',na=False)]['PnL'].mean() if wc else 0
+    al  = history_df[history_df['status'].str.contains('LOSS|SL HIT',na=False)]['PnL'].mean() if lc else 0
+    exp = f"₹{(wc/dec*aw + lc/dec*al):,.0f}"
 else:
-    exp_str = "—"
+    exp = "—"
 
-pc  = 'color-win' if realized_pnl >= 0 else 'color-loss'
-upc = 'color-win' if total_unrealized_pnl >= 0 else 'color-loss'
+oc    = len(open_df)
+rf    = len(open_df[open_df['Risk']=='🛡️ FREE']) if not open_df.empty else 0
+eq    = INITIAL_CAPITAL + realized_pnl
+pnl_c = "#3fb950" if realized_pnl >= 0 else "#f85149"
+upnl_c= "#3fb950" if total_unrealized >= 0 else "#f85149"
 
-st.markdown("<h1 style='background:-webkit-linear-gradient(45deg,#ffd700,#ffaa00);"
-            "-webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px'>"
-            "⚡ Algo Engine by Vinayak</h1>", unsafe_allow_html=True)
-
-st.markdown(f"""
-<table class="metrics-matrix">
-<tr><th></th><th>Total</th><th>Win</th><th>Break Even</th><th>Loss</th><th>Win Rate</th><th>Expectancy</th></tr>
-<tr>
-  <td class="row-title">CLOSED TRADES</td>
-  <td class="val">{tc}</td><td class="val color-win">{wc}</td>
-  <td class="val color-be">{bc}</td><td class="val color-loss">{lc}</td>
-  <td class="val color-win">{wr}</td>
-  <td class="val" style="font-size:1.05rem">{exp_str}</td>
-</tr>
-<tr>
-  <td class="row-title" style="border-bottom:2px solid #2b303b">CAPITAL & PNL</td>
-  <td class="val" style="border-bottom:2px solid #2b303b;font-size:1.05rem">₹{INITIAL_CAPITAL:,.0f}</td>
-  <td colspan="5" class="pct" style="border-bottom:2px solid #2b303b;text-align:left;padding-left:16px">
-    Realized: <b class="{pc}">₹{realized_pnl:,.2f}</b> &nbsp;|&nbsp;
-    Equity: <b style="color:#f0f6fc">₹{INITIAL_CAPITAL+realized_pnl:,.2f}</b> &nbsp;|&nbsp;
-    Unrealized: <b class="{upc}">₹{total_unrealized_pnl:,.2f}</b>
-  </td>
-</tr>
-<tr>
-  <td class="row-title">OPEN TRADES</td>
-  <td class="val color-open">{len(open_df_ui)}</td>
-  <td colspan="5" class="pct" style="text-align:left;padding-left:16px">
-    🛡️ {rf} Risk-Free &nbsp;|&nbsp; ⚠️ {len(open_df_ui)-rf} At Risk
-  </td>
-</tr>
-</table>""", unsafe_allow_html=True)
+# ── METRIC CARDS ─────────────────────────────────────────────────────────────
+st.markdown(f"""<div class="metrics-row">
+  <div class="mc">
+    <div class="mc-label">Closed Trades</div>
+    <div class="mc-value mc-neutral">{tc}</div>
+    <div class="mc-sub">{wc}W · {bc}BE · {lc}L</div>
+  </div>
+  <div class="mc mc-win">
+    <div class="mc-label">Win Rate</div>
+    <div class="mc-value">{wr}</div>
+    <div class="mc-sub">{dec} decided</div>
+  </div>
+  <div class="mc">
+    <div class="mc-label">Expectancy</div>
+    <div class="mc-value mc-gold" style="font-size:1.15rem">{exp}</div>
+    <div class="mc-sub">per trade</div>
+  </div>
+  <div class="mc">
+    <div class="mc-label">Realized PnL</div>
+    <div class="mc-value" style="color:{pnl_c};font-size:1.15rem">{_fmt_pnl(realized_pnl)}</div>
+    <div class="mc-sub">from ₹{INITIAL_CAPITAL:,.0f}</div>
+  </div>
+  <div class="mc">
+    <div class="mc-label">Unrealized</div>
+    <div class="mc-value" style="color:{upnl_c};font-size:1.15rem">{_fmt_pnl(total_unrealized)}</div>
+    <div class="mc-sub">{oc} open · {rf} risk-free</div>
+  </div>
+  <div class="mc mc-gold">
+    <div class="mc-label">Equity</div>
+    <div class="mc-value" style="font-size:1.15rem">₹{eq:,.0f}</div>
+    <div class="mc-sub">{_fmt_pnl(eq-INITIAL_CAPITAL)} total</div>
+  </div>
+</div>""", unsafe_allow_html=True)
 
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-t_heat, t_open, t_ledger, t_blocked, t_chart = st.tabs(
-    ["🔥 Heatmap","🟢 Open Trades","📚 Ledger","🚫 Blocked","📈 Chart"])
+t_scan, t_open, t_ledger, t_blocked, t_chart = st.tabs([
+    f"📡 Scanner ({len(live_df)})",
+    f"🟢 Open ({oc})",
+    f"📚 Ledger ({tc})",
+    f"🚫 Blocked",
+    "📈 Chart"
+])
 
-with t_heat:
+# ── SCANNER TAB ───────────────────────────────────────────────────────────────
+with t_scan:
     if not live_df.empty:
-        st.dataframe(
-            live_df.style.map(
-                lambda v: ('background-color:rgba(220,38,38,.35);color:#fff' if pd.notna(v) and float(v)<0.10 else
-                           'background-color:rgba(217,119,6,.35);color:#fff' if pd.notna(v) and float(v)<0.50 else ''),
-                subset=['% Gap']),
-            use_container_width=True, height=_dyn_height(len(live_df)), hide_index=True)
-    else:
-        st.info("⏳ Waiting for first data sync...")
+        # Add anchor indicator column
+        live_df['Signal?'] = live_df['Asset'].apply(
+            lambda a: "🔔 PENDING" if a in active_anchors else "")
 
+        # Reorder columns for clarity
+        cols_order = ['Asset','Status','Price','ATR','% Gap','15m','1H','ADX','Vol','Signal?','Updated']
+        live_df = live_df[[c for c in cols_order if c in live_df.columns]]
+
+        def _heatmap_style(row):
+            """[BUG-1 FIX] Proper function, no ternary Streamlit calls."""
+            base = 'color: #f0f6fc; '
+            try:
+                gap   = float(row['% Gap'])
+                status = str(row.get('Status',''))
+                is_live = 'LIVE' in status or '24/7' in status
+                asset  = row.get('Asset','')
+                has_anc = asset in active_anchors
+
+                if has_anc:
+                    bg = 'background-color: rgba(163,113,247,0.18); '
+                elif is_live and gap < 0.10:
+                    bg = 'background-color: rgba(248,81,73,0.18); '
+                elif is_live and gap < 0.50:
+                    bg = 'background-color: rgba(227,179,65,0.12); '
+                else:
+                    bg = ''
+                return [base + bg] * len(row)
+            except Exception:
+                return [base] * len(row)
+
+        styled = live_df.style.apply(_heatmap_style, axis=1)
+        st.markdown('<div class="section-title">Signal Scanner — sorted by EMA proximity ↑</div>',
+                    unsafe_allow_html=True)
+        st.markdown("""<div style="font-size:.74rem;color:#6e7681;margin-bottom:6px">
+            🔴 Red = &lt;0.1% gap (imminent) &nbsp;·&nbsp;
+            🟡 Amber = &lt;0.5% gap (approaching) &nbsp;·&nbsp;
+            🟣 Purple = anchor active (evaluating entry)</div>""", unsafe_allow_html=True)
+        st.dataframe(styled, use_container_width=True,
+                     height=_dyn_height(len(live_df), rpx=35, hdr=38), hide_index=True)
+    else:
+        st.info("⏳ Waiting for first 15m boundary scan...")
+
+
+# ── OPEN TRADES TAB ───────────────────────────────────────────────────────────
 with t_open:
-    if not open_df_ui.empty:
-        dc = [c for c in ['ticker','signal_type','entry_time','entry_price','sl','tp',
-                           'Latest Price','→ SL','→ TP','Time In','Status','Unrlzd PnL (₹)']
-              if c in open_df_ui.columns]
-        st.dataframe(open_df_ui[dc], use_container_width=True,
-                     height=_dyn_height(len(open_df_ui)), hide_index=True)
-    else:
+    if open_df.empty:
         st.info("No active trades.")
-
-with t_ledger:
-    if not history_df.empty:
-        st.dataframe(
-            history_df[['ticker','signal_type','entry_time','entry_price',
-                         'sl','tp','exit_time','exit_price','status','PnL (₹)']],
-            use_container_width=True, height=_dyn_height(len(history_df)), hide_index=True)
     else:
-        st.info("No closed trades.")
+        st.markdown(f'<div class="section-title">{oc} Open Position{"s" if oc!=1 else ""}</div>',
+                    unsafe_allow_html=True)
+        for _, row in open_df.iterrows():
+            direction  = str(row['signal_type']).upper()
+            card_cls   = "trade-card-long" if direction=="LONG" else "trade-card-short"
+            dir_cls    = "tc-dir-long"     if direction=="LONG" else "tc-dir-short"
+            pnl_val    = row.get('Unrlzd PnL', 0.0)
+            pnl_cls    = "tc-pnl-pos" if (pnl_val or 0) >= 0 else "tc-pnl-neg"
+            risk_badge = (f'<span class="tc-badge-free">{row.get("Risk","")}</span>'
+                          if row.get("Risk","") == "🛡️ FREE"
+                          else f'<span class="tc-badge-risk">{row.get("Risk","")}</span>')
+            lp    = row.get('LivePrice', row['entry_price'])
+            sl_d  = row.get('→ SL','—')
+            tp_d  = row.get('→ TP','—')
+            tin   = row.get('Time In','—')
+            st.markdown(f"""<div class="trade-card {card_cls}">
+  <div class="tc-row">
+    <span class="tc-asset">{row['ticker']}</span>
+    <span class="{dir_cls}">{direction}</span>
+    {risk_badge}
+    <span class="{pnl_cls}">{_fmt_pnl(pnl_val or 0)}</span>
+  </div>
+  <div class="tc-row" style="margin-top:6px">
+    <span class="tc-stat">Entry <b>{row['entry_price']:.2f}</b></span>
+    <span class="tc-stat">Live <b>{lp:.2f}</b></span>
+    <span class="tc-stat">SL <b>{row['sl']:.2f}</b> <span style="color:#6e7681">({sl_d})</span></span>
+    <span class="tc-stat">TP <b>{row['tp']:.2f}</b> <span style="color:#6e7681">({tp_d})</span></span>
+    <span class="tc-stat">⏱ {tin}</span>
+    <span class="tc-stat">HTF {row.get('htf_trend','—')}</span>
+  </div>
+</div>""", unsafe_allow_html=True)
 
+
+# ── LEDGER TAB ────────────────────────────────────────────────────────────────
+with t_ledger:
+    if history_df.empty:
+        st.info("No closed trades.")
+    else:
+        # Summary bar above table
+        if tc > 0:
+            best  = history_df['PnL'].max()
+            worst = history_df['PnL'].min()
+            st.markdown(f"""<div style="display:flex;gap:16px;flex-wrap:wrap;
+                margin-bottom:8px;font-size:.8rem;color:#8b949e">
+                <span>Best: <b style="color:#3fb950">₹{best:,.0f}</b></span>
+                <span>Worst: <b style="color:#f85149">₹{worst:,.0f}</b></span>
+                <span>Avg Win: <b style="color:#3fb950">₹{history_df[history_df['PnL']>0]['PnL'].mean():,.0f}</b></span>
+                <span>Avg Loss: <b style="color:#f85149">₹{history_df[history_df['PnL']<0]['PnL'].mean():,.0f}</b></span>
+            </div>""", unsafe_allow_html=True)
+
+        disp = history_df[['ticker','signal_type','entry_time','entry_price',
+                            'exit_price','status','PnL']].copy()
+        disp.columns = ['Asset','Dir','Entry Time','Entry','Exit','Status','PnL (₹)']
+        disp['PnL (₹)'] = disp['PnL (₹)'].round(2)
+
+        def _ledger_color(val):
+            try:
+                v = float(val)
+                return 'color: #3fb950' if v > 0 else ('color: #f85149' if v < 0 else 'color: #a371f7')
+            except Exception:
+                return ''
+
+        st.dataframe(
+            disp.style.map(_ledger_color, subset=['PnL (₹)']),
+            use_container_width=True, height=_dyn_height(len(disp)), hide_index=True)
+
+
+# ── BLOCKED TAB ───────────────────────────────────────────────────────────────
 with t_blocked:
+    # [BUG-1 FIX] No ternary — proper if/else
     try:
         bdf = _db_query(
-            "SELECT ticker as Asset, signal_type as Signal, timestamp as 'Time (IST)', "
-            "price as Price, adx as ADX, htf_trend as '1H Trend', vol_ratio as 'Vol (x)', "
-            "rejection_reasons as 'Rejection Reasons' "
+            "SELECT ticker as Asset, signal_type as Dir, timestamp as Time, "
+            "price as Price, adx as ADX, htf_trend as '1H', vol_ratio as Vol, "
+            "rejection_reasons as Reason "
             "FROM blocked_signals ORDER BY id DESC LIMIT 50")
-        st.dataframe(bdf, use_container_width=True, height=_dyn_height(len(bdf)), hide_index=True) if not bdf.empty else st.info("No blocked signals.")
-    except Exception: pass
+        if not bdf.empty:
+            st.dataframe(bdf, use_container_width=True,
+                         height=_dyn_height(len(bdf)), hide_index=True)
+        else:
+            st.info("No blocked signals logged yet.")
+    except Exception:
+        st.info("No blocked signals logged yet.")
 
+
+# ── CHART TAB ─────────────────────────────────────────────────────────────────
 with t_chart:
-    # [R1] Uses get_chart_data (5d) not fetch_and_analyze (15d)
     if not live_df.empty:
-        sel = st.selectbox("Select Asset:", ["— select —"]+sorted(live_df['Asset'].tolist()),
+        all_assets = sorted(live_df['Asset'].tolist())
+        sel = st.selectbox("Select Asset", ["— select —"] + all_assets,
                            label_visibility="collapsed")
         if sel != "— select —":
-            with st.spinner("Loading..."):
+            with st.spinner("Loading chart..."):
                 try:
                     sym = next(i['yf_symbol'] for i in WATCHLIST if i['name']==sel)
                     cdf = get_chart_data(sym)
-                    if cdf is not None:
+                    if cdf is not None and len(cdf) >= 5:
+                        last_adx = cdf['ADX'].iloc[-1]
+                        last_atr = cdf['ATR'].iloc[-1]
+                        last_cls = cdf['Close'].iloc[-1]
+                        trend_up = cdf['EMA5'].iloc[-1] > cdf['EMA39'].iloc[-1]
+                        htf_bull = cdf['Close'].iloc[-1] > cdf['EMA39_1H'].iloc[-1]
+
+                        # Chart header stats
+                        trend_col = "#3fb950" if trend_up else "#f85149"
+                        htf_col   = "#3fb950" if htf_bull else "#f85149"
+                        adx_col   = "#3fb950" if last_adx > 25 else ("#e3b341" if last_adx > 20 else "#f85149")
+                        st.markdown(f"""<div style="display:flex;gap:16px;flex-wrap:wrap;
+                            margin-bottom:8px;font-size:.8rem">
+                            <span style="color:#f0f6fc;font-weight:700">{sel}</span>
+                            <span style="color:{trend_col}">15m: {'🟢 Bull' if trend_up else '🔴 Bear'}</span>
+                            <span style="color:{htf_col}">1H: {'🟢 Bull' if htf_bull else '🔴 Bear'}</span>
+                            <span style="color:{adx_col}">ADX: {last_adx:.1f}</span>
+                            <span style="color:#8b949e">ATR: {last_atr:.2f}</span>
+                            <span style="color:#8b949e">Price: {last_cls:.2f}</span>
+                        </div>""", unsafe_allow_html=True)
+
                         fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                            vertical_spacing=0.04, row_heights=[0.72,0.28])
-                        x = cdf.index.strftime('%b %d %H:%M')
+                                            vertical_spacing=0.03, row_heights=[0.72,0.28])
+                        x = cdf.index.strftime('%d/%m %H:%M')
+
                         fig.add_trace(go.Candlestick(x=x, open=cdf['Open'], high=cdf['High'],
                             low=cdf['Low'], close=cdf['Close'], name="Price",
-                            increasing_line_color='#3fb950', decreasing_line_color='#f85149'), row=1,col=1)
-                        fig.add_trace(go.Scatter(x=x,y=cdf['EMA5'],
-                            line=dict(color='#58a6ff',width=1.5),name='EMA 5'),row=1,col=1)
-                        fig.add_trace(go.Scatter(x=x,y=cdf['EMA39'],
-                            line=dict(color='#f0883e',width=2.0),name='EMA 39'),row=1,col=1)
-                        # [U3] HTF reference line
-                        fig.add_trace(go.Scatter(x=x,y=cdf['EMA39_1H'],
-                            line=dict(color='#a371f7',width=1.5,dash='dash'),name='EMA 39 1H'),row=1,col=1)
-                        fig.add_trace(go.Scatter(x=x,y=cdf['ADX'],
-                            line=dict(color='#ffd700',width=1.5),name='ADX'),row=2,col=1)
-                        fig.add_hline(y=20,line_dash="dot",line_color="#6e7681",
-                                      annotation_text="20",row=2,col=1)
+                            increasing_line_color='#3fb950', decreasing_line_color='#f85149',
+                            increasing_fillcolor='rgba(63,185,80,0.7)',
+                            decreasing_fillcolor='rgba(248,81,73,0.7)'), row=1, col=1)
+
+                        fig.add_trace(go.Scatter(x=x, y=cdf['EMA5'],
+                            line=dict(color='#58a6ff',width=1.5), name='EMA5'), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=x, y=cdf['EMA39'],
+                            line=dict(color='#f0883e',width=2.0), name='EMA39'), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=x, y=cdf['EMA39_1H'],
+                            line=dict(color='#a371f7',width=1.5,dash='dot'), name='EMA39 1H',
+                            opacity=0.8), row=1, col=1)
+
+                        # ADX with threshold fill
+                        fig.add_trace(go.Scatter(x=x, y=cdf['ADX'],
+                            line=dict(color='#ffd700',width=1.5), name='ADX',
+                            fill='tozeroy', fillcolor='rgba(255,215,0,0.04)'), row=2, col=1)
+                        fig.add_hline(y=20, line_dash="dot", line_color="rgba(110,118,129,0.5)",
+                                      annotation_text="20", annotation_font_color="#6e7681",
+                                      row=2, col=1)
+                        fig.add_hline(y=25, line_dash="dot", line_color="rgba(63,185,80,0.3)",
+                                      annotation_text="25", annotation_font_color="#3fb950",
+                                      row=2, col=1)
+
                         fig.update_layout(
-                            title=dict(text=f"{sel}  ·  ADX: {cdf['ADX'].iloc[-1]:.1f}  ·  ATR: {cdf['ATR'].iloc[-1]:.2f}",
-                                       font=dict(size=13)),
-                            template="plotly_dark", xaxis_rangeslider_visible=False,
-                            height=660, legend=dict(orientation='h',y=1.02),
-                            margin=dict(t=55,b=15,l=5,r=5))
+                            template="plotly_dark",
+                            paper_bgcolor='#0d1117', plot_bgcolor='#0d1117',
+                            xaxis_rangeslider_visible=False,
+                            height=640,
+                            legend=dict(orientation='h', y=1.01, x=0,
+                                        bgcolor='rgba(0,0,0,0)', font=dict(size=11)),
+                            margin=dict(t=10, b=10, l=0, r=0),
+                            xaxis2=dict(showgrid=True, gridcolor='rgba(33,38,45,0.8)'),
+                            yaxis=dict(showgrid=True, gridcolor='rgba(33,38,45,0.8)',side='right'),
+                            yaxis2=dict(showgrid=True, gridcolor='rgba(33,38,45,0.5)',
+                                        range=[0,60], side='right'))
                         st.plotly_chart(fig, use_container_width=True)
                         del fig
+                    else:
+                        st.warning("Not enough data to display chart.")
                 except Exception:
-                    st.error("Chart unavailable.")
+                    st.error("Chart unavailable for this asset.")
     else:
         st.info("⏳ Waiting for first data sync...")
