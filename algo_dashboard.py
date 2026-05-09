@@ -60,10 +60,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import contextlib
 from datetime import datetime, timedelta, timezone
-from tvDatafeed import TvDatafeed, Interval
 
 # [MEM-7] Suppress noisy connection-pool and library logs
-logging.getLogger('tvDatafeed').setLevel(logging.CRITICAL)
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
 logging.getLogger('urllib3').setLevel(logging.CRITICAL)
 logging.getLogger('peewee').setLevel(logging.CRITICAL)
@@ -244,130 +242,78 @@ def send_telegram_csv_backup():
 # ==========================================
 # 3. WATCHLIST
 # ==========================================
+# tv_symbol / tv_exchange removed — yfinance is now the sole data source.
+# asset_class drives the market-hours gate:
+#   'NSE'     → weekdays 09:15–15:30 IST only
+#   'COMMODITY' → weekdays only (Mon–Fri), ~23 hours
+#   'CRYPTO'  → 24/7, no gate
 WATCHLIST = [
-    {'name': 'NIFTY 50',       'tv_symbol': 'NIFTY',       'tv_exchange': 'NSE',     'yf_symbol': '^NSEI'},
-    {'name': 'BANK NIFTY',     'tv_symbol': 'BANKNIFTY',   'tv_exchange': 'NSE',     'yf_symbol': '^NSEBANK'},
-    {'name': 'BITCOIN (24/7)', 'tv_symbol': 'BTCUSDT',     'tv_exchange': 'BINANCE', 'yf_symbol': 'BTC-USD'},
-    {'name': 'GOLD',           'tv_symbol': 'XAUUSD',      'tv_exchange': 'OANDA',   'yf_symbol': 'GC=F'},
-    {'name': 'SILVER',         'tv_symbol': 'XAGUSD',      'tv_exchange': 'OANDA',   'yf_symbol': 'SI=F'},
-    {'name': 'CRUDE OIL',      'tv_symbol': 'WTICOUSD',    'tv_exchange': 'OANDA',   'yf_symbol': 'CL=F'},
-    {'name': 'HDFC BANK',      'tv_symbol': 'HDFCBANK',    'tv_exchange': 'NSE',     'yf_symbol': 'HDFCBANK.NS'},
-    {'name': 'SBI',            'tv_symbol': 'SBIN',         'tv_exchange': 'NSE',     'yf_symbol': 'SBIN.NS'},
-    {'name': 'RELIANCE',       'tv_symbol': 'RELIANCE',    'tv_exchange': 'NSE',     'yf_symbol': 'RELIANCE.NS'},
-    {'name': 'INFOSYS',        'tv_symbol': 'INFY',         'tv_exchange': 'NSE',     'yf_symbol': 'INFY.NS'},
-    {'name': 'TCS',            'tv_symbol': 'TCS',          'tv_exchange': 'NSE',     'yf_symbol': 'TCS.NS'},
-    {'name': 'ITC',            'tv_symbol': 'ITC',          'tv_exchange': 'NSE',     'yf_symbol': 'ITC.NS'},
-    {'name': 'TATA MOTORS',    'tv_symbol': 'TATAMOTORS',  'tv_exchange': 'NSE',     'yf_symbol': 'TATAMOTORS.NS'},
-    {'name': 'TATA STEEL',     'tv_symbol': 'TATASTEEL',   'tv_exchange': 'NSE',     'yf_symbol': 'TATASTEEL.NS'},
-    {'name': 'L&T',            'tv_symbol': 'LT',           'tv_exchange': 'NSE',     'yf_symbol': 'LT.NS'},
-    {'name': 'BHARTI AIRTEL',  'tv_symbol': 'BHARTIARTL',  'tv_exchange': 'NSE',     'yf_symbol': 'BHARTIARTL.NS'},
-    {'name': 'SUN PHARMA',     'tv_symbol': 'SUNPHARMA',   'tv_exchange': 'NSE',     'yf_symbol': 'SUNPHARMA.NS'},
-    {'name': 'VEDANTA',        'tv_symbol': 'VEDL',         'tv_exchange': 'NSE',     'yf_symbol': 'VEDL.NS'},
+    {'name': 'NIFTY 50',       'yf_symbol': '^NSEI',          'asset_class': 'NSE'},
+    {'name': 'BANK NIFTY',     'yf_symbol': '^NSEBANK',       'asset_class': 'NSE'},
+    {'name': 'BITCOIN (24/7)', 'yf_symbol': 'BTC-USD',        'asset_class': 'CRYPTO'},
+    {'name': 'GOLD',           'yf_symbol': 'GC=F',           'asset_class': 'COMMODITY'},
+    {'name': 'SILVER',         'yf_symbol': 'SI=F',           'asset_class': 'COMMODITY'},
+    {'name': 'CRUDE OIL',      'yf_symbol': 'CL=F',           'asset_class': 'COMMODITY'},
+    {'name': 'HDFC BANK',      'yf_symbol': 'HDFCBANK.NS',    'asset_class': 'NSE'},
+    {'name': 'SBI',            'yf_symbol': 'SBIN.NS',        'asset_class': 'NSE'},
+    {'name': 'RELIANCE',       'yf_symbol': 'RELIANCE.NS',    'asset_class': 'NSE'},
+    {'name': 'INFOSYS',        'yf_symbol': 'INFY.NS',        'asset_class': 'NSE'},
+    {'name': 'TCS',            'yf_symbol': 'TCS.NS',         'asset_class': 'NSE'},
+    {'name': 'ITC',            'yf_symbol': 'ITC.NS',         'asset_class': 'NSE'},
+    {'name': 'TATA MOTORS',    'yf_symbol': 'TATAMOTORS.NS',  'asset_class': 'NSE'},
+    {'name': 'TATA STEEL',     'yf_symbol': 'TATASTEEL.NS',   'asset_class': 'NSE'},
+    {'name': 'L&T',            'yf_symbol': 'LT.NS',          'asset_class': 'NSE'},
+    {'name': 'BHARTI AIRTEL',  'yf_symbol': 'BHARTIARTL.NS',  'asset_class': 'NSE'},
+    {'name': 'SUN PHARMA',     'yf_symbol': 'SUNPHARMA.NS',   'asset_class': 'NSE'},
+    {'name': 'VEDANTA',        'yf_symbol': 'VEDL.NS',        'asset_class': 'NSE'},
 ]
 
 
 # ==========================================
 # 4. DATA FETCHING ENGINE
 # ==========================================
+# tvDatafeed removed — yfinance covers all 18 assets and is PyPI-stable.
+# All WATCHLIST items have a yf_symbol that works with yf.download().
 _api_lock = threading.Lock()
-_global_tv: TvDatafeed | None = None
-
-
-def _get_tv_connection() -> TvDatafeed | None:
-    global _global_tv
-    if _global_tv is None:
-        try:
-            _global_tv = TvDatafeed()
-        except Exception:
-            _global_tv = None
-    return _global_tv
-
-
-def _reset_tv_connection() -> TvDatafeed | None:
-    """Replaces the singleton; called under _api_lock."""
-    global _global_tv
-    try:
-        _global_tv = TvDatafeed()
-    except Exception:
-        _global_tv = None
-    return _global_tv
 
 
 def fetch_and_analyze(item: dict) -> pd.DataFrame | None:
     """
-    Fetches 15m OHLCV from TvDatafeed (yfinance fallback for NSE).
+    Fetches 15m OHLCV via yfinance for all asset classes:
+      NSE stocks/indices, BTC, Gold (GC=F), Silver (SI=F), Crude (CL=F).
     Computes: EMA5, EMA39, ATR14, ADX14, EMA39_1H, Vol_Ratio.
-
-    Key memory fixes vs v1:
-    [MEM-1] n_bars = 110 (was 250)
-    [MEM-2] No df.copy() — processes in place
-    [MEM-3] Explicit del of adx_data, close_1h, ema39_1h
-    [MEM-4] 1H EMA computed from Close-only resample (not full OHLCV)
-    [BAN-2] Single retry on TV failure (was double-reset)
-    [MEM-6] yfinance fallback uses yf.download() (no Ticker object)
-    [BUG-2] Volume guard uses explicit column check
+    yf.download() is stateless — no persistent session or Ticker objects.
     """
     df = None
 
-    # --- Primary: TvDatafeed ---
     try:
         with _api_lock:
-            tv = _get_tv_connection()
-            if tv:
-                df_tv = tv.get_hist(
-                    symbol=item['tv_symbol'],
-                    exchange=item['tv_exchange'],
-                    interval=Interval.in_15_minute,
-                    n_bars=110  # [MEM-1]
-                )
-                # Single retry on empty result
-                if df_tv is None or df_tv.empty:
-                    tv = _reset_tv_connection()
-                    if tv:
-                        df_tv = tv.get_hist(
-                            symbol=item['tv_symbol'],
-                            exchange=item['tv_exchange'],
-                            interval=Interval.in_15_minute,
-                            n_bars=110
-                        )
-                if df_tv is not None and not df_tv.empty:
-                    df = df_tv.rename(columns={
-                        'open': 'Open', 'high': 'High',
-                        'low': 'Low', 'close': 'Close', 'volume': 'Volume'
-                    })
-                    del df_tv
-    except Exception:
-        pass
-
-    # --- Fallback: yfinance (NSE only) ---
-    # [MEM-6] yf.download is stateless; no persistent Ticker/Session objects
-    if (df is None or df.empty) and item['tv_exchange'] == 'NSE':
-        try:
             df_yf = yf.download(
                 item['yf_symbol'],
                 interval="15m",
-                period="4d",
+                period="5d",
                 progress=False,
                 auto_adjust=True
             )
-            if df_yf is not None and not df_yf.empty:
-                if df_yf.index.tz is not None:
-                    df_yf.index = df_yf.index.tz_localize(None)
-                df = df_yf
-                del df_yf
-        except Exception:
-            pass
+        if df_yf is not None and not df_yf.empty:
+            # yfinance Multi-level columns fix (yf >= 0.2.x returns MultiIndex)
+            if isinstance(df_yf.columns, pd.MultiIndex):
+                df_yf.columns = df_yf.columns.get_level_values(0)
+            df = df_yf
+            del df_yf
+    except Exception:
+        pass
 
     if df is None or df.empty:
         return None
 
     try:
-        # --- Timezone normalisation to IST ---
-        # [MEM-2] No df.copy() — safe to mutate; tv/yf DataFrames are not
-        #         referenced anywhere else at this point.
+        # --- Timezone normalisation to IST (tz-naive) ---
+        # yfinance always returns tz-aware UTC timestamps.
         if df.index.tz is not None:
             df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
         else:
+            # Safety fallback: treat naive index as UTC and shift to IST
             df.index = df.index + timedelta(hours=5, minutes=30)
 
         # --- Type enforcement ---
@@ -464,19 +410,20 @@ def process_market_data() -> bool:
             # MAIN ASSET LOOP
             # -------------------------------------------------------
             for item in WATCHLIST:
-                name, exchange = item['name'], item['tv_exchange']
+                name, asset_class = item['name'], item['asset_class']
 
                 # --- Market-hours gate ---
                 market_open = True
-                if exchange == 'NSE':
+                if asset_class == 'NSE':
                     mins = ist_now.hour * 60 + ist_now.minute
                     if ist_now.weekday() >= 5 or not (555 <= mins <= 935):
                         market_open = False
-                elif exchange in ('OANDA', 'TVC'):
+                elif asset_class == 'COMMODITY':
+                    # Futures markets closed Saturday; reopen Sunday ~18:00 EST
                     if ist_now.weekday() == 5 or \
                             (ist_now.weekday() == 6 and ist_now.hour < 3):
                         market_open = False
-                # [BUG-3] BINANCE is 24/7 — no gate applied (falls through)
+                # CRYPTO: 24/7 — no gate applied
 
                 if not market_open:
                     continue
