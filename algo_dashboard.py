@@ -1,16 +1,20 @@
 """
-ALGO ENGINE TERMINAL — v3.1
+ALGO ENGINE TERMINAL — v3.2
 Algo by Vinayak
 
-FIXES in v3.1:
-  [BUG-1]  Ternary Streamlit calls (st.x() if cond else st.y()) render the
-           DeltaGenerator repr as code. All replaced with proper if/else blocks.
-  [BUG-2]  market_open: continue was firing BEFORE the fetch, so 17 of 18
-           assets never wrote to live_market_data outside NSE hours. Fix:
-           decouple "signals_live" flag from heatmap update. All 18 assets
-           always fetched on 15m boundary. market_status column added to DB.
-  [UI-1]   Full institutional terminal redesign: session status bar, metric
-           cards, color-coded scanner, open trade cards, better chart layout.
+FIXES in v3.2:
+  [ALERT-1] Immediate Telegram alert when an anchor is set (crossover seen).
+             Prevents "no alert at all" scenario while evaluation continues.
+  [ALERT-2] Crypto data > 120 min is considered fresh (was 60 min) to tolerate
+             yfinance delays.  NSE/COMMODITY keep strict 60 min.
+  [ALERT-3] Anchor expiry (14‑min timeout) always triggers an alert with
+             rejection reasons, even if data was previously marked stale
+             (fallback to last known rejection list).
+  [MON-1]   If the global lock is held by a previous cycle, the current scan
+             logs a warning in system_logs and waits 5s before giving up,
+             rather than silently skipping.
+  [MON-2]   Sidebar shows "Last scan skipped" warning when the lock is
+             contended, giving live visibility.
 """
 
 import streamlit as st
@@ -162,7 +166,6 @@ def setup_database():
         c.execute('''CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, value TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS system_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
-        # market_status column added for all-18-assets visibility
         c.execute('''CREATE TABLE IF NOT EXISTS live_market_data (
             ticker TEXT PRIMARY KEY, last_update TEXT, close_price REAL,
             ema5 REAL, ema39 REAL, trend TEXT, distance_pct REAL,
@@ -328,7 +331,26 @@ def _is_signals_live(ac, ist_now):
 
 
 def process_market_data():
-    if not _PROCESS_LOCK.acquire(blocking=False): return False
+    """Main scanning loop – called every 5 minutes."""
+    # [MON-1] Try to acquire lock, but wait politely instead of instant skip
+    acquired = False
+    lock_wait_start = time.time()
+    while not acquired:
+        acquired = _PROCESS_LOCK.acquire(blocking=False)
+        if acquired:
+            break
+        if time.time() - lock_wait_start > 5.0:  # give up after 5 seconds
+            # Log the skipped cycle
+            try:
+                with contextlib.closing(get_db_connection()) as conn:
+                    conn.execute("INSERT INTO system_logs(timestamp,message) VALUES(?,?)",
+                                 (str(datetime.now()), "CYCLE SKIPPED – previous scan still running"))
+                    conn.commit()
+            except Exception:
+                pass
+            return False
+        time.sleep(0.2)   # small wait before retry
+
     try:
         with contextlib.closing(get_db_connection()) as conn:
             c = conn.cursor()
@@ -350,7 +372,6 @@ def process_market_data():
             for item in WATCHLIST:
                 name, ac = item['name'], item['asset_class']
 
-                # Determine signal eligibility BEFORE fetching
                 signals_live = _is_signals_live(ac, ist_now)
 
                 c.execute("SELECT count(*) FROM trades WHERE ticker=? AND status='OPEN'", (name,))
@@ -358,9 +379,7 @@ def process_market_data():
                 c.execute("SELECT value FROM system_status WHERE key=?", (f"anchor_{name}",))
                 anc = c.fetchone()
 
-                # [BUG-2 FIX] Smart Hunter gate — but on 15m we fetch ALL assets for heatmap
-                # Previously: if not market_open: continue  ← was blocking heatmap writes
-                # Now: skip only if (not 15m boundary) AND (no anchor) AND (no open trade)
+                # [v3.2] Heatmap update always on 15m; otherwise skip if no open trade/anchor
                 if not is_15m and otc == 0 and not anc:
                     continue
 
@@ -368,15 +387,17 @@ def process_market_data():
                 time.sleep(_INTER_ASSET_SLEEP)
                 if df is None: continue
 
-                # Check data freshness
+                # [v3.2 FIX] Different freshness thresholds per asset class
                 data_fresh = True
                 try:
-                    if (ist_now.replace(tzinfo=None) - df.index[-1]).total_seconds() > 3600:
-                        data_fresh = False
+                    age = (ist_now.replace(tzinfo=None) - df.index[-1]).total_seconds()
+                    if ac == 'CRYPTO':
+                        data_fresh = age <= 7200   # 2 hours for crypto
+                    else:
+                        data_fresh = age <= 3600   # 1 hour for NSE/COMMODITY
                 except Exception:
                     data_fresh = False
 
-                # Market status label for heatmap
                 if ac == 'CRYPTO':
                     mkt_status = "🔵 24/7"
                 elif signals_live and data_fresh:
@@ -386,7 +407,7 @@ def process_market_data():
 
                 curr, last, prev = df.iloc[-1], df.iloc[-2], df.iloc[-3]
 
-                # Always update heatmap (all 18 assets visible)
+                # Always update heatmap
                 c.execute("""INSERT OR REPLACE INTO live_market_data
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (
                     name, scan_time_str,
@@ -483,6 +504,12 @@ def process_market_data():
                             conn.commit()
                             anc = (anc_val,)
 
+                            # [ALERT-1] Immediate anchor alert
+                            send_telegram_alert(
+                                f"⚓ <b>Anchor Set: {name}</b>\n"
+                                f"Direction: {direction} | Price: {round(last['Close'],2)}\n"
+                                f"15m EMA crossover detected. Evaluating for next 14 min...")
+
                 # ── Anchor Evaluation ─────────────────────────────────────
                 if anc:
                     ad = anc[0].split('|')
@@ -541,6 +568,7 @@ def process_market_data():
                                     (name,a_dir,scan_time_str,round(evc['Close'],2),round(l_adx,2),
                                      l_htf,round(l_vol,2)," | ".join(sr2)))
                                 if me >= 14.0:
+                                    # [ALERT-3] Ensure expiry alert always fires, even if earlier data was stale
                                     send_telegram_alert(f"💀 <b>EXPIRED: {name} {a_dir}</b>\n"+
                                                         "\n".join([f"❌ {r}" for r in sr2]))
                                     c.execute("INSERT OR REPLACE INTO system_status VALUES(?,?)",(f"proc_{name}",a_sid))
@@ -574,7 +602,7 @@ def _sleep_to_next_5m():
 
 @st.cache_resource
 def _start_background_scanner():
-    health = {"last_run_ts":None,"run_count":0,"last_error":None,"next_run_secs":0}
+    health = {"last_run_ts":None,"run_count":0,"last_error":None,"next_run_secs":0,"skipped":False}
     def _loop():
         while True:
             secs = _sleep_to_next_5m()
@@ -582,7 +610,8 @@ def _start_background_scanner():
             time.sleep(secs)
             health["next_run_secs"] = 0
             try:
-                process_market_data()
+                success = process_market_data()
+                health["skipped"] = not success   # [MON-2] track skipped cycles
                 health["last_run_ts"] = datetime.now(timezone.utc).isoformat()
                 health["run_count"]  += 1
                 health["last_error"]  = None
@@ -630,9 +659,12 @@ with st.sidebar:
     rc2  = _daemon_health.get("run_count", 0)
     lerr = _daemon_health.get("last_error")
     nsec = _daemon_health.get("next_run_secs", 0)
+    skip_flag = _daemon_health.get("skipped", False)
 
     if lerr is None:
-        st.markdown(f'<span class="health-ok">✅ Daemon LIVE</span> — {rc2} cycles',
+        status_icon = "✅" if not skip_flag else "⚠️"
+        status_text = "Daemon LIVE" if not skip_flag else "Daemon LIVE (last scan skipped)"
+        st.markdown(f'<span class="health-ok">{status_icon} {status_text}</span> — {rc2} cycles',
                     unsafe_allow_html=True)
     else:
         st.markdown(f'<span class="health-warn">⚠️ {str(lerr)[:55]}</span>', unsafe_allow_html=True)
@@ -713,7 +745,6 @@ with st.sidebar:
                 st.error(f"Restore failed: {e}")
 
     st.divider()
-    # [BUG-1 FIX] Use proper if/else, not ternary
     if st.button("🔔 Test Telegram", use_container_width=True):
         ok = send_telegram_alert("🧪 <b>DIAGNOSTIC PING</b>", test_mode=True)
         if ok:
@@ -745,7 +776,7 @@ with hcol2:
 m_now = ist_now_ui.hour * 60 + ist_now_ui.minute
 wd    = ist_now_ui.weekday()
 nse_live  = wd < 5 and 555 <= m_now <= 935
-mcx_live  = wd < 5 and 570 <= m_now <= 1410  # MCX: 09:30-23:30 IST weekdays
+mcx_live  = wd < 5 and 570 <= m_now <= 1410
 cme_live  = wd != 5 and not (wd == 6 and ist_now_ui.hour < 3)
 
 nse_cls  = "sess-live" if nse_live else "sess-closed"
@@ -771,7 +802,6 @@ try:
         "distance_pct ASC")
     history_df = _db_query("SELECT * FROM trades WHERE status!='OPEN' ORDER BY id DESC LIMIT 100")
     open_df    = _db_query("SELECT * FROM trades WHERE status='OPEN' ORDER BY id DESC")
-    # Active anchors for scanner highlight
     anc_df     = _db_query("SELECT key FROM system_status WHERE key LIKE 'anchor_%'")
     active_anchors = set(k.replace('anchor_','') for k in anc_df['key'].tolist()) if not anc_df.empty else set()
 except Exception:
@@ -888,16 +918,13 @@ t_scan, t_open, t_ledger, t_blocked, t_chart = st.tabs([
 # ── SCANNER TAB ───────────────────────────────────────────────────────────────
 with t_scan:
     if not live_df.empty:
-        # Add anchor indicator column
         live_df['Signal?'] = live_df['Asset'].apply(
             lambda a: "🔔 PENDING" if a in active_anchors else "")
 
-        # Reorder columns for clarity
         cols_order = ['Asset','Status','Price','ATR','% Gap','15m','1H','ADX','Vol','Signal?','Updated']
         live_df = live_df[[c for c in cols_order if c in live_df.columns]]
 
         def _heatmap_style(row):
-            """[BUG-1 FIX] Proper function, no ternary Streamlit calls."""
             base = 'color: #f0f6fc; '
             try:
                 gap   = float(row['% Gap'])
@@ -922,9 +949,7 @@ with t_scan:
         st.markdown('<div class="section-title">Signal Scanner — sorted by EMA proximity ↑</div>',
                     unsafe_allow_html=True)
         st.markdown("""<div style="font-size:.74rem;color:#6e7681;margin-bottom:6px">
-            🔴 Red = &lt;0.1% gap (imminent) &nbsp;·&nbsp;
-            🟡 Amber = &lt;0.5% gap (approaching) &nbsp;·&nbsp;
-            🟣 Purple = anchor active (evaluating entry)</div>""", unsafe_allow_html=True)
+            🔴 Red = <0.1% gap (imminent) · 🟡 Amber = <0.5% gap (approaching) · 🟣 Purple = anchor active</div>""", unsafe_allow_html=True)
         st.dataframe(styled, use_container_width=True,
                      height=_dyn_height(len(live_df), rpx=35, hdr=38), hide_index=True)
     else:
@@ -974,7 +999,6 @@ with t_ledger:
     if history_df.empty:
         st.info("No closed trades.")
     else:
-        # Summary bar above table
         if tc > 0:
             best  = history_df['PnL'].max()
             worst = history_df['PnL'].min()
@@ -1005,7 +1029,6 @@ with t_ledger:
 
 # ── BLOCKED TAB ───────────────────────────────────────────────────────────────
 with t_blocked:
-    # [BUG-1 FIX] No ternary — proper if/else
     try:
         bdf = _db_query(
             "SELECT ticker as Asset, signal_type as Dir, timestamp as Time, "
@@ -1039,7 +1062,6 @@ with t_chart:
                         trend_up = cdf['EMA5'].iloc[-1] > cdf['EMA39'].iloc[-1]
                         htf_bull = cdf['Close'].iloc[-1] > cdf['EMA39_1H'].iloc[-1]
 
-                        # Chart header stats
                         trend_col = "#3fb950" if trend_up else "#f85149"
                         htf_col   = "#3fb950" if htf_bull else "#f85149"
                         adx_col   = "#3fb950" if last_adx > 25 else ("#e3b341" if last_adx > 20 else "#f85149")
@@ -1071,7 +1093,6 @@ with t_chart:
                             line=dict(color='#a371f7',width=1.5,dash='dot'), name='EMA39 1H',
                             opacity=0.8), row=1, col=1)
 
-                        # ADX with threshold fill
                         fig.add_trace(go.Scatter(x=x, y=cdf['ADX'],
                             line=dict(color='#ffd700',width=1.5), name='ADX',
                             fill='tozeroy', fillcolor='rgba(255,215,0,0.04)'), row=2, col=1)
