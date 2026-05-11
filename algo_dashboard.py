@@ -1,20 +1,14 @@
 """
-ALGO ENGINE TERMINAL — v3.2
+ALGO ENGINE TERMINAL — v3.3
 Algo by Vinayak
 
-FIXES in v3.2:
-  [ALERT-1] Immediate Telegram alert when an anchor is set (crossover seen).
-             Prevents "no alert at all" scenario while evaluation continues.
-  [ALERT-2] Crypto data > 120 min is considered fresh (was 60 min) to tolerate
-             yfinance delays.  NSE/COMMODITY keep strict 60 min.
-  [ALERT-3] Anchor expiry (14‑min timeout) always triggers an alert with
-             rejection reasons, even if data was previously marked stale
-             (fallback to last known rejection list).
-  [MON-1]   If the global lock is held by a previous cycle, the current scan
-             logs a warning in system_logs and waits 5s before giving up,
-             rather than silently skipping.
-  [MON-2]   Sidebar shows "Last scan skipped" warning when the lock is
-             contended, giving live visibility.
+FIXES in v3.3:
+  [IND-1]  ATR and ADX now use Wilder's RMA (alpha=1/n) instead of span‑based
+           EMA.  Values will match TradingView's built‑in indicators.
+  [IND-2]  EMA5 and EMA39 at entry stored and displayed in Open Trades & Ledger.
+  [PERF-1] Chart tab removed entirely to reduce API calls and memory usage.
+  [ALERT-1→3] inherited from v3.2 (anchor alert, crypto freshness, expiry guarantee)
+  [MON-1→2]   inherited from v3.2 (lock retry & skip logging)
 """
 
 import streamlit as st
@@ -29,8 +23,6 @@ import gc
 import logging
 import io
 import yfinance as yf
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import contextlib
 from datetime import datetime, timedelta, timezone
 
@@ -39,24 +31,36 @@ logging.getLogger('urllib3').setLevel(logging.CRITICAL)
 logging.getLogger('peewee').setLevel(logging.CRITICAL)
 
 
-# ── INLINE INDICATORS ─────────────────────────────────────────────────────────
+# ── INLINE INDICATORS (Wilder’s RMA corrected) ────────────────────────────────
 def _ema(s, n):
     return s.ewm(span=n, adjust=False, min_periods=n).mean()
 
 def _atr(h, l, c, n=14):
     pc = c.shift(1)
-    tr = pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=n, adjust=False, min_periods=n).mean()
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    # Wilder's smoothing: alpha = 1/n
+    return tr.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
 
 def _adx(h, l, c, n=14):
     up, dn = h.diff(), -(l.diff())
-    pdm = pd.Series(np.where((up>dn)&(up>0), up, 0.0), index=h.index)
-    mdm = pd.Series(np.where((dn>up)&(dn>0), dn, 0.0), index=h.index)
-    atr_ = _atr(h, l, c, n)
-    pdi  = 100*pdm.ewm(span=n,adjust=False,min_periods=n).mean()/atr_
-    mdi  = 100*mdm.ewm(span=n,adjust=False,min_periods=n).mean()/atr_
-    dx   = (100*(pdi-mdi).abs()/((pdi+mdi).replace(0,np.nan))).fillna(0)
-    return dx.ewm(span=n, adjust=False, min_periods=n).mean()
+    pdm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=h.index)
+    mdm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=h.index)
+
+    atr_ = _atr(h, l, c, n)   # now uses RMA internally
+
+    # Smooth DM with RMA
+    pdm_s = pdm.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+    mdm_s = mdm.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
+
+    pdi = 100 * pdm_s / atr_
+    mdi = 100 * mdm_s / atr_
+
+    di_sum  = pdi + mdi
+    di_diff = (pdi - mdi).abs()
+    dx = (100 * di_diff / di_sum.replace(0, np.nan)).fillna(0)
+
+    # Final ADX smoothing also with RMA
+    return dx.ewm(alpha=1/n, adjust=False, min_periods=n).mean()
 
 
 # ── PAGE CONFIG ───────────────────────────────────────────────────────────────
@@ -162,7 +166,7 @@ def setup_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, signal_type TEXT,
             entry_time TEXT, entry_price REAL, sl REAL, tp REAL, status TEXT,
             exit_time TEXT, exit_price REAL, htf_trend TEXT, vol_ratio REAL,
-            atr REAL, adx REAL)''')
+            atr REAL, adx REAL, ema5 REAL, ema39 REAL)''')
         c.execute('''CREATE TABLE IF NOT EXISTS system_status (key TEXT PRIMARY KEY, value TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS system_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, message TEXT)''')
@@ -180,6 +184,8 @@ def setup_database():
             "ALTER TABLE trades ADD COLUMN vol_ratio REAL",
             "ALTER TABLE trades ADD COLUMN atr REAL",
             "ALTER TABLE trades ADD COLUMN adx REAL",
+            "ALTER TABLE trades ADD COLUMN ema5 REAL",
+            "ALTER TABLE trades ADD COLUMN ema39 REAL",
             "ALTER TABLE live_market_data ADD COLUMN adx REAL",
             "ALTER TABLE live_market_data ADD COLUMN atr REAL",
             "ALTER TABLE live_market_data ADD COLUMN market_status TEXT",
@@ -313,15 +319,8 @@ def fetch_and_analyze(item):
     return _add_indicators(df) if df is not None else None
 
 
-@st.cache_data(ttl=300)
-def get_chart_data(yf_symbol):
-    df = _yf_download(yf_symbol, '5d')
-    return _add_indicators(df) if df is not None else None
-
-
 # ── EXECUTION ENGINE ──────────────────────────────────────────────────────────
 def _is_signals_live(ac, ist_now):
-    """Returns True if market is open for signal processing."""
     if ac == 'NSE':
         m = ist_now.hour * 60 + ist_now.minute
         return ist_now.weekday() < 5 and 555 <= m <= 935
@@ -331,25 +330,20 @@ def _is_signals_live(ac, ist_now):
 
 
 def process_market_data():
-    """Main scanning loop – called every 5 minutes."""
-    # [MON-1] Try to acquire lock, but wait politely instead of instant skip
     acquired = False
     lock_wait_start = time.time()
     while not acquired:
         acquired = _PROCESS_LOCK.acquire(blocking=False)
-        if acquired:
-            break
-        if time.time() - lock_wait_start > 5.0:  # give up after 5 seconds
-            # Log the skipped cycle
+        if acquired: break
+        if time.time() - lock_wait_start > 5.0:
             try:
                 with contextlib.closing(get_db_connection()) as conn:
                     conn.execute("INSERT INTO system_logs(timestamp,message) VALUES(?,?)",
                                  (str(datetime.now()), "CYCLE SKIPPED – previous scan still running"))
                     conn.commit()
-            except Exception:
-                pass
+            except Exception: pass
             return False
-        time.sleep(0.2)   # small wait before retry
+        time.sleep(0.2)
 
     try:
         with contextlib.closing(get_db_connection()) as conn:
@@ -371,7 +365,6 @@ def process_market_data():
 
             for item in WATCHLIST:
                 name, ac = item['name'], item['asset_class']
-
                 signals_live = _is_signals_live(ac, ist_now)
 
                 c.execute("SELECT count(*) FROM trades WHERE ticker=? AND status='OPEN'", (name,))
@@ -379,7 +372,6 @@ def process_market_data():
                 c.execute("SELECT value FROM system_status WHERE key=?", (f"anchor_{name}",))
                 anc = c.fetchone()
 
-                # [v3.2] Heatmap update always on 15m; otherwise skip if no open trade/anchor
                 if not is_15m and otc == 0 and not anc:
                     continue
 
@@ -387,23 +379,15 @@ def process_market_data():
                 time.sleep(_INTER_ASSET_SLEEP)
                 if df is None: continue
 
-                # [v3.2 FIX] Different freshness thresholds per asset class
                 data_fresh = True
                 try:
                     age = (ist_now.replace(tzinfo=None) - df.index[-1]).total_seconds()
-                    if ac == 'CRYPTO':
-                        data_fresh = age <= 7200   # 2 hours for crypto
-                    else:
-                        data_fresh = age <= 3600   # 1 hour for NSE/COMMODITY
+                    data_fresh = age <= (7200 if ac == 'CRYPTO' else 3600)
                 except Exception:
                     data_fresh = False
 
-                if ac == 'CRYPTO':
-                    mkt_status = "🔵 24/7"
-                elif signals_live and data_fresh:
-                    mkt_status = "🟢 LIVE"
-                else:
-                    mkt_status = "🔴 CLOSED"
+                mkt_status = ("🔵 24/7" if ac == 'CRYPTO' else
+                              "🟢 LIVE" if (signals_live and data_fresh) else "🔴 CLOSED")
 
                 curr, last, prev = df.iloc[-1], df.iloc[-2], df.iloc[-3]
 
@@ -421,12 +405,11 @@ def process_market_data():
                     mkt_status))
                 conn.commit()
 
-                # Signal processing only for live markets with fresh data
                 if not signals_live or not data_fresh:
                     del df
                     continue
 
-                # ── Open Trade Manager ────────────────────────────────────
+                # ── Open Trade Manager ────────────────────────────
                 if otc > 0:
                     c.execute("SELECT id,signal_type,sl,tp,entry_price,atr FROM trades WHERE ticker=? AND status='OPEN'", (name,))
                     for t_id, s_type, sl, tp, e_price, atr_val in c.fetchall():
@@ -485,7 +468,7 @@ def process_market_data():
                                     send_telegram_alert(f"🛡️ <b>TRAIL: {name}</b>\n{nlbl} → SL: {nsl}")
                     conn.commit()
 
-                # ── Anchor Logic ──────────────────────────────────────────
+                # ── Anchor Logic ──────────────────────────────────
                 signal_id = str(last.name.round('15min')) if hasattr(last.name,'round') else str(last.name)
 
                 if not anc and is_15m:
@@ -504,13 +487,11 @@ def process_market_data():
                             conn.commit()
                             anc = (anc_val,)
 
-                            # [ALERT-1] Immediate anchor alert
                             send_telegram_alert(
                                 f"⚓ <b>Anchor Set: {name}</b>\n"
                                 f"Direction: {direction} | Price: {round(last['Close'],2)}\n"
                                 f"15m EMA crossover detected. Evaluating for next 14 min...")
 
-                # ── Anchor Evaluation ─────────────────────────────────────
                 if anc:
                     ad = anc[0].split('|')
                     if len(ad) == 4:
@@ -527,7 +508,6 @@ def process_market_data():
                             r_htf = "🟢 Bull" if a_dir=="LONG" else "🔴 Bear"
                             rej = []
 
-                            # Post-loss cooldown
                             c.execute("""SELECT status,exit_time FROM trades
                                 WHERE ticker=? AND status NOT LIKE 'OPEN' ORDER BY id DESC LIMIT 1""",(name,))
                             lt = c.fetchone()
@@ -552,9 +532,11 @@ def process_market_data():
                                 sl_v  = entry-(1.5*a_atr) if a_dir=="LONG" else entry+(1.5*a_atr)
                                 tp_v  = entry+(3.75*a_atr) if a_dir=="LONG" else entry-(3.75*a_atr)
                                 c.execute("""INSERT INTO trades(ticker,signal_type,entry_time,entry_price,
-                                    sl,tp,status,htf_trend,vol_ratio,atr,adx) VALUES(?,?,?,?,?,?,'OPEN',?,?,?,?)""",
-                                    (name,a_dir.lower(),scan_time_str,round(entry,2),round(sl_v,2),round(tp_v,2),
-                                     l_htf,round(l_vol,2),round(a_atr,2),round(l_adx,2)))
+                                    sl,tp,status,htf_trend,vol_ratio,atr,adx,ema5,ema39)
+                                    VALUES(?,?,?,?,?,?,'OPEN',?,?,?,?,?,?)""",
+                                    (name, a_dir.lower(), scan_time_str, round(entry,2), round(sl_v,2), round(tp_v,2),
+                                     l_htf, round(l_vol,2), round(a_atr,2), round(l_adx,2),
+                                     round(evc['EMA5'],2), round(evc['EMA39'],2)))
                                 send_telegram_alert(
                                     f"{'🟢' if a_dir=='LONG' else '🔴'} <b>{a_dir}: {name}</b>\n"
                                     f"Entry: {round(entry,2)} | SL: {round(sl_v,2)} | TP: {round(tp_v,2)}\n"
@@ -568,7 +550,6 @@ def process_market_data():
                                     (name,a_dir,scan_time_str,round(evc['Close'],2),round(l_adx,2),
                                      l_htf,round(l_vol,2)," | ".join(sr2)))
                                 if me >= 14.0:
-                                    # [ALERT-3] Ensure expiry alert always fires, even if earlier data was stale
                                     send_telegram_alert(f"💀 <b>EXPIRED: {name} {a_dir}</b>\n"+
                                                         "\n".join([f"❌ {r}" for r in sr2]))
                                     c.execute("INSERT OR REPLACE INTO system_status VALUES(?,?)",(f"proc_{name}",a_sid))
@@ -611,7 +592,7 @@ def _start_background_scanner():
             health["next_run_secs"] = 0
             try:
                 success = process_market_data()
-                health["skipped"] = not success   # [MON-2] track skipped cycles
+                health["skipped"] = not success
                 health["last_run_ts"] = datetime.now(timezone.utc).isoformat()
                 health["run_count"]  += 1
                 health["last_error"]  = None
@@ -718,9 +699,9 @@ with st.sidebar:
                                         (row['ticker'],row['entry_time']))
                             if not cur.fetchone():
                                 cur.execute("""INSERT INTO trades(ticker,signal_type,entry_time,entry_price,sl,tp,
-                                    status,exit_time,exit_price,htf_trend,vol_ratio,atr,adx) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    status,exit_time,exit_price,htf_trend,vol_ratio,atr,adx,ema5,ema39) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                                     tuple(row[k] for k in ['ticker','signal_type','entry_time','entry_price','sl','tp',
-                                          'status','exit_time','exit_price','htf_trend','vol_ratio','atr','adx']))
+                                          'status','exit_time','exit_price','htf_trend','vol_ratio','atr','adx','ema5','ema39']))
                         rc.commit()
                         st.success("✅ Trades restored!")
                     elif 'rejection_reasons' in rcol or 'Rejection Reasons' in rcol:
@@ -907,12 +888,11 @@ st.markdown(f"""<div class="metrics-row">
 
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-t_scan, t_open, t_ledger, t_blocked, t_chart = st.tabs([
+t_scan, t_open, t_ledger, t_blocked = st.tabs([
     f"📡 Scanner ({len(live_df)})",
     f"🟢 Open ({oc})",
     f"📚 Ledger ({tc})",
-    f"🚫 Blocked",
-    "📈 Chart"
+    f"🚫 Blocked"
 ])
 
 # ── SCANNER TAB ───────────────────────────────────────────────────────────────
@@ -949,7 +929,8 @@ with t_scan:
         st.markdown('<div class="section-title">Signal Scanner — sorted by EMA proximity ↑</div>',
                     unsafe_allow_html=True)
         st.markdown("""<div style="font-size:.74rem;color:#6e7681;margin-bottom:6px">
-            🔴 Red = <0.1% gap (imminent) · 🟡 Amber = <0.5% gap (approaching) · 🟣 Purple = anchor active</div>""", unsafe_allow_html=True)
+            🔴 Red = <0.1% gap (imminent) · 🟡 Amber = <0.5% gap (approaching) · 🟣 Purple = anchor active</div>""",
+                    unsafe_allow_html=True)
         st.dataframe(styled, use_container_width=True,
                      height=_dyn_height(len(live_df), rpx=35, hdr=38), hide_index=True)
     else:
@@ -976,6 +957,13 @@ with t_open:
             sl_d  = row.get('→ SL','—')
             tp_d  = row.get('→ TP','—')
             tin   = row.get('Time In','—')
+            atr   = row.get('atr', '—')
+            adx   = row.get('adx', '—')
+            vol   = row.get('vol_ratio', '—')
+            ema5  = row.get('ema5', '—')
+            ema39 = row.get('ema39', '—')
+            htf   = row.get('htf_trend','—')
+
             st.markdown(f"""<div class="trade-card {card_cls}">
   <div class="tc-row">
     <span class="tc-asset">{row['ticker']}</span>
@@ -989,7 +977,14 @@ with t_open:
     <span class="tc-stat">SL <b>{row['sl']:.2f}</b> <span style="color:#6e7681">({sl_d})</span></span>
     <span class="tc-stat">TP <b>{row['tp']:.2f}</b> <span style="color:#6e7681">({tp_d})</span></span>
     <span class="tc-stat">⏱ {tin}</span>
-    <span class="tc-stat">HTF {row.get('htf_trend','—')}</span>
+  </div>
+  <div class="tc-row" style="margin-top:4px">
+    <span class="tc-stat">ATR <b>{atr}</b></span>
+    <span class="tc-stat">ADX <b>{adx}</b></span>
+    <span class="tc-stat">Vol <b>{vol}x</b></span>
+    <span class="tc-stat">EMA5 <b>{ema5}</b></span>
+    <span class="tc-stat">EMA39 <b>{ema39}</b></span>
+    <span class="tc-stat">HTF {htf}</span>
   </div>
 </div>""", unsafe_allow_html=True)
 
@@ -1011,9 +1006,16 @@ with t_ledger:
             </div>""", unsafe_allow_html=True)
 
         disp = history_df[['ticker','signal_type','entry_time','entry_price',
-                            'exit_price','status','PnL']].copy()
-        disp.columns = ['Asset','Dir','Entry Time','Entry','Exit','Status','PnL (₹)']
-        disp['PnL (₹)'] = disp['PnL (₹)'].round(2)
+                           'exit_price','status','PnL',
+                           'atr','adx','vol_ratio','ema5','ema39','htf_trend']].copy()
+        disp.columns = ['Asset','Dir','Entry Time','Entry','Exit','Status',
+                        'PnL (₹)','ATR','ADX','Vol','EMA5','EMA39','1H Trend']
+        disp['PnL (₹)']   = disp['PnL (₹)'].round(2)
+        disp['ATR']        = disp['ATR'].round(2)
+        disp['ADX']        = disp['ADX'].round(1)
+        disp['Vol']        = disp['Vol'].round(2)
+        disp['EMA5']       = disp['EMA5'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "")
+        disp['EMA39']      = disp['EMA39'].apply(lambda x: f"{x:.2f}" if pd.notna(x) else "")
 
         def _ledger_color(val):
             try:
@@ -1042,84 +1044,3 @@ with t_blocked:
             st.info("No blocked signals logged yet.")
     except Exception:
         st.info("No blocked signals logged yet.")
-
-
-# ── CHART TAB ─────────────────────────────────────────────────────────────────
-with t_chart:
-    if not live_df.empty:
-        all_assets = sorted(live_df['Asset'].tolist())
-        sel = st.selectbox("Select Asset", ["— select —"] + all_assets,
-                           label_visibility="collapsed")
-        if sel != "— select —":
-            with st.spinner("Loading chart..."):
-                try:
-                    sym = next(i['yf_symbol'] for i in WATCHLIST if i['name']==sel)
-                    cdf = get_chart_data(sym)
-                    if cdf is not None and len(cdf) >= 5:
-                        last_adx = cdf['ADX'].iloc[-1]
-                        last_atr = cdf['ATR'].iloc[-1]
-                        last_cls = cdf['Close'].iloc[-1]
-                        trend_up = cdf['EMA5'].iloc[-1] > cdf['EMA39'].iloc[-1]
-                        htf_bull = cdf['Close'].iloc[-1] > cdf['EMA39_1H'].iloc[-1]
-
-                        trend_col = "#3fb950" if trend_up else "#f85149"
-                        htf_col   = "#3fb950" if htf_bull else "#f85149"
-                        adx_col   = "#3fb950" if last_adx > 25 else ("#e3b341" if last_adx > 20 else "#f85149")
-                        st.markdown(f"""<div style="display:flex;gap:16px;flex-wrap:wrap;
-                            margin-bottom:8px;font-size:.8rem">
-                            <span style="color:#f0f6fc;font-weight:700">{sel}</span>
-                            <span style="color:{trend_col}">15m: {'🟢 Bull' if trend_up else '🔴 Bear'}</span>
-                            <span style="color:{htf_col}">1H: {'🟢 Bull' if htf_bull else '🔴 Bear'}</span>
-                            <span style="color:{adx_col}">ADX: {last_adx:.1f}</span>
-                            <span style="color:#8b949e">ATR: {last_atr:.2f}</span>
-                            <span style="color:#8b949e">Price: {last_cls:.2f}</span>
-                        </div>""", unsafe_allow_html=True)
-
-                        fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                                            vertical_spacing=0.03, row_heights=[0.72,0.28])
-                        x = cdf.index.strftime('%d/%m %H:%M')
-
-                        fig.add_trace(go.Candlestick(x=x, open=cdf['Open'], high=cdf['High'],
-                            low=cdf['Low'], close=cdf['Close'], name="Price",
-                            increasing_line_color='#3fb950', decreasing_line_color='#f85149',
-                            increasing_fillcolor='rgba(63,185,80,0.7)',
-                            decreasing_fillcolor='rgba(248,81,73,0.7)'), row=1, col=1)
-
-                        fig.add_trace(go.Scatter(x=x, y=cdf['EMA5'],
-                            line=dict(color='#58a6ff',width=1.5), name='EMA5'), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=x, y=cdf['EMA39'],
-                            line=dict(color='#f0883e',width=2.0), name='EMA39'), row=1, col=1)
-                        fig.add_trace(go.Scatter(x=x, y=cdf['EMA39_1H'],
-                            line=dict(color='#a371f7',width=1.5,dash='dot'), name='EMA39 1H',
-                            opacity=0.8), row=1, col=1)
-
-                        fig.add_trace(go.Scatter(x=x, y=cdf['ADX'],
-                            line=dict(color='#ffd700',width=1.5), name='ADX',
-                            fill='tozeroy', fillcolor='rgba(255,215,0,0.04)'), row=2, col=1)
-                        fig.add_hline(y=20, line_dash="dot", line_color="rgba(110,118,129,0.5)",
-                                      annotation_text="20", annotation_font_color="#6e7681",
-                                      row=2, col=1)
-                        fig.add_hline(y=25, line_dash="dot", line_color="rgba(63,185,80,0.3)",
-                                      annotation_text="25", annotation_font_color="#3fb950",
-                                      row=2, col=1)
-
-                        fig.update_layout(
-                            template="plotly_dark",
-                            paper_bgcolor='#0d1117', plot_bgcolor='#0d1117',
-                            xaxis_rangeslider_visible=False,
-                            height=640,
-                            legend=dict(orientation='h', y=1.01, x=0,
-                                        bgcolor='rgba(0,0,0,0)', font=dict(size=11)),
-                            margin=dict(t=10, b=10, l=0, r=0),
-                            xaxis2=dict(showgrid=True, gridcolor='rgba(33,38,45,0.8)'),
-                            yaxis=dict(showgrid=True, gridcolor='rgba(33,38,45,0.8)',side='right'),
-                            yaxis2=dict(showgrid=True, gridcolor='rgba(33,38,45,0.5)',
-                                        range=[0,60], side='right'))
-                        st.plotly_chart(fig, use_container_width=True)
-                        del fig
-                    else:
-                        st.warning("Not enough data to display chart.")
-                except Exception:
-                    st.error("Chart unavailable for this asset.")
-    else:
-        st.info("⏳ Waiting for first data sync...")
