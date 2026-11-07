@@ -1,0 +1,105 @@
+Nifty 100 stocks/Data/ABB_minute.csv
+Nifty 100 stocks/Data/ADANIENSOL_minute.csv
+Nifty 100 stocks/Data/ADANIENT_minute.csv
+Nifty 100 stocks/Data/ADANIGREEN_minute.csv
+Nifty 100 stocks/Data/ADANIPORTS_minute.csv
+Nifty 100 stocks/Data/ADANIPOWER_minute.csv
+Nifty 100 stocks/Data/AMBUJACEM_minute.csv
+Nifty 100 stocks/Data/APOLLOHOSP_minute.csv
+Nifty 100 stocks/Data/ASIANPAINT_minute.csv
+Nifty 100 stocks/Data/ATGL_minute.csv
+Nifty 100 stocks/Data/AXISBANK_minute.csv
+Nifty 100 stocks/Data/BAJAJ-AUTO_minute.csv
+Nifty 100 stocks/Data/BAJAJFINSV_minute.csv
+Nifty 100 stocks/Data/BAJAJHLDNG_minute.csv
+Nifty 100 stocks/Data/BAJFINANCE_minute.csv
+Nifty 100 stocks/Data/BANKBARODA_minute.csv
+Nifty 100 stocks/Data/BEL_minute.csv
+Nifty 100 stocks/Data/BHARTIARTL_minute.csv
+Nifty 100 stocks/Data/BHEL_minute.csv
+Nifty 100 stocks/Data/BOSCHLTD_minute.csv
+Nifty 100 stocks/Data/BPCL_minute.csv
+Nifty 100 stocks/Data/BRITANNIA_minute.csv
+Nifty 100 stocks/Data/CANBK_minute.csv
+Nifty 100 stocks/Data/CHOLAFIN_minute.csv
+Nifty 100 stocks/Data/CIPLA_minute.csv
+Nifty 100 stocks/Data/COALINDIA_minute.csv
+Nifty 100 stocks/Data/DABUR_minute.csv
+Nifty 100 stocks/Data/DIVISLAB_minute.csv
+Nifty 100 stocks/Data/DLF_minute.csv
+Nifty 100 stocks/Data/DMART_minute.csv
+Nifty 100 stocks/Data/DRREDDY_minute.csv
+Nifty 100 stocks/Data/EICHERMOT_minute.csv
+Nifty 100 stocks/Data/GAIL_minute.csv
+Nifty 100 stocks/Data/GODREJCP_minute.csv
+Nifty 100 stocks/Data/GRASIM_minute.csv
+Nifty 100 stocks/Data/HAL_minute.csv
+Nifty 100 stocks/Data/HAVELLS_minute.csv
+Nifty 100 stocks/Data/HCLTECH_minute.csv
+Nifty 100 stocks/Data/HDFCBANK_minute.csv
+Nifty 100 stocks/Data/HDFCLIFE_minute.csv
+Nifty 100 stocks/Data/HEROMOTOCO_minute.csv
+Nifty 100 stocks/Data/HINDALCO_minute.csv
+Nifty 100 stocks/Data/HINDUNILVR_minute.csv
+Nifty 100 stocks/Data/ICICIBANK_minute.csv
+Nifty 100 stocks/Data/ICICIGI_minute.csv
+Nifty 100 stocks/Data/ICICIPRULI_minute.csv
+Nifty 100 stocks/Data/INDIA VIX_minute.csv
+Nifty 100 stocks/Data/INDIGO_minute.csv
+Nifty 100 stocks/Data/INDUSINDBK_minute.csv
+Nifty 100 stocks/Data/INFY_minute.csv
+Nifty 100 stocks/Data/IOC_minute.csv
+Nifty 100 stocks/Data/IRCTC_minute.csv
+Nifty 100 stocks/Data/IRFC_minute.csv
+Nifty 100 stocks/Data/ITC_minute.csv
+Nifty 100 stocks/Data/JINDALSTEL_minute.csv
+Nifty 100 stocks/Data/JIOFIN_minute.csv
+Nifty 100 stocks/Data/JSWENERGY_minute.csv
+Nifty 100 stocks/Data/JSWSTEEL_minute.csv
+Nifty 100 stocks/Data/KOTAKBANK_minute.csv
+Nifty 100 stocks/Data/LICI_minute.csv
+Nifty 100 stocks/Data/LODHA_minute.csv
+Nifty 100 stocks/Data/LTIM_minute.csv
+Nifty 100 stocks/Data/LT_minute.csv
+Nifty 100 stocks/Data/MARUTI_minute.csv
+Nifty 100 stocks/Data/MOTHERSON_minute.csv
+Nifty 100 stocks/Data/NAUKRI_minute.csv
+Nifty 100 stocks/Data/NESTLEIND_minute.csv
+Nifty 100 stocks/Data/NHPC_minute.csv
+Nifty 100 stocks/Data/NTPC_minute.csv
+Nifty 100 stocks/Data/ONGC_minute.csv
+Nifty 100 stocks/Data/PFC_minute.csv
+Nifty 100 stocks/Data/PIDILITIND_minute.csv
+Nifty 100 stocks/Data/PNB_minute.csv
+Nifty 100 stocks/Data/POWERGRID_minute.csv
+Nifty 100 stocks/Data/RECLTD_minute.csv
+Nifty 100 stocks/Data/RELIANCE_minute.csv
+Nifty 100 stocks/Data/SBILIFE_minute.csv
+Nifty 100 stocks/Data/SBIN_minute.csv
+Nifty 100 stocks/Data/SHREECEM_minute.csv
+Nifty 100 stocks/Data/SHRIRAMFIN_minute.csv
+Nifty 100 stocks/Data/SIEMENS_minute.csv
+Nifty 100 stocks/Data/SUNPHARMA_minute.csv
+Nifty 100 stocks/Data/TATACONSUM_minute.csv
+Nifty 100 stocks/Data/TATAMOTORS_minute.csv
+Nifty 100 stocks/Data/TATAPOWER_minute.csv
+Nifty 100 stocks/Data/TCS_minute.csv
+Nifty 100 stocks/Data/TVSMOTOR_minute.csv
+multi_index_strategy/data/ADANIENT_minute.csv
+multi_index_strategy/data/ADANIGREEN_minute.csv
+multi_index_strategy/data/AMBUJACEM_minute.csv
+multi_index_strategy/data/BANKBARODA_minute.csv
+multi_index_strategy/data/BHEL_minute.csv
+multi_index_strategy/data/CANBK_minute.csv
+multi_index_strategy/data/EICHERMOT_minute.csv
+multi_index_strategy/data/GAIL_minute.csv
+multi_index_strategy/data/INDIA_VIX_minute.csv
+multi_index_strategy/data/MARUTI_minute.csv
+multi_index_strategy/data/NIFTY_50_minute_data.csv
+multi_index_strategy/data/NIFTY_BANK_minute_data.csv
+multi_index_strategy/data/NIFTY_CONSUMPTION_minute_data.csv
+multi_index_strategy/data/NIFTY_ENERGY_minute_data.csv
+multi_index_strategy/data/PFC_minute.csv
+multi_index_strategy/data/POWERGRID_minute.csv
+multi_index_strategy/data/RECLTD_minute.csv
+output/features_minute.csv
