@@ -1,0 +1,21 @@
+{
+  "BTC_LOWVOL_TREND_BREAKOUT": {
+    "status": "DEPLOYABLE_PARKED",
+    "approved_on": "2026-11-07",
+    "symbol": "BTC-USD (traded in INR)",
+    "timeframe": "1D, decision at daily close, entry next open",
+    "rules": {
+      "trend": "EMA20 > EMA50 > EMA200",
+      "entry": "close > highest high of previous 20 days",
+      "stop": "3.5 x ATR14, closing-basis; hard intraday stop at -10%",
+      "volatility_gate": "skip if stop distance > 10% of entry",
+      "target": "2R",
+      "break_even": "at +1R move stop to entry + costs (0.7%)",
+      "position": "Rs 1,00,000 notional, long only, no leverage, one position at a time"
+    },
+    "backtest_2015_2026": {"trades": 27, "win_pct": 85.2, "payoff": 1.73, "profit_factor": 9.94,
+                           "max_dd_pct": -10.6, "inr_per_year_pre_tax": 27797, "oos_2023_plus_trades": 7},
+    "caveats": ["OOS sample (7 trades) below the 30-trade target", "~2.7 trades/yr", "30% crypto tax + cess, no loss set-off"],
+    "research": "research2/stage4_volbo.py, research2/sim.py"
+  }
+}
