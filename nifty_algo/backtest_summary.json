@@ -1,0 +1,104 @@
+{
+  "trades": 153,
+  "trades_per_year": 16.7,
+  "win_rate_pct": 72.5,
+  "win_rate_95ci": [
+    65.0,
+    79.0
+  ],
+  "profit_factor": 1.57,
+  "avg_win_pts": 150.5,
+  "avg_loss_pts": -253.5,
+  "expectancy_pts": 39.6,
+  "total_pts": 6059.7,
+  "total_inr_per_lot": 393882.0,
+  "max_drawdown_pts": -1931.7,
+  "worst_trade_pts": -1120.1,
+  "avg_days_held": 3.73,
+  "exit_reasons": {
+    "TARGET: close > prev high": 150,
+    "TIME: held 10 days": 3
+  },
+  "by_year": {
+    "2017": {
+      "n": 11,
+      "win_pct": 63.6,
+      "pts": -317.1
+    },
+    "2018": {
+      "n": 18,
+      "win_pct": 61.1,
+      "pts": -132.1
+    },
+    "2019": {
+      "n": 19,
+      "win_pct": 68.4,
+      "pts": 57.6
+    },
+    "2020": {
+      "n": 11,
+      "win_pct": 100.0,
+      "pts": 1579.5
+    },
+    "2021": {
+      "n": 18,
+      "win_pct": 77.8,
+      "pts": 1727.5
+    },
+    "2022": {
+      "n": 15,
+      "win_pct": 60.0,
+      "pts": -229.2
+    },
+    "2023": {
+      "n": 16,
+      "win_pct": 81.2,
+      "pts": 475.1
+    },
+    "2024": {
+      "n": 20,
+      "win_pct": 80.0,
+      "pts": 2194.2
+    },
+    "2025": {
+      "n": 18,
+      "win_pct": 72.2,
+      "pts": 810.3
+    },
+    "2026": {
+      "n": 7,
+      "win_pct": 57.1,
+      "pts": -106.2
+    }
+  },
+  "by_setup": {
+    "IBS": {
+      "n": 129,
+      "win_pct": 70.5,
+      "pf": 1.38,
+      "pts": 3762.7
+    },
+    "IBS+RSI": {
+      "n": 10,
+      "win_pct": 90.0,
+      "pf": 4.67,
+      "pts": 812.8
+    },
+    "RSI": {
+      "n": 14,
+      "win_pct": 78.6,
+      "pf": 3.51,
+      "pts": 1484.3
+    }
+  },
+  "in_sample_2017_2022": {
+    "n": 92,
+    "win_pct": 70.7,
+    "pf": 1.51
+  },
+  "out_of_sample_2023_plus": {
+    "n": 61,
+    "win_pct": 75.4,
+    "pf": 1.62
+  }
+}

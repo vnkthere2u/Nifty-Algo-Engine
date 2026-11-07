@@ -1,12 +1,8 @@
-# requirements.txt — Algo Engine Terminal v2.1
-# pandas_ta removed — unmaintained, pyproject.toml build hangs on Python 3.12.
-# tvdatafeed removed — not on PyPI, Streamlit Cloud blocks git installs.
-# All indicators (EMA, ATR, ADX) implemented inline with pandas/numpy.
- 
-streamlit>=1.35.0
+# Algo Engine v4.0 (NIFTY TPMR)
+pandas>=2.0
+numpy>=1.26
+requests>=2.31
+streamlit>=1.48
 streamlit-autorefresh>=1.0.1
-pandas>=2.0.0,<3.0.0
-numpy>=1.26.0,<2.0.0
-requests>=2.31.0
-yfinance>=0.2.40
-plotly>=5.20.0
+yfinance>=0.2.40      # optional fallback feed only
+pytest>=8.0           # tests

@@ -6,7 +6,8 @@
     "codespaces": {
       "openFiles": [
         "README.md",
-        "algo_dashboard.py"
+        "algo_dashboard.py",
+        "nifty_algo/strategy.py"
       ]
     },
     "vscode": {
@@ -19,6 +20,7 @@
   },
   "updateContentCommand": "[ -f packages.txt ] && sudo apt update && sudo apt upgrade -y && sudo xargs apt install -y <packages.txt; [ -f requirements.txt ] && pip3 install --user -r requirements.txt; pip3 install --user streamlit; echo '✅ Packages installed and Requirements met'",
   "postAttachCommand": {
+    "engine": "mkdir -p data && nohup python3 -m nifty_algo.runner > data/engine.log 2>&1 &",
     "server": "streamlit run algo_dashboard.py --server.enableCORS false --server.enableXsrfProtection false"
   },
   "portsAttributes": {

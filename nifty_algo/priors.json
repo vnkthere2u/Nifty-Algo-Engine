@@ -1,0 +1,18 @@
+{
+  "ALL": {
+    "wins": 111,
+    "losses": 42
+  },
+  "IBS": {
+    "wins": 91,
+    "losses": 38
+  },
+  "IBS+RSI": {
+    "wins": 9,
+    "losses": 1
+  },
+  "RSI": {
+    "wins": 11,
+    "losses": 3
+  }
+}
