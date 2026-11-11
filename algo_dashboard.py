@@ -38,6 +38,22 @@ def _secret(key, default=None):
 
 STATE_URL = os.environ.get("ALGO_STATE_URL") or _secret(
     "ALGO_STATE_URL", "https://raw.githubusercontent.com/vnkthere2u/Nifty-Algo-Engine/algo-state")
+# ---- in-app engine (simple hosting): the app itself runs the engines in a background thread
+ENGINE_IN_APP = str(os.environ.get("ALGO_ENGINE_IN_APP", _secret("ALGO_ENGINE_IN_APP", "1"))).lower() not in ("0", "false", "no")
+if ENGINE_IN_APP:
+    os.environ.setdefault("NIFTY_ALGO_STATE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_live"))
+    for k in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"):
+        if not os.environ.get(k) and _secret(k):
+            os.environ[k] = str(_secret(k))
+
+
+@st.cache_resource
+def _engine():
+    from nifty_algo.inapp import start_background
+    return start_background()
+
+
+ENGINE = _engine() if ENGINE_IN_APP else None
 LOCAL_DIR = os.environ.get("NIFTY_ALGO_STATE_DIR")
 
 STRATS = {
@@ -64,7 +80,7 @@ st.markdown("""<style>
 
 
 # ------------------------------------------------------------------ data access
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=20, show_spinner=False)
 def fetch(name: str):
     """Return a local path to the state file (downloaded from the state branch), or None."""
     if LOCAL_DIR:
@@ -153,7 +169,15 @@ status = json.load(open(status_path)) if status_path else None
 data = {sid: load(sid) for sid in STRATS}
 
 c = st.columns(4)
-if status:
+if ENGINE is not None and ENGINE.get("last_tick"):
+    lt = datetime.fromisoformat(ENGINE["last_tick"])
+    age = (now - lt).total_seconds()
+    card(c[0], "Engine (in app)", "🟢 running" if age < 120 else "🔴 stalled",
+         f"last tick {lt:%H:%M:%S} IST · {ENGINE['ticks']} ticks since {ENGINE['started'][11:16]}"
+         + (f" · error: {ENGINE['error'][:60]}" if ENGINE.get("error") else ""))
+elif ENGINE is not None:
+    card(c[0], "Engine (in app)", "🟡 starting", "first tick within 30 s")
+elif status:
     upd = datetime.fromisoformat(status["updated"])
     age_min = (now - upd).total_seconds() / 60
     ok = age_min <= 90

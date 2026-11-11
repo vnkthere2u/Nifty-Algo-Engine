@@ -7,10 +7,12 @@
 name: algo-engine
 
 on:
-  schedule:
-    - cron: "13 9 * * 1-5"    # 14:43 IST  NIFTY session
-    - cron: "41 9 * * 1-5"    # 15:11 IST  NIFTY session (backup)
-    - cron: "17 * * * *"      # hourly     BTC + monitors
+  # Schedules disabled: the engine now runs inside the Streamlit app (nifty_algo/inapp.py).
+  # Re-enable the cron lines below only if you stop the in-app engine (ALGO_ENGINE_IN_APP=0).
+  # schedule:
+  #   - cron: "13 9 * * 1-5"
+  #   - cron: "41 9 * * 1-5"
+  #   - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       mode:
