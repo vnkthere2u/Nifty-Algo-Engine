@@ -11,7 +11,6 @@ on:
     - cron: "13 9 * * 1-5"    # 14:43 IST  NIFTY session
     - cron: "41 9 * * 1-5"    # 15:11 IST  NIFTY session (backup)
     - cron: "17 * * * *"      # hourly     BTC + monitors
-    - cron: "7,37 3-9 * * 1-5"  # every 30 min 08:37-15:07 IST: refresh NIFTY live conditions
   workflow_dispatch:
     inputs:
       mode:
