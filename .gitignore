@@ -7,3 +7,4 @@ __pycache__/
 logs/
 .streamlit/secrets.toml
 state/
+state_live/
