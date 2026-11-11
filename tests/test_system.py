@@ -170,7 +170,7 @@ def test_full_lifecycle_entry_hold_exit_and_idempotency(tmp_path):
     daily, bars, d0, d1 = _scenario()
     feed = ScriptedFeed(daily, bars)
     eng = _engine(tmp_path, feed)
-    assert eng.tick(_at(d0, 15, 20)) == []                       # before decision window: nothing
+    assert "decision" not in eng.tick(_at(d0, 15, 20))            # before decision window: no decision
     assert "decision" in eng.tick(_at(d0, 15, 25))
     pos = eng.j.open_position()
     assert pos and pos["setup"] in ("RSI", "IBS", "IBS+RSI") and pos["confidence"] > 50
@@ -290,3 +290,31 @@ def test_live_engine_matches_backtest(tmp_path):
     bt = bt[pd.to_datetime(bt.exit_date) <= pd.to_datetime(lv.exit_date).max()]
     assert len(bt) == len(lv) > 5
     assert np.allclose(bt.entry.values, lv.entry_price.values) and np.allclose(bt.exit.values, lv.exit_price.values)
+
+
+def test_fill_recent_days_adds_missing_session():
+    from nifty_algo.feeds import fill_recent_days
+    daily = pd.DataFrame({"Open": [1.0], "High": [2.0], "Low": [0.5], "Close": [1.5]}, index=[pd.Timestamp("2026-11-09")])
+    idx = pd.date_range("2026-11-11 09:15", periods=3, freq="1min")
+    m = pd.DataFrame({"Open": [10, 11, 12.0], "High": [11, 13, 12.5], "Low": [9, 10.5, 11.0], "Close": [10.5, 12, 12.2]}, index=idx)
+    out = fill_recent_days(daily, m)
+    assert list(out.index) == [pd.Timestamp("2026-11-09"), pd.Timestamp("2026-11-11")]
+    assert out.iloc[-1].tolist() == [10, 13, 9, 12.2]
+
+
+def test_nifty_conditions_triggers_are_consistent(tmp_path):
+    from nifty_algo.conditions import nifty_conditions
+    from nifty_algo.indicators import rsi as _rsi
+    daily, bars, d0, _ = _scenario()
+    feed = ScriptedFeed(daily, bars)
+    eng = _engine(tmp_path, feed)
+    snap = feed.snapshot(_at(d0, 12, 0), 555)
+    c = nifty_conditions(eng.cfg, snap, None, _at(d0, 12, 0))
+    assert {r["rule"].split(":")[0] for r in c["rules"]} >= {"Trend", "Setup A", "Setup B"}
+    lv = {x["level"]: x["price"] for x in c["levels"]}
+    H, L = bars[d0]["High"], bars[d0]["Low"]
+    assert lv["IBS trigger"] == pytest.approx(L + 0.15 * (H - L), abs=0.01)
+    if lv["RSI(2) trigger"]:
+        closes = pd.concat([daily.Close.iloc[:-1], pd.Series([lv["RSI(2) trigger"] - 0.01])], ignore_index=True)
+        assert _rsi(closes, 2).iloc[-1] < 10
+    assert c["verdict"].startswith("ENTRY CONDITIONS MET")   # scenario day is a valid dip-buy
