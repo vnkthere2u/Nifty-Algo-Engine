@@ -1,0 +1,66 @@
+# Always-on paper-trading engine (NIFTY TPMR + BTC breakout). GitHub Actions never sleeps.
+#  - NIFTY session job: starts ~14:43 IST on weekdays, ticks every 30 s until 15:40 IST
+#    (15:25 decision, monitoring, EOD summary). A 15:11 IST run is a backup if the first is delayed.
+#  - Hourly job: BTC daily decision (first run after 00:00 UTC), stop/target checks for open
+#    positions, and a late NIFTY decision from the 15:25 snapshot if the session job was missed.
+# State (SQLite journal) lives on the `algo-state` branch; the Streamlit dashboard reads it.
+name: algo-engine
+
+on:
+  schedule:
+    - cron: "13 9 * * 1-5"    # 14:43 IST  NIFTY session
+    - cron: "41 9 * * 1-5"    # 15:11 IST  NIFTY session (backup)
+    - cron: "17 * * * *"      # hourly     BTC + monitors
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "once | session | test-telegram"
+        default: once
+
+permissions:
+  contents: write
+
+concurrency:
+  group: algo-state
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      NIFTY_ALGO_STATE_DIR: state
+      ALGO_HOST: github-actions
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-engine.txt
+      - run: pip install -r requirements-engine.txt
+      - name: Load state
+        run: bash deploy/state.sh pull
+      - name: Run engine
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          SCHED="${{ github.event.schedule }}"
+          if [ "$MODE" = "test-telegram" ]; then
+            python -m nifty_algo.runner --test-telegram
+          elif [ "$MODE" = "session" ] || [ "$SCHED" = "13 9 * * 1-5" ] || [ "$SCHED" = "41 9 * * 1-5" ]; then
+            python -m nifty_algo.runner --until 15:40
+          else
+            python -m nifty_algo.runner --once
+          fi
+      - name: Save state
+        if: always()
+        run: bash deploy/state.sh push
+      - name: Alert on failure
+        if: failure()
+        run: |
+          [ -n "$TELEGRAM_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="⚠️ Algo engine run failed: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" || true

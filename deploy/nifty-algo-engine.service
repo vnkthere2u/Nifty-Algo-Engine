@@ -1,0 +1,21 @@
+# systemd unit for the always-on engine (Linux VM / home server).
+#   sudo cp deploy/nifty-algo-engine.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now nifty-algo-engine
+# Secrets: put TELEGRAM_TOKEN / TELEGRAM_CHAT_ID in /etc/nifty-algo.env (chmod 600).
+[Unit]
+Description=NIFTY TPMR algo engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=algo
+WorkingDirectory=/opt/nifty-algo-engine
+EnvironmentFile=-/etc/nifty-algo.env
+ExecStart=/usr/bin/python3 -m nifty_algo.runner
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

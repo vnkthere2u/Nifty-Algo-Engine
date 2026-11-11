@@ -1,0 +1,13 @@
+[Unit]
+Description=NIFTY TPMR dashboard (read-only)
+After=network-online.target
+
+[Service]
+Type=simple
+User=algo
+WorkingDirectory=/opt/nifty-algo-engine
+ExecStart=/usr/bin/python3 -m streamlit run algo_dashboard.py --server.port 8501 --server.headless true
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
