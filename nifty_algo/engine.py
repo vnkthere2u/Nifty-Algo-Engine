@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from .bars import FEATURE_WINDOW
+from .conditions import nifty_conditions
 from .confidence import confidence, load_priors
 from .config import IST, Config
 from .feeds import FeedError
@@ -52,6 +53,7 @@ class Engine:
             ("monitor", self._monitor_due(now, m), self.monitor),
             ("decision", self._decision_due(now, m), self.decide),
             ("eod", self._eod_due(now, m), self.eod),
+            ("conditions", self._cond_due(now), self.update_conditions),
         ):
             if not due:
                 continue
@@ -65,6 +67,18 @@ class Engine:
                 self.j.event("ERROR", name, f"{e}\n{traceback.format_exc()}")
                 log.exception("%s failed", name)
         return done
+
+    track_conditions = True   # display snapshot; replays turn it off for speed
+
+    def _cond_due(self, now) -> bool:
+        if not self.track_conditions:
+            return False
+        c = self.j.get("conditions")
+        return c is None or (now - datetime.fromisoformat(c["updated"])).total_seconds() >= 235
+
+    def update_conditions(self, now: datetime):
+        snap = self.feed.snapshot(now, self.cfg.session_open_min, None)
+        self.j.set("conditions", nifty_conditions(self.cfg, snap, self.j.open_position(), now))
 
     def _monitor_due(self, now, m) -> bool:
         if not (self.cfg.session_open_min <= m <= self.cfg.session_close_min):

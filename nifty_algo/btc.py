@@ -21,6 +21,7 @@ import numpy as np
 import pandas as pd
 import requests
 
+from .conditions import btc_conditions
 from .confidence import confidence
 from .config import IST, state_dir
 from .feeds import FeedError, YahooFeed
@@ -265,6 +266,12 @@ class BtcEngine:
                 else:
                     self._mark(ps, float(r.Close), float(r.High), float(r.Low))
                     self._be_alert(ps, float(r.High))
+        try:
+            if "usdinr" in d.columns:
+                f["usdinr"] = d["usdinr"]
+            self.j.set("conditions", btc_conditions(f, today, self._pos(), self.j.get("btc_pending"), p, now.astimezone(IST)))
+        except Exception as e:  # display-only; never block trading logic
+            self.j.event("WARN", "btc", f"conditions snapshot failed: {e}")
         return done
 
     # actions --------------------------------------------------------

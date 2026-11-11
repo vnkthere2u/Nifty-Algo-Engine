@@ -146,14 +146,15 @@ class YahooFeed:
         """Build the strategy snapshot.  cutoff_min: only intraday bars that START before this
         minute are used (15:25 -> identical to the backtest)."""
         today = now.astimezone(IST).replace(tzinfo=None).date()
-        intr = self.intraday()
-        intr = intr[intr.index.date == today]
-        mins = intr.index.hour * 60 + intr.index.minute
-        intr = intr[mins >= session_open_min]
+        recent = self._chart("1m", "5d")
+        rm = recent.index.hour * 60 + recent.index.minute
+        recent = recent[(rm >= session_open_min) & (rm < 15 * 60 + 30)]
+        intr = recent[recent.index.date == today]
         if cutoff_min is not None:
             intr = intr[(intr.index.hour * 60 + intr.index.minute) < cutoff_min]
         daily = self.daily()
         daily = daily[daily.index.date < today][["Open", "High", "Low", "Close"]]
+        daily = fill_recent_days(daily, recent[recent.index.date < today])
         validate_daily(daily)
         if intr.empty:
             return Snapshot(daily=daily, today=None, last_price=None, as_of=None)
@@ -162,6 +163,19 @@ class YahooFeed:
         validate_today(tb, daily)
         return Snapshot(daily=daily, today=tb, last_price=float(intr.Close.iloc[-1]),
                         as_of=intr.index[-1].to_pydatetime().replace(tzinfo=IST))
+
+
+def fill_recent_days(daily: pd.DataFrame, minutes: pd.DataFrame) -> pd.DataFrame:
+    """Yahoo's daily series can lag by a day; add any completed session found in 1-minute data
+    but missing from the daily bars (full-session aggregation, as in the backtest)."""
+    if minutes is None or minutes.empty:
+        return daily
+    agg = minutes.groupby(minutes.index.normalize()).agg(
+        Open=("Open", "first"), High=("High", "max"), Low=("Low", "min"), Close=("Close", "last"))
+    missing = agg[~agg.index.isin(daily.index)]
+    if missing.empty:
+        return daily
+    return pd.concat([daily, missing]).sort_index()
 
 
 def validate_daily(daily: pd.DataFrame):

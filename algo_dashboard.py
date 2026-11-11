@@ -15,6 +15,7 @@ import sqlite3
 import tempfile
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -79,6 +80,27 @@ def fetch(name: str):
         return path
     except Exception:
         return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def live_price(symbol: str):
+    """Latest 1-minute price from Yahoo (display only; the engine does its own fetching)."""
+    try:
+        r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{requests.utils.quote(symbol)}",
+                         params={"interval": "1m", "range": "1d"}, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        res = r.json()["chart"]["result"][0]
+        closes = [c for c in res["indicators"]["quote"][0]["close"] if c is not None]
+        ts = [t for t, c in zip(res["timestamp"], res["indicators"]["quote"][0]["close"]) if c is not None]
+        return float(closes[-1]), datetime.fromtimestamp(ts[-1], IST)
+    except Exception:
+        return None, None
+
+
+def live_levels():
+    n, nt = live_price("^NSEI")
+    b, bt_ = live_price("BTC-USD")
+    fx, _ = live_price("INR=X")
+    return {"NIFTY": (n, nt), "BTC": ((b * fx) if (b and fx) else None, bt_)}
 
 
 def q(path, sql, params=()):
@@ -172,9 +194,50 @@ for col, (sid, meta) in zip(cols, STRATS.items()):
         card(k[2], "Paper record", f"{s['n']} trades", f"win {s['win']:.0f}% (bt {meta['bt']['win']}%) · {inr(s['net'])}" if s["n"] else f"backtest win {meta['bt']['win']}%")
 
 st.write("")
-tabs = st.tabs(["📈 Performance", "📂 Open positions", "📒 Trade ledger", "🧭 Signals & decisions", "🛠 Events", "📜 Rules"])
+tabs = st.tabs(["📡 Live conditions", "📈 Performance", "📂 Open positions", "📒 Trade ledger", "🧭 Signals & decisions",
+                "🛠 Events", "📜 Rules"])
 
 with tabs[0]:
+    live = live_levels()
+    st.caption(f"Page refreshed {now:%d-%b %H:%M:%S} IST. 'Engine' values are what the engine computed on its last run; "
+               "'Live' prices are fetched by this page every minute for reference.")
+    for sid in STRATS:
+        c = kv(data[sid]["path"], "conditions")
+        lp, lt = live[sid]
+        st.markdown(f"#### {STRATS[sid]['title']}")
+        if not c:
+            st.info("No condition snapshot yet. It appears after the engine's next run.")
+            continue
+        upd = datetime.fromisoformat(c["updated"])
+        m = st.columns(4)
+        fmt = (lambda x: f"₹{x:,.0f}") if sid == "BTC" else (lambda x: f"{x:,.2f}")
+        card(m[0], "Engine price", fmt(c["price"]), f"{c['source']} · run {upd:%d-%b %H:%M}")
+        card(m[1], "Live price", fmt(lp) if lp else "n/a",
+             (f"{lt:%H:%M} IST · {100 * (lp / c['price'] - 1):+.2f}% vs engine" if lp else "live fetch unavailable"))
+        card(m[2], "Decision time", c["decision_time"].split(" (")[0], c.get("session", "") if sid == "NIFTY" else "daily UTC close · 24×7")
+        posd = c.get("position")
+        card(m[3], "Position", f"LONG {posd['pnl_pct']:+.2f}%" if posd else "FLAT",
+             f"entry {posd['entry']:,} on {posd['entry_date']}" if posd else "")
+        ok_all = c["verdict"].startswith(("ENTRY CONDITIONS MET", "SIGNAL", "IN POSITION"))
+        (st.success if ok_all else st.info)(c["verdict"])
+        rules = pd.DataFrame(c["rules"])
+        rules["status"] = np.where(rules.ok, "✅ met", "❌ not met")
+        st.dataframe(rules[["rule", "current", "required", "status", "note"]], hide_index=True, width="stretch")
+        lv = pd.DataFrame(c["levels"])
+        lv = lv.rename(columns={"dist_pct": "distance from engine price %"})
+        if lp:
+            lv["distance from live price %"] = [round(100 * (x / lp - 1), 2) if x else None for x in lv.price]
+        st.dataframe(lv, hide_index=True, width="stretch")
+        if sid == "NIFTY":
+            st.caption("Distance % = how far the price must move from here to reach that level (negative = must fall). "
+                       "Entry needs the 15:25 price at or below the entry trigger while staying above SMA50. "
+                       "The IBS trigger moves with the day's high/low; the RSI trigger is fixed for the day.")
+        else:
+            st.caption("Distance % = how far BTC must move to reach that level. A buy needs all three rules true at the "
+                       "UTC daily close (05:30 IST); the paper entry is then the next day's open.")
+        st.write("")
+
+with tabs[1]:
     if len(allc):
         e = allc.sort_values("exit_ts")[["exit_date", "net_inr", "strategy"]].copy()
         e["Cumulative P&L (₹)"] = e.net_inr.cumsum()
@@ -193,7 +256,7 @@ with tabs[0]:
     else:
         st.info("No closed paper trades yet. NIFTY averages ~17 trades/yr and BTC ~3/yr, so the first ones can take days to weeks.")
 
-with tabs[1]:
+with tabs[2]:
     rows = []
     for sid, d in data.items():
         for _, p in d["open"].iterrows():
@@ -208,7 +271,7 @@ with tabs[1]:
     else:
         st.info("No open positions.")
 
-with tabs[2]:
+with tabs[3]:
     if len(allc):
         led = allc[["strategy", "entry_date", "entry_price", "exit_date", "exit_price", "exit_reason", "setup",
                     "confidence", "net_inr"]].copy()
@@ -218,7 +281,7 @@ with tabs[2]:
     else:
         st.info("No closed trades yet.")
 
-with tabs[3]:
+with tabs[4]:
     for sid, d in data.items():
         st.markdown(f"**{sid}**")
         dec = d["dec"]
@@ -230,7 +293,7 @@ with tabs[3]:
         else:
             st.caption("No decisions recorded yet.")
 
-with tabs[4]:
+with tabs[5]:
     ev = pd.concat([d["ev"].assign(strategy=s) for s, d in data.items() if len(d["ev"])], ignore_index=True) \
         if any(len(d["ev"]) for d in data.values()) else pd.DataFrame()
     if len(ev):
@@ -240,7 +303,7 @@ with tabs[4]:
     if status:
         st.caption(f"Engine host: {status.get('host')} · last result: {status.get('last_result')}")
 
-with tabs[5]:
+with tabs[6]:
     for sid, meta in STRATS.items():
         bt = meta["bt"]
         st.markdown(f"**{meta['title']}**  \n{meta['rules']}  \n"

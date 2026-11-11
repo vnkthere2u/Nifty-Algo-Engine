@@ -62,6 +62,7 @@ def replay(m1: pd.DataFrame, cfg: Config, start: str, end: str, db_path: str, st
         os.remove(db_path)
     feed = HistoricalFeed(m1, cfg.session_close_min)
     eng = Engine(cfg, Journal(db_path), feed, Notifier())
+    eng.track_conditions = False
     days = sorted(d for d in feed.days if pd.Timestamp(start).date() <= d <= pd.Timestamp(end).date())
     for d in days:
         base = datetime(d.year, d.month, d.day, tzinfo=IST)
