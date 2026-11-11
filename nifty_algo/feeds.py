@@ -22,7 +22,7 @@ log = logging.getLogger("nifty_algo.feed")
 
 CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 CHART_URL_ALT = "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}"
-UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+UA = "Mozilla/5.0"  # Yahoo answers 429 to full browser UA strings sent without cookies
 
 
 class FeedError(RuntimeError):
@@ -137,8 +137,8 @@ class YahooFeed:
     def intraday(self) -> pd.DataFrame:
         return self._chart("1m", "1d")
 
-    def daily(self) -> pd.DataFrame:
-        d = self._chart("1d", "2y")
+    def daily(self, rng: str = "2y") -> pd.DataFrame:
+        d = self._chart("1d", rng)
         d.index = d.index.normalize()
         return d[~d.index.duplicated(keep="last")]
 

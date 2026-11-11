@@ -1,54 +1,99 @@
 """
-ALGO ENGINE TERMINAL v4.0 - read-only dashboard for the NIFTY TPMR engine.
+ALGO ENGINE — paper-trading dashboard (NIFTY TPMR + BTC low-vol breakout).
 
-This UI never fetches market data and never runs strategy code: it only reads the SQLite
-journal written by the engine process (`python -m nifty_algo.runner`).  Refreshing it can
-therefore never hang, overlap, or delay execution.
+Read-only. The engine runs on GitHub Actions (never sleeps) and saves its journal to the
+`algo-state` branch; this page downloads those files every minute. It never fetches market
+data or runs strategy code, so it cannot hang, overlap scans, or delay execution.
 
     streamlit run algo_dashboard.py
+Config (optional): env/secret ALGO_STATE_URL (raw URL of the state branch) or
+NIFTY_ALGO_STATE_DIR (read local files instead, e.g. when the engine runs on the same machine).
 """
 import json
 import os
 import sqlite3
-from datetime import datetime
+import tempfile
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import requests
 import streamlit as st
-
-from nifty_algo.config import IST, load_config
 
 try:
     from streamlit_autorefresh import st_autorefresh
-except Exception:  # optional
+except Exception:
     st_autorefresh = None
 
-CFG = load_config(os.environ.get("NIFTY_ALGO_CONFIG"))
-BT_SUMMARY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_algo", "backtest_summary.json")
-BT_TRADES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nifty_algo", "backtest_trades.csv")
+IST = timezone(timedelta(hours=5, minutes=30))
+CAPITAL = 100_000.0
+
+
+def _secret(key, default=None):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+STATE_URL = os.environ.get("ALGO_STATE_URL") or _secret(
+    "ALGO_STATE_URL", "https://raw.githubusercontent.com/vnkthere2u/Nifty-Algo-Engine/algo-state")
+LOCAL_DIR = os.environ.get("NIFTY_ALGO_STATE_DIR")
+
+STRATS = {
+    "NIFTY": {"file": "nifty.db", "title": "NIFTY 50 · Trend-Pullback Mean Reversion",
+              "bt": {"win": 72.5, "ci": "65.0–79.0", "pf": 1.57, "n": 153, "per_yr": 16.7},
+              "rules": "15:25 IST daily: price > SMA50 and (RSI(2) < 10 or IBS < 0.15) → BUY. "
+                       "Exit at a later 15:25 when price > previous day's high, or after 10 days. Disaster stop 8×ATR."},
+    "BTC": {"file": "btc.db", "title": "BTC · Low-volatility trend breakout",
+            "bt": {"win": 85.2, "ci": "67–95", "pf": 9.94, "n": 27, "per_yr": 2.7},
+            "rules": "Daily (UTC): EMA20 > EMA50 > EMA200 and close > prior 20-day high → BUY next open. "
+                     "Stop 3.5×ATR (daily-close basis) + hard −10%; target 2R; break-even at +1R; skip if stop > 10%."},
+}
 
 st.set_page_config(page_title="Algo Engine", layout="wide", initial_sidebar_state="collapsed")
 if st_autorefresh:
-    st_autorefresh(interval=30_000, key="refresh")
-
+    st_autorefresh(interval=60_000, key="refresh")
 st.markdown("""<style>
 .block-container{padding:0.8rem 1rem 0.5rem!important;max-width:100%!important}
-.mc{background:var(--secondary-background-color);border-radius:8px;padding:10px 14px;text-align:center}
+.mc{background:var(--secondary-background-color);border-radius:8px;padding:10px 14px;text-align:center;height:100%}
 .mc-l{font-size:.70rem;opacity:.7;font-weight:600;text-transform:uppercase;letter-spacing:.6px}
-.mc-v{font-size:1.45rem;font-weight:700;line-height:1.2}
-.mc-s{font-size:.72rem;opacity:.7}
+.mc-v{font-size:1.35rem;font-weight:700;line-height:1.25}
+.mc-s{font-size:.74rem;opacity:.75}
 </style>""", unsafe_allow_html=True)
 
 
-def q(sql, params=()):
-    if not os.path.exists(CFG.db_path):
+# ------------------------------------------------------------------ data access
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch(name: str):
+    """Return a local path to the state file (downloaded from the state branch), or None."""
+    if LOCAL_DIR:
+        p = os.path.join(LOCAL_DIR, name)
+        return p if os.path.exists(p) else None
+    try:
+        r = requests.get(f"{STATE_URL}/{name}", timeout=15, headers={"Cache-Control": "no-cache"})
+        if r.status_code != 200:
+            return None
+        fd, path = tempfile.mkstemp(suffix="_" + name)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(r.content)
+        return path
+    except Exception:
+        return None
+
+
+def q(path, sql, params=()):
+    if not path:
         return pd.DataFrame()
-    with sqlite3.connect(f"file:{CFG.db_path}?mode=ro", uri=True, timeout=5) as c:
-        return pd.read_sql_query(sql, c, params=params)
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as c:
+            return pd.read_sql_query(sql, c, params=params)
+    except Exception:
+        return pd.DataFrame()
 
 
-def kv(key):
-    df = q("SELECT value FROM kv WHERE key=?", (key,))
-    return json.loads(df.value.iloc[0]) if len(df) else None
+def kv(path, key):
+    df = q(path, "SELECT value FROM kv WHERE key=?", (key,))
+    return json.loads(df.value.iloc[0]) if len(df) and df.value.iloc[0] is not None else None
 
 
 def card(col, label, value, sub=""):
@@ -56,129 +101,150 @@ def card(col, label, value, sub=""):
                  f"<div class='mc-s'>{sub}</div></div>", unsafe_allow_html=True)
 
 
-st.markdown(f"### ⚙️ Algo Engine — {CFG.name} · Trend-Pullback Mean Reversion")
+def inr(x):
+    return f"₹{x:+,.0f}"
 
-if not os.path.exists(CFG.db_path):
-    st.warning("No journal yet. Start the engine: `python -m nifty_algo.runner` "
-               f"(expected DB at `{CFG.db_path}`).")
 
-# ---------------------------------------------------------------- status row
+def load(sid):
+    path = fetch(STRATS[sid]["file"])
+    pos = q(path, "SELECT * FROM positions ORDER BY id")
+    dec = q(path, "SELECT * FROM decisions ORDER BY id DESC LIMIT 400")
+    ev = q(path, "SELECT ts, level, component, message FROM events ORDER BY id DESC LIMIT 200")
+    closed = pos[pos.status == "CLOSED"].copy() if len(pos) else pos
+    opn = pos[pos.status == "OPEN"].copy() if len(pos) else pos
+    return dict(path=path, closed=closed, open=opn, dec=dec, ev=ev, hb=kv(path, "heartbeat"))
+
+
+def stats(closed):
+    if closed is None or len(closed) == 0:
+        return dict(n=0, win=0.0, be=0, net=0.0)
+    w = closed.net_inr > 0
+    be = closed.exit_reason.fillna("").str.contains("BE").sum()
+    return dict(n=len(closed), win=100 * w.mean(), be=int(be), net=float(closed.net_inr.sum()))
+
+
+# ------------------------------------------------------------------ header
 now = datetime.now(IST)
-hb = kv("heartbeat")
-hb_age = (now - datetime.fromisoformat(hb["ts"])).total_seconds() if hb else None
-closed = q("SELECT * FROM positions WHERE status='CLOSED' ORDER BY id")
-openp = q("SELECT * FROM positions WHERE status='OPEN' ORDER BY id DESC LIMIT 1")
-last_dec = q("SELECT * FROM decisions ORDER BY id DESC LIMIT 1")
-bt = json.load(open(BT_SUMMARY)) if os.path.exists(BT_SUMMARY) else {}
+st.markdown("### ⚙️ Algo Engine — paper trading")
+status_path = fetch("status.json")
+status = json.load(open(status_path)) if status_path else None
+data = {sid: load(sid) for sid in STRATS}
 
-c = st.columns(6)
-if hb_age is None:
-    card(c[0], "Engine", "⚪ offline", "no heartbeat")
+c = st.columns(4)
+if status:
+    upd = datetime.fromisoformat(status["updated"])
+    age_min = (now - upd).total_seconds() / 60
+    ok = age_min <= 90
+    card(c[0], "Engine", "🟢 running" if ok else "🔴 no recent run", f"last run {upd:%d-%b %H:%M} IST ({age_min:.0f} min ago)")
 else:
-    ok = hb_age < 120
-    card(c[0], "Engine", "🟢 running" if ok else "🔴 stalled", f"heartbeat {int(hb_age)}s ago")
-if len(last_dec):
-    r = last_dec.iloc[0]
-    card(c[1], "Last decision", r.action, f"{r.trade_date} @ {r.price if pd.notna(r.price) else '-'}")
-else:
-    card(c[1], "Last decision", "—", "waiting for 15:25 IST")
-n = len(closed)
-wins = int((closed.net_pts > 0).sum()) if n else 0
-card(c[2], "Live trades", n, f"win {100 * wins / n:.1f}%" if n else "no closed trades")
-card(c[3], "Live net", f"{closed.net_pts.sum():+,.0f} pts" if n else "0 pts",
-     f"₹{closed.net_inr.sum():+,.0f}" if n else "")
-if len(openp):
-    p = openp.iloc[0]
-    u = (p.last_price - p.entry_price) if pd.notna(p.last_price) else 0.0
-    card(c[4], "Open position", f"LONG {u:+,.0f} pts", f"from {p.entry_price:,.2f} · day {int(p.days_held or 0)}")
-else:
-    card(c[4], "Open position", "FLAT", "")
-card(c[5], "Backtest win rate", f"{bt.get('win_rate_pct', '—')}%",
-     f"95% CI {bt.get('win_rate_95ci', ['-', '-'])[0]}–{bt.get('win_rate_95ci', ['-', '-'])[1]}% · n={bt.get('trades', '-')}")
+    card(c[0], "Engine", "⚪ no state yet", "waiting for the first GitHub Actions run")
+allc = pd.concat([d["closed"].assign(strategy=s) for s, d in data.items() if len(d["closed"])], ignore_index=True) \
+    if any(len(d["closed"]) for d in data.values()) else pd.DataFrame()
+S = stats(allc)
+unreal = 0.0
+for d in data.values():
+    for _, p in d["open"].iterrows():
+        if pd.notna(p.last_price):
+            unreal += (p.last_price / p.entry_price - 1) * CAPITAL
+card(c[1], "Closed paper trades", S["n"], f"win {S['win']:.1f}% · {S['be']} break-even" if S["n"] else "none yet")
+card(c[2], "Realised P&L", inr(S["net"]) if S["n"] else "₹0", "₹1 L notional per trade")
+card(c[3], "Open P&L", inr(unreal), f"{sum(len(d['open']) for d in data.values())} open position(s)")
 
 st.write("")
-t_today, t_pos, t_ledger, t_dec, t_perf, t_bt, t_log = st.tabs(
-    ["📡 Today", "📂 Open position", "📒 Trade ledger", "🧭 Decision log", "📈 Live performance",
-     "🧪 Backtest", "🛠 Events"])
+cols = st.columns(len(STRATS))
+for col, (sid, meta) in zip(cols, STRATS.items()):
+    d = data[sid]
+    with col:
+        st.markdown(f"**{meta['title']}**")
+        k = st.columns(3)
+        if len(d["open"]):
+            p = d["open"].iloc[-1]
+            ret = (p.last_price / p.entry_price - 1) if pd.notna(p.last_price) else 0.0
+            card(k[0], "Position", f"LONG {100 * ret:+.2f}%", f"entry {p.entry_price:,.2f} · {inr(ret * CAPITAL)}")
+        else:
+            card(k[0], "Position", "FLAT", "waiting for setup")
+        if len(d["dec"]):
+            r = d["dec"].iloc[0]
+            card(k[1], "Last decision", r.action, f"{r.trade_date}")
+        else:
+            card(k[1], "Last decision", "—", "")
+        s = stats(d["closed"])
+        card(k[2], "Paper record", f"{s['n']} trades", f"win {s['win']:.0f}% (bt {meta['bt']['win']}%) · {inr(s['net'])}" if s["n"] else f"backtest win {meta['bt']['win']}%")
 
-with t_today:
-    if len(last_dec):
-        r = last_dec.iloc[0]
-        st.markdown(f"**{r.trade_date} — {r.action}**  · setup `{r.setup}`"
-                    + (f" · confidence **{r.confidence:.1f}%** (90% floor {r.confidence_low:.1f}%)" if pd.notna(r.confidence) else ""))
-        for reason in json.loads(r.reasons or "[]"):
-            st.markdown(f"- {reason}")
-        f = json.loads(r.features or "{}")
-        if f:
-            keep = ["Close", "High", "Low", "prev_high", "rsi", "ibs", "sma_trend", "atr", "trend_dist_atr"]
-            st.dataframe(pd.DataFrame([{k: f.get(k) for k in keep}]), hide_index=True, width="stretch")
-    st.caption("Rules: at 15:25 IST, if price > SMA50(daily) and (RSI(2) < 10 or IBS < 0.15) → BUY. "
-               "Exit at a later 15:25 when price > previous day's high, or after 10 days. "
-               "Disaster stop 8×ATR (insurance only).")
+st.write("")
+tabs = st.tabs(["📈 Performance", "📂 Open positions", "📒 Trade ledger", "🧭 Signals & decisions", "🛠 Events", "📜 Rules"])
 
-with t_pos:
-    if len(openp):
-        st.dataframe(openp.drop(columns=["features"]).T.rename(columns={0: "value"}), width="stretch")
+with tabs[0]:
+    if len(allc):
+        e = allc.sort_values("exit_ts")[["exit_date", "net_inr", "strategy"]].copy()
+        e["Cumulative P&L (₹)"] = e.net_inr.cumsum()
+        st.markdown("**Combined paper equity (closed trades)**")
+        st.line_chart(e.set_index("exit_date")["Cumulative P&L (₹)"], height=260)
+        rows = []
+        for sid, d in data.items():
+            s = stats(d["closed"]); bt = STRATS[sid]["bt"]
+            flag = ""
+            if s["n"] >= 15 and s["win"] < float(bt["ci"].split("–")[0]):
+                flag = "⚠️ below backtest range"
+            rows.append({"strategy": sid, "trades": s["n"], "win %": round(s["win"], 1), "break-evens": s["be"],
+                         "net ₹": round(s["net"]), "backtest win %": bt["win"], "backtest 95% range": bt["ci"],
+                         "backtest trades/yr": bt["per_yr"], "check": flag})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     else:
-        st.info("No open position.")
+        st.info("No closed paper trades yet. NIFTY averages ~17 trades/yr and BTC ~3/yr, so the first ones can take days to weeks.")
 
-with t_ledger:
-    if n:
-        show = closed[["id", "entry_date", "entry_price", "exit_date", "exit_price", "days_held", "setup",
-                       "confidence", "exit_reason", "mfe_pts", "mae_pts", "net_pts", "net_inr"]]
-        st.dataframe(show.iloc[::-1], hide_index=True, width="stretch")
-        st.download_button("Download ledger CSV", closed.to_csv(index=False), "ledger.csv", "text/csv")
+with tabs[1]:
+    rows = []
+    for sid, d in data.items():
+        for _, p in d["open"].iterrows():
+            ret = (p.last_price / p.entry_price - 1) if pd.notna(p.last_price) else 0.0
+            rows.append({"strategy": sid, "entry date": p.entry_date, "entry": round(p.entry_price, 2),
+                         "last": round(p.last_price, 2) if pd.notna(p.last_price) else None,
+                         "last update": p.last_price_ts, "P&L %": round(100 * ret, 2), "P&L ₹": round(ret * CAPITAL),
+                         "stop": round(p.disaster_stop, 2) if pd.notna(p.disaster_stop) else None,
+                         "setup": p.setup, "confidence %": p.confidence, "days": p.days_held})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    else:
+        st.info("No open positions.")
+
+with tabs[2]:
+    if len(allc):
+        led = allc[["strategy", "entry_date", "entry_price", "exit_date", "exit_price", "exit_reason", "setup",
+                    "confidence", "net_inr"]].copy()
+        led["return %"] = 100 * led.net_inr / CAPITAL
+        st.dataframe(led.sort_values("exit_date", ascending=False), hide_index=True, width="stretch")
+        st.download_button("Download ledger CSV", led.to_csv(index=False), "paper_ledger.csv", "text/csv")
     else:
         st.info("No closed trades yet.")
 
-with t_dec:
-    d = q("SELECT trade_date, ts, action, setup, price, confidence, reasons FROM decisions ORDER BY id DESC LIMIT 500")
-    if len(d):
-        d["reasons"] = d.reasons.apply(lambda s: " | ".join(json.loads(s or "[]")))
-        st.dataframe(d, hide_index=True, width="stretch")
-    else:
-        st.info("No decisions recorded yet.")
-
-with t_perf:
-    if n:
-        eq = closed[["exit_date", "net_pts"]].copy()
-        eq["Cumulative net (pts)"] = eq.net_pts.cumsum()
-        st.markdown("**Live equity curve (closed trades, index points)**")
-        st.line_chart(eq.set_index("exit_date")["Cumulative net (pts)"], height=260)
-        exp_wr = bt.get("win_rate_pct")
-        lo = bt.get("win_rate_95ci", [None])[0]
-        live_wr = 100 * wins / n
-        msg = f"Live win rate {live_wr:.1f}% over {n} trades vs backtest {exp_wr}% (95% CI lower bound {lo}%)."
-        if n >= 15 and lo is not None and live_wr < lo:
-            st.error("⚠️ Edge-degradation alert: " + msg)
+with tabs[3]:
+    for sid, d in data.items():
+        st.markdown(f"**{sid}**")
+        dec = d["dec"]
+        if len(dec):
+            dec = dec.copy()
+            dec["reasons"] = dec.reasons.apply(lambda s: " | ".join(json.loads(s or "[]")))
+            st.dataframe(dec[["trade_date", "ts", "action", "setup", "price", "confidence", "reasons"]],
+                         hide_index=True, width="stretch", height=260)
         else:
-            st.success(msg)
-        by = closed.groupby("setup").agg(trades=("net_pts", "size"), win_pct=("net_pts", lambda x: round(100 * (x > 0).mean(), 1)),
-                                         net_pts=("net_pts", "sum")).reset_index()
-        st.dataframe(by, hide_index=True)
-    else:
-        st.info("Live performance appears after the first closed trade.")
+            st.caption("No decisions recorded yet.")
 
-with t_bt:
-    if bt:
-        cols = st.columns(5)
-        card(cols[0], "Trades", bt["trades"], f"{bt['trades_per_year']}/yr")
-        card(cols[1], "Win rate", f"{bt['win_rate_pct']}%", f"OOS 2023+: {bt['out_of_sample_2023_plus']['win_pct']}%")
-        card(cols[2], "Profit factor", bt["profit_factor"], f"OOS {bt['out_of_sample_2023_plus']['pf']}")
-        card(cols[3], "Expectancy", f"{bt['expectancy_pts']} pts", f"avg win {bt['avg_win_pts']} / loss {bt['avg_loss_pts']}")
-        card(cols[4], "Max drawdown", f"{bt['max_drawdown_pts']} pts", f"worst trade {bt['worst_trade_pts']}")
-        if os.path.exists(BT_TRADES):
-            btt = pd.read_csv(BT_TRADES)
-            btt["Cumulative net (pts)"] = btt.net_pts.cumsum()
-            st.markdown("**Backtest equity curve 2017–2026 (index points, net of costs)**")
-            st.line_chart(btt.set_index("exit_date")["Cumulative net (pts)"], height=260)
-        yr = pd.DataFrame(bt["by_year"]).T
-        yr.index.name = "year"
-        st.dataframe(yr, width="stretch")
-        st.dataframe(pd.DataFrame(bt["by_setup"]).T, width="stretch")
+with tabs[4]:
+    ev = pd.concat([d["ev"].assign(strategy=s) for s, d in data.items() if len(d["ev"])], ignore_index=True) \
+        if any(len(d["ev"]) for d in data.values()) else pd.DataFrame()
+    if len(ev):
+        st.dataframe(ev.sort_values("ts", ascending=False), hide_index=True, width="stretch")
     else:
-        st.info("Run `python -m nifty_algo.backtest --write-priors` to generate the backtest summary.")
+        st.info("No events.")
+    if status:
+        st.caption(f"Engine host: {status.get('host')} · last result: {status.get('last_result')}")
 
-with t_log:
-    ev = q("SELECT ts, level, component, message FROM events ORDER BY id DESC LIMIT 300")
-    st.dataframe(ev, hide_index=True, width="stretch") if len(ev) else st.info("No events.")
+with tabs[5]:
+    for sid, meta in STRATS.items():
+        bt = meta["bt"]
+        st.markdown(f"**{meta['title']}**  \n{meta['rules']}  \n"
+                    f"Backtest: {bt['n']} trades, win {bt['win']}% (95% range {bt['ci']}%), profit factor {bt['pf']}, "
+                    f"~{bt['per_yr']} trades/yr.")
+    st.caption("Paper trading only. ₹1 L notional per trade, no leverage. NIFTY P&L uses futures-equivalent costs (0.04%); "
+               "BTC uses 0.6% round trip. Taxes not deducted.")

@@ -75,7 +75,7 @@ class Engine:
         return last is None or (now - datetime.fromisoformat(last)).total_seconds() >= self.cfg.monitor_every_sec - 5
 
     def _decision_due(self, now, m) -> bool:
-        return (self.cfg.decision_min <= m <= self.cfg.decision_deadline_min
+        return (self.cfg.decision_min <= m <= self.cfg.late_decision_until_min
                 and not self.j.decision_exists(now.date().isoformat(), "DECISION"))
 
     def _eod_due(self, now, m) -> bool:
@@ -115,14 +115,18 @@ class Engine:
                 self.j.record_decision(trade_date, "DECISION", None, "NO_SESSION", "NONE", None, None,
                                        ["no intraday data for today (holiday/weekend)"], {})
             return
-        if not self._fresh(snap, now):
-            msg = f"stale snapshot as_of={snap.as_of} at {now:%H:%M:%S}"
-            if _mins(now) >= self.cfg.decision_deadline_min:
+        # the snapshot is complete when its last bar is within 6 minutes of the 15:25 cutoff
+        cutoff = now.replace(hour=self.cfg.decision_min // 60, minute=self.cfg.decision_min % 60, second=0, microsecond=0)
+        complete = snap.as_of is not None and 0 < (cutoff - snap.as_of).total_seconds() <= 360
+        if not complete:
+            msg = f"incomplete snapshot as_of={snap.as_of} at {now:%H:%M:%S}"
+            if _mins(now) >= self.cfg.decision_deadline_min + 60:
                 self.j.record_decision(trade_date, "DECISION", snap.last_price, "SKIPPED_STALE", "NONE", None, None, [msg], {})
                 self.n.send(f"⚠️ <b>{esc(self.cfg.name)}</b> decision SKIPPED - {esc(msg)}")
             else:
                 self.j.event("WARN", "decision", msg + " (will retry)")
             return
+        self._late = _mins(now) > self.cfg.decision_deadline_min
 
         frame = pd.concat([snap.daily.tail(FEATURE_WINDOW - 1), snap.today.to_frame().T]).astype(float)
         feats = compute_features(frame, self.cfg.strategy)
@@ -180,7 +184,9 @@ class Engine:
                                confidence_low=conf["low90_pct"], features=json.dumps(dec.features),
                                last_price=price, last_price_ts=now.isoformat(timespec="seconds"))
         self.j.event("INFO", "decision", f"ENTRY {self.cfg.name} @ {price:.2f} setup={dec.setup_key} conf={conf['pct']}%")
-        msg = (f"🟢 <b>BUY {esc(self.cfg.name)}</b> @ {price:,.2f}\n"
+        late = getattr(self, "_late", False)
+        msg = (f"🟢 <b>BUY {esc(self.cfg.name)}</b> (paper) @ {price:,.2f}"
+               f"{' — LATE ALERT, paper-filled at the 15:25 price' if late else ''}\n"
                f"Setup: <b>{esc(dec.setup_key)}</b> | RSI{p.rsi_len}={row['rsi']:.1f} | IBS={row['ibs']:.2f}\n"
                f"Trend: {row['trend_dist_atr']:+.1f} ATR above SMA{p.trend_sma}\n"
                f"Confidence: <b>{conf['pct']}%</b> (90% floor {conf['low90_pct']}%, basis {esc(conf['basis'])})\n"
@@ -217,12 +223,12 @@ class Engine:
         self.j.update_position(pos["id"], status="CLOSED", exit_ts=now.isoformat(timespec="seconds"),
                                exit_date=now.date().isoformat(), exit_price=price, exit_reason=reason,
                                gross_pts=gross, cost_pts=cost, net_pts=net,
-                               net_inr=net * pos["lots"] * pos["lot_size"], last_price=price)
+                               net_inr=net / pos["entry_price"] * self.cfg.capital_per_trade, last_price=price)
         self.j.event("INFO", "trade", f"EXIT {self.cfg.name} @ {price:.2f} ({reason}) net {net:+.1f} pts")
         icon = "✅" if net > 0 else "🛑"
         self.n.send(f"{icon} <b>EXIT {esc(self.cfg.name)}</b> @ {price:,.2f}\n{esc(reason)}\n"
                     f"Entry {pos['entry_price']:,.2f} ({pos['entry_date']}) → net <b>{net:+.1f} pts</b> "
-                    f"(₹{net * pos['lots'] * pos['lot_size']:+,.0f})")
+                    f"({100 * net / pos['entry_price']:+.2f}% = ₹{net / pos['entry_price'] * self.cfg.capital_per_trade:+,.0f} on ₹1 L)")
 
     def _live_counts(self) -> dict:
         out = {"ALL": {"wins": 0, "losses": 0}}

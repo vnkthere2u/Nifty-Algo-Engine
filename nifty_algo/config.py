@@ -31,7 +31,8 @@ class Config:
     name: str = "NIFTY 50"
     lot_size: int = 65                    # NIFTY futures lot (verify against the current NSE circular)
     lots: int = 1
-    cost_pct: float = 0.0004              # round-trip cost+slippage as fraction of notional (used in P&L)
+    cost_pct: float = 0.0004              # round-trip cost+slippage as fraction of notional (futures-equivalent)
+    capital_per_trade: float = 100000.0   # paper P&L: Rs 1 L notional per trade, no leverage
     db_path: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "algo_journal.db")
     lock_path: str = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "engine.lock")
     priors_path: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "priors.json")
@@ -39,7 +40,8 @@ class Config:
     session_open_min: int = 9 * 60 + 15
     session_close_min: int = 15 * 60 + 30
     decision_min: int = 15 * 60 + 25      # decision snapshot time
-    decision_deadline_min: int = 15 * 60 + 29
+    decision_deadline_min: int = 15 * 60 + 29   # last minute for an on-time (actionable) alert
+    late_decision_until_min: int = 23 * 60 + 30  # a late run still records the 15:25-snapshot decision (paper)
     monitor_every_sec: int = 300
     max_data_age_sec: int = 600           # intraday snapshot older than this is considered stale
     # risk governance
@@ -85,4 +87,14 @@ def load_config(path: str | None = None) -> Config:
                     out[f.name] = v.strip().lower() in ("1", "true", "yes", "on")
         return out
 
+    state_dir = os.environ.get("NIFTY_ALGO_STATE_DIR")
+    if state_dir and "db_path" not in raw:
+        raw["db_path"] = os.path.join(os.path.abspath(state_dir), "nifty.db")
     return Config(strategy=StrategyParams(**coerce(StrategyParams, strat_raw)), **coerce(Config, raw))
+
+
+def state_dir() -> str:
+    d = os.environ.get("NIFTY_ALGO_STATE_DIR") or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+    os.makedirs(d, exist_ok=True)
+    return os.path.abspath(d)

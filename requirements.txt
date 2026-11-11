@@ -1,8 +1,6 @@
-# Algo Engine v4.0 (NIFTY TPMR)
+# Dashboard (Streamlit Cloud). The engine itself needs only requirements-engine.txt.
+streamlit>=1.48
+streamlit-autorefresh>=1.0.1
 pandas>=2.0
 numpy>=1.26
 requests>=2.31
-streamlit>=1.48
-streamlit-autorefresh>=1.0.1
-yfinance>=0.2.40      # optional fallback feed only
-pytest>=8.0           # tests

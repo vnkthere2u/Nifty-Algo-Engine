@@ -1,4 +1,4 @@
-# Nifty Algo Engine v4.0: NIFTY Trend-Pullback Mean Reversion (TPMR)
+# Nifty Algo Engine v5: paper-trading NIFTY TPMR + BTC low-vol breakout
 
 A rule-based, self-running NIFTY signal engine with a full decision journal, Telegram alerts,
 calibrated confidence % and a read-only dashboard.
@@ -44,26 +44,34 @@ research/          every study behind the verdict (replica, tweak grids, new-mod
   (NO_TRADE / ENTRY / HOLD / EXIT / BLOCKED_RISK / SKIPPED_STALE / NO_SESSION). The dashboard
   compares the live win rate with the backtest confidence interval.
 
-## Quick start
+## Live paper trading (NIFTY TPMR + BTC breakout)
 
+| Piece | Where it runs | Why |
+|---|---|---|
+| Engine (`nifty_algo.runner`) | **GitHub Actions** (`.github/workflows/algo-engine.yml`) | free for public repos, never sleeps |
+| State (SQLite journal) | branch **`algo-state`** (`nifty.db`, `btc.db`, `status.json`) | survives every run; single-commit snapshot |
+| Dashboard (`algo_dashboard.py`) | Streamlit Cloud | read-only; downloads state every 60 s |
+| Alerts | Telegram, sent by the engine | BUY / EXIT / break-even / skipped signal / failures |
+
+Schedule (UTC cron, IST in brackets): `13 9 * * 1-5` (14:43, NIFTY session loop to 15:40), `41 9 * * 1-5`
+(15:11, backup), `17 * * * *` (hourly: BTC daily decision after 00:00 UTC, stop/target checks, late NIFTY
+decision from the 15:25 snapshot if the session job was missed). Runs are serialized (`concurrency`).
+
+**One-time setup**
+1. Merge this branch into `main` (scheduled workflows only run from the default branch).
+2. GitHub → Settings → Secrets and variables → Actions → add `TELEGRAM_TOKEN` and `TELEGRAM_CHAT_ID`
+   (same values as in the Streamlit secrets; GitHub cannot read those).
+3. Actions → *algo-engine* → *Run workflow* → mode `test-telegram` (you should get a test alert), then `once`.
+4. Streamlit Cloud keeps serving `algo_dashboard.py` from `main`; no secrets needed for it.
+
+**Local commands**
 ```bash
-pip install -r requirements.txt
-python scripts/fetch_history.py                          # ~60 MB of 1-min NIFTY history
-python -m nifty_algo.backtest --write-priors             # reproduce results + confidence priors
-python -m pytest -q tests                                # 18 tests incl. live-vs-backtest parity
-export TELEGRAM_TOKEN=... TELEGRAM_CHAT_ID=...           # optional alerts
-python -m nifty_algo.runner                              # start the engine (keep it running)
-streamlit run algo_dashboard.py                          # dashboard (separate process)
+pip install -r requirements-engine.txt
+python -m nifty_algo.runner --once            # one tick of both engines
+python -m nifty_algo.runner --test-telegram   # needs TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env vars
+python -m nifty_algo.runner                   # run forever (VPS alternative to GitHub Actions)
+python -m pytest -q tests                     # 22 tests incl. live-vs-backtest parity for both strategies
 ```
-
-Other commands: `python -m nifty_algo.runner --status` · `--once` · `--reset-risk` ·
-`python -m nifty_algo.replay --start 2025-01-01` (full offline dry-run).
-
-**Hosting:** run the engine on an always-on Linux box or VM (`deploy/*.service` systemd units).
-Streamlit Community Cloud sleeps idle apps and wipes `/tmp`, so it cannot host the engine.
-
-Config: `nifty_algo/config.py` (or env `NIFTY_ALGO_<FIELD>` / JSON via `--config`). Verify
-`lot_size` against the current NSE circular.
 
 ## Status / next steps toward live deployment
 

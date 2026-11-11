@@ -67,6 +67,17 @@ class Journal:
         finally:
             c.close()
 
+    def checkpoint(self) -> None:
+        """Fold the WAL into the main file so the .db can be copied/committed as one file."""
+        if self.readonly:
+            return
+        c = sqlite3.connect(self.path, timeout=30)
+        try:
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            c.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            c.close()
+
     # ---------------------------------------------------------------- kv / events
     def set(self, key: str, value) -> None:
         with self.conn() as c:

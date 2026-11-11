@@ -1,6 +1,6 @@
 {
   "BTC_LOWVOL_TREND_BREAKOUT": {
-    "status": "DEPLOYABLE_PARKED",
+    "status": "PAPER_TRADING",
     "approved_on": "2026-11-07",
     "symbol": "BTC-USD (traded in INR)",
     "timeframe": "1D, decision at daily close, entry next open",
@@ -13,9 +13,49 @@
       "break_even": "at +1R move stop to entry + costs (0.7%)",
       "position": "Rs 1,00,000 notional, long only, no leverage, one position at a time"
     },
-    "backtest_2015_2026": {"trades": 27, "win_pct": 85.2, "payoff": 1.73, "profit_factor": 9.94,
-                           "max_dd_pct": -10.6, "inr_per_year_pre_tax": 27797, "oos_2023_plus_trades": 7},
-    "caveats": ["OOS sample (7 trades) below the 30-trade target", "~2.7 trades/yr", "30% crypto tax + cess, no loss set-off"],
-    "research": "research2/stage4_volbo.py, research2/sim.py"
+    "backtest_2015_2026": {
+      "trades": 27,
+      "win_pct": 85.2,
+      "payoff": 1.73,
+      "profit_factor": 9.94,
+      "max_dd_pct": -10.6,
+      "inr_per_year_pre_tax": 27797,
+      "oos_2023_plus_trades": 7
+    },
+    "caveats": [
+      "OOS sample (7 trades) below the 30-trade target",
+      "~2.7 trades/yr",
+      "30% crypto tax + cess, no loss set-off"
+    ],
+    "research": "research2/stage4_volbo.py, research2/sim.py",
+    "engine": "nifty_algo/btc.py"
+  },
+  "NIFTY_TPMR": {
+    "status": "PAPER_TRADING",
+    "symbol": "^NSEI (NIFTY 50 index)",
+    "timeframe": "1D, decision at 15:25 IST",
+    "rules": {
+      "regime": "price > SMA50 (daily)",
+      "entry": "RSI(2) < 10 or IBS < 0.15",
+      "exit": "15:25 price > previous day's high, or 10 days",
+      "disaster_stop": "8 x ATR14",
+      "position": "Rs 1,00,000 notional, long only"
+    },
+    "backtest_2017_2026": {
+      "trades": 153,
+      "win_pct": 72.5,
+      "win_95ci": [
+        65.0,
+        79.0
+      ],
+      "profit_factor": 1.57,
+      "oos_2023_plus_win_pct": 75.4,
+      "max_dd_pts": -1931.7
+    },
+    "caveats": [
+      "P&L uses futures-equivalent cost 0.04%; delivery/ETF costs (~0.2%+) would consume most of the edge",
+      "negatively skewed payoff (avg loss ~1.7x avg win)"
+    ],
+    "engine": "nifty_algo/engine.py"
   }
 }

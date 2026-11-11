@@ -199,9 +199,28 @@ def test_stale_data_retries_then_skips(tmp_path):
     eng.tick(_at(d0, 15, 25))
     assert not eng.j.decision_exists(d0.isoformat(), "DECISION")      # retry pending
     eng.tick(_at(d0, 15, 29))
+    assert not eng.j.decision_exists(d0.isoformat(), "DECISION")      # still retrying (late window)
+    eng.tick(_at(d0, 16, 30))
     with eng.j.conn() as c:
         assert c.execute("SELECT action FROM decisions").fetchone()[0] == "SKIPPED_STALE"
     assert eng.j.open_position() is None
+
+
+class FixedAsOfFeed(ScriptedFeed):
+    def snapshot(self, now, session_open_min, cutoff_min=None):
+        s = super().snapshot(now, session_open_min, cutoff_min)
+        if s.today is not None:
+            s.as_of = now.replace(hour=15, minute=24, second=0)
+        return s
+
+
+def test_late_run_still_records_snapshot_decision(tmp_path):
+    daily, bars, d0, _ = _scenario()
+    eng = _engine(tmp_path, FixedAsOfFeed(daily, bars))
+    assert "decision" in eng.tick(_at(d0, 17, 5))          # job started late: decision from the 15:25 snapshot
+    pos = eng.j.open_position()
+    assert pos is not None and pos["entry_price"] == pytest.approx(bars[d0]["Close"])
+    assert any("LATE ALERT" in m for m in eng.n.sent)
 
 
 def test_holiday_records_no_session(tmp_path):
