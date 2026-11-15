@@ -164,7 +164,9 @@ def stats(closed):
 
 # ------------------------------------------------------------------ header
 now = datetime.now(IST)
+APP_VERSION = "v5.2 (engine on GitHub Actions; dashboard read-only)"
 st.markdown("### ⚙️ Algo Engine — paper trading")
+st.caption(f"Dashboard {APP_VERSION} · data: {'local in-app engine' if ENGINE_IN_APP else 'GitHub algo-state branch'}")
 status_path = fetch("status.json")
 status = json.load(open(status_path)) if status_path else None
 data = {sid: load(sid) for sid in STRATS}
@@ -247,6 +249,7 @@ with tabs[0]:
         (st.success if ok_all else st.info)(c["verdict"])
         rules = pd.DataFrame(c["rules"])
         rules["status"] = np.where(rules.ok, "✅ met", "❌ not met")
+        rules["current"] = rules["current"].astype(str)
         st.dataframe(rules[["rule", "current", "required", "status", "note"]], hide_index=True, width="stretch")
         lv = pd.DataFrame(c["levels"])
         lv = lv.rename(columns={"dist_pct": "distance from engine price %"})
