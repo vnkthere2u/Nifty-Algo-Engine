@@ -147,6 +147,7 @@ class YahooFeed:
         minute are used (15:25 -> identical to the backtest)."""
         today = now.astimezone(IST).replace(tzinfo=None).date()
         recent = self._chart("1m", "5d")
+        self.recent_from = recent.index.min().date() if len(recent) else None   # minute-data coverage start
         rm = recent.index.hour * 60 + recent.index.minute
         recent = recent[(rm >= session_open_min) & (rm < 15 * 60 + 30)]
         intr = recent[recent.index.date == today]

@@ -144,10 +144,13 @@ class ScriptedFeed:
         return Snapshot(hist, pd.Series(tb, name=d), float(tb["Close"]), now - timedelta(seconds=self.lag))
 
 
-def _engine(tmp_path, feed, **cfg_over):
+def _engine(tmp_path, feed, catchup=False, **cfg_over):
     cfg = replace(Config(), db_path=str(tmp_path / "j.db"), lock_path=str(tmp_path / "l"),
                   priors_path=os.path.join(ROOT, "nifty_algo", "priors.json"), **cfg_over)
-    return Engine(cfg, Journal(cfg.db_path), feed, Notifier())
+    eng = Engine(cfg, Journal(cfg.db_path), feed, Notifier())
+    if not catchup:
+        eng.j.set("catchup_from", "2100-01-01")   # these tests exercise same-day logic only
+    return eng
 
 
 def _at(d, hh, mm, ss=5):
@@ -318,3 +321,32 @@ def test_nifty_conditions_triggers_are_consistent(tmp_path):
         closes = pd.concat([daily.Close.iloc[:-1], pd.Series([lv["RSI(2) trigger"] - 0.01])], ignore_index=True)
         assert _rsi(closes, 2).iloc[-1] < 10
     assert c["verdict"].startswith("ENTRY CONDITIONS MET")   # scenario day is a valid dip-buy
+
+
+def test_catchup_recovers_signal_missed_while_offline(tmp_path):
+    """Engine was down at 15:25 on d0 (a signal day); it wakes on d1 morning and must still record the
+    d0 entry at d0's 15:25 price, alert it as a catch-up, then manage the exit normally on d1."""
+    daily, bars, d0, d1 = _scenario()
+    eng = _engine(tmp_path, ScriptedFeed(daily, bars), catchup=True)
+    eng.j.set("catchup_from", d0.isoformat())
+    assert "catchup" in eng.tick(_at(d1, 10, 0))
+    pos = eng.j.open_position()
+    assert pos is not None and pos["entry_date"] == d0.isoformat()
+    assert pos["entry_price"] == pytest.approx(bars[d0]["Close"])
+    assert any("MISSED-SIGNAL CATCH-UP" in m for m in eng.n.sent)
+    assert "catchup" not in eng.tick(_at(d1, 10, 5))           # nothing left to catch up
+    eng.tick(_at(d1, 15, 25))
+    closed = eng.j.closed_positions()
+    assert len(closed) == 1 and closed[0]["exit_reason"].startswith("TARGET")
+
+
+def test_catchup_flags_days_without_data(tmp_path):
+    daily, bars, d0, d1 = _scenario()
+    feed = ScriptedFeed(daily, {d1: bars[d1]})          # d0 bars no longer available
+    feed.recent_from = d1                               # minute data starts at d1
+    eng = _engine(tmp_path, feed, catchup=True)
+    eng.j.set("catchup_from", d0.isoformat())
+    eng.tick(_at(d1, 10, 0))
+    with eng.j.conn() as c:
+        assert c.execute("SELECT action FROM decisions WHERE trade_date=?", (d0.isoformat(),)).fetchone()[0] == "MISSED_NO_DATA"
+    assert any("could not be recovered" in m for m in eng.n.sent)

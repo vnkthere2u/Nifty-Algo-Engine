@@ -39,7 +39,8 @@ def _secret(key, default=None):
 STATE_URL = os.environ.get("ALGO_STATE_URL") or _secret(
     "ALGO_STATE_URL", "https://raw.githubusercontent.com/vnkthere2u/Nifty-Algo-Engine/algo-state")
 # ---- in-app engine (simple hosting): the app itself runs the engines in a background thread
-ENGINE_IN_APP = str(os.environ.get("ALGO_ENGINE_IN_APP", _secret("ALGO_ENGINE_IN_APP", "1"))).lower() not in ("0", "false", "no")
+# Default OFF: the engine runs on GitHub Actions (never sleeps). Set ALGO_ENGINE_IN_APP=1 only as a fallback.
+ENGINE_IN_APP = str(os.environ.get("ALGO_ENGINE_IN_APP", _secret("ALGO_ENGINE_IN_APP", "0"))).lower() in ("1", "true", "yes")
 if ENGINE_IN_APP:
     os.environ.setdefault("NIFTY_ALGO_STATE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "state_live"))
     for k in ("TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"):
