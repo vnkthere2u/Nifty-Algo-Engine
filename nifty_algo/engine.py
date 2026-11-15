@@ -50,6 +50,7 @@ class Engine:
         self.j.set("heartbeat", {"ts": now.isoformat(timespec="seconds")})
         m = _mins(now)
         for name, due, fn in (
+            ("catchup", self._catchup_due(now), self.catch_up),
             ("monitor", self._monitor_due(now, m), self.monitor),
             ("decision", self._decision_due(now, m), self.decide),
             ("eod", self._eod_due(now, m), self.eod),
@@ -79,6 +80,36 @@ class Engine:
     def update_conditions(self, now: datetime):
         snap = self.feed.snapshot(now, self.cfg.session_open_min, None)
         self.j.set("conditions", nifty_conditions(self.cfg, snap, self.j.open_position(), now))
+
+    # ---------------------------------------------------------------- missed-day catch-up
+    CATCHUP_DAYS = 7
+
+    def _missed_days(self, now) -> list:
+        """Calendar days (oldest first) since the engine started tracking that have no recorded decision."""
+        today = now.date()
+        start = self.j.get("catchup_from")
+        if start is None:
+            start = (today - timedelta(days=self.CATCHUP_DAYS)).isoformat()
+            self.j.set("catchup_from", start)
+        first = max(datetime.fromisoformat(start).date(), today - timedelta(days=self.CATCHUP_DAYS))
+        last = today if _mins(now) > self.cfg.late_decision_until_min else today - timedelta(days=1)
+        out, d = [], first
+        while d <= last:
+            if not self.j.decision_exists(d.isoformat(), "DECISION"):
+                out.append(d)
+            d += timedelta(days=1)
+        return out
+
+    def _catchup_due(self, now) -> bool:
+        return bool(self._missed_days(now))
+
+    def catch_up(self, now: datetime):
+        for d in self._missed_days(now):
+            if d.weekday() >= 5:
+                self.j.record_decision(d.isoformat(), "DECISION", None, "NO_SESSION", "NONE", None, None, ["weekend"], {})
+                continue
+            at = datetime(d.year, d.month, d.day, self.cfg.decision_min // 60, self.cfg.decision_min % 60, 30, tzinfo=IST)
+            self.decide(at, catchup=True)
 
     def _monitor_due(self, now, m) -> bool:
         if not (self.cfg.session_open_min <= m <= self.cfg.session_close_min):
@@ -120,9 +151,20 @@ class Engine:
         if ds is not None and px <= ds:
             self._close(pos, px, now, f"DISASTER STOP {ds:.2f}")
 
-    def decide(self, now: datetime):
+    def decide(self, now: datetime, catchup: bool = False):
         trade_date = now.date().isoformat()
+        self._catchup = catchup
         snap = self.feed.snapshot(now, self.cfg.session_open_min, self.cfg.decision_min)
+        if catchup and snap.today is None:
+            covered_from = getattr(self.feed, "recent_from", None)
+            if covered_from is not None and now.date() < covered_from:
+                msg = f"engine was offline on {trade_date} and Yahoo minute data no longer covers that day"
+                self.j.record_decision(trade_date, "DECISION", None, "MISSED_NO_DATA", "NONE", None, None, [msg], {})
+                self.n.send(f"⚠️ <b>{esc(self.cfg.name)}</b> {esc(msg)}; that day's signal (if any) could not be recovered.")
+            else:
+                self.j.record_decision(trade_date, "DECISION", None, "NO_SESSION", "NONE", None, None,
+                                       ["no market session (holiday)"], {})
+            return
         if snap.today is None:
             # no intraday bars today: exchange holiday / weekend
             if _mins(now) >= self.cfg.decision_deadline_min or now.weekday() >= 5:
@@ -134,13 +176,13 @@ class Engine:
         complete = snap.as_of is not None and 0 < (cutoff - snap.as_of).total_seconds() <= 360
         if not complete:
             msg = f"incomplete snapshot as_of={snap.as_of} at {now:%H:%M:%S}"
-            if _mins(now) >= self.cfg.decision_deadline_min + 60:
+            if catchup or _mins(now) >= self.cfg.decision_deadline_min + 60:
                 self.j.record_decision(trade_date, "DECISION", snap.last_price, "SKIPPED_STALE", "NONE", None, None, [msg], {})
                 self.n.send(f"⚠️ <b>{esc(self.cfg.name)}</b> decision SKIPPED - {esc(msg)}")
             else:
                 self.j.event("WARN", "decision", msg + " (will retry)")
             return
-        self._late = _mins(now) > self.cfg.decision_deadline_min
+        self._late = _mins(now) > self.cfg.decision_deadline_min and not catchup
 
         frame = pd.concat([snap.daily.tail(FEATURE_WINDOW - 1), snap.today.to_frame().T]).astype(float)
         feats = compute_features(frame, self.cfg.strategy)
@@ -199,8 +241,11 @@ class Engine:
                                last_price=price, last_price_ts=now.isoformat(timespec="seconds"))
         self.j.event("INFO", "decision", f"ENTRY {self.cfg.name} @ {price:.2f} setup={dec.setup_key} conf={conf['pct']}%")
         late = getattr(self, "_late", False)
-        msg = (f"🟢 <b>BUY {esc(self.cfg.name)}</b> (paper) @ {price:,.2f}"
-               f"{' — LATE ALERT, paper-filled at the 15:25 price' if late else ''}\n"
+        cu = getattr(self, "_catchup", False)
+        tag = (f" — ⚠️ MISSED-SIGNAL CATCH-UP: signal of {trade_date} 15:25 (engine was offline); "
+               "paper-filled at that day's 15:25 price" if cu else
+               " — LATE ALERT, paper-filled at the 15:25 price" if late else "")
+        msg = (f"🟢 <b>BUY {esc(self.cfg.name)}</b> (paper) @ {price:,.2f}{tag}\n"
                f"Setup: <b>{esc(dec.setup_key)}</b> | RSI{p.rsi_len}={row['rsi']:.1f} | IBS={row['ibs']:.2f}\n"
                f"Trend: {row['trend_dist_atr']:+.1f} ATR above SMA{p.trend_sma}\n"
                f"Confidence: <b>{conf['pct']}%</b> (90% floor {conf['low90_pct']}%, basis {esc(conf['basis'])})\n"
@@ -240,7 +285,8 @@ class Engine:
                                net_inr=net / pos["entry_price"] * self.cfg.capital_per_trade, last_price=price)
         self.j.event("INFO", "trade", f"EXIT {self.cfg.name} @ {price:.2f} ({reason}) net {net:+.1f} pts")
         icon = "✅" if net > 0 else "🛑"
-        self.n.send(f"{icon} <b>EXIT {esc(self.cfg.name)}</b> @ {price:,.2f}\n{esc(reason)}\n"
+        cu = f" (catch-up for {now.date().isoformat()} 15:25; engine was offline)" if getattr(self, "_catchup", False) else ""
+        self.n.send(f"{icon} <b>EXIT {esc(self.cfg.name)}</b> @ {price:,.2f}{cu}\n{esc(reason)}\n"
                     f"Entry {pos['entry_price']:,.2f} ({pos['entry_date']}) → net <b>{net:+.1f} pts</b> "
                     f"({100 * net / pos['entry_price']:+.2f}% = ₹{net / pos['entry_price'] * self.cfg.capital_per_trade:+,.0f} on ₹1 L)")
 
