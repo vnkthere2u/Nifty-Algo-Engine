@@ -1,0 +1,38 @@
+# Opens the Streamlit dashboard in a headless browser every 3 hours so Streamlit Community Cloud
+# never puts it to sleep (and wakes it if it already is). The trading engine itself runs in
+# algo-engine.yml and does not depend on the dashboard being awake.
+name: keep-dashboard-awake
+
+on:
+  schedule:
+    - cron: "29 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keep-awake
+  cancel-in-progress: true
+
+jobs:
+  visit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      STREAMLIT_URL: ${{ vars.STREAMLIT_URL || 'https://nifty-algo-engine-zqb9yt8k6yqnsd4xw4cmvn.streamlit.app/' }}
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install playwright==1.48.0 && python -m playwright install --with-deps chromium
+      - run: python deploy/keep_awake.py "$STREAMLIT_URL" "Algo Signals"
+      - name: Alert on failure
+        if: failure()
+        run: |
+          [ -n "$TELEGRAM_TOKEN" ] && curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="⚠️ Dashboard could not be woken: ${STREAMLIT_URL} (engine and alerts are unaffected)" || true
