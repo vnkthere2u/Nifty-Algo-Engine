@@ -26,6 +26,7 @@ from .config import IST, load_config, state_dir
 from .engine import Engine
 from .feeds import YahooFeed
 from .journal import Journal
+from .momentum import MomentumEngine, MomentumFeed, momentum_db_path
 from .notify import Notifier
 
 log = logging.getLogger("nifty_algo")
@@ -66,6 +67,8 @@ def build_engines(names, cfg_path=None) -> list:
         engines.append(Engine(cfg, Journal(cfg.db_path), YahooFeed(cfg.symbol), notifier))
     if "btc" in names:
         engines.append(BtcEngine(Journal(btc_db_path()), BtcFeed(), notifier))
+    if "momentum" in names:
+        engines.append(MomentumEngine(Journal(momentum_db_path()), MomentumFeed(), notifier))
     return engines
 
 
@@ -97,7 +100,7 @@ def write_status(engines, result):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
-    ap.add_argument("--strategies", default="nifty,btc")
+    ap.add_argument("--strategies", default="nifty,btc,momentum")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--until", default=None, help="HH:MM IST")
     ap.add_argument("--status", action="store_true")

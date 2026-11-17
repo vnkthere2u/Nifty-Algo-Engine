@@ -119,12 +119,12 @@ class Journal:
             r = c.execute("SELECT * FROM positions WHERE status='OPEN' ORDER BY id DESC LIMIT 1").fetchone()
         return dict(r) if r else None
 
-    def insert_position(self, **kw) -> int:
+    def insert_position(self, allow_multiple: bool = False, **kw) -> int:
         kw.setdefault("status", "OPEN")
         cols = ",".join(kw.keys())
         q = ",".join("?" * len(kw))
         with self.conn() as c:
-            if c.execute("SELECT 1 FROM positions WHERE status='OPEN'").fetchone():
+            if not allow_multiple and c.execute("SELECT 1 FROM positions WHERE status='OPEN'").fetchone():
                 raise RuntimeError("refusing to open a second position")
             cur = c.execute(f"INSERT INTO positions({cols}) VALUES({q})", tuple(kw.values()))
             return int(cur.lastrowid)
@@ -133,6 +133,10 @@ class Journal:
         sets = ",".join(f"{k}=?" for k in kw)
         with self.conn() as c:
             c.execute(f"UPDATE positions SET {sets} WHERE id=?", (*kw.values(), pid))
+
+    def open_positions(self) -> list:
+        with self.conn() as c:
+            return [dict(r) for r in c.execute("SELECT * FROM positions WHERE status='OPEN' ORDER BY id")]
 
     def closed_positions(self) -> list:
         with self.conn() as c:
