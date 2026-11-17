@@ -29,7 +29,13 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install playwright==1.48.0 && python -m playwright install --with-deps chromium
-      - run: python deploy/keep_awake.py "$STREAMLIT_URL" "Algo Signals"
+      - run: python deploy/keep_awake.py "$STREAMLIT_URL"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: keep-awake-screenshot
+          path: keep_awake.png
+          if-no-files-found: ignore
       - name: Alert on failure
         if: failure()
         run: |
