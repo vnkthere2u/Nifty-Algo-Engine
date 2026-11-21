@@ -1,0 +1,16 @@
+{
+  "updated": "2026-11-21T16:40:23+05:30",
+  "host": "github-actions",
+  "last_result": {
+    "NIFTY 50": [
+      "decision",
+      "conditions"
+    ],
+    "BTC": [
+      "day 2026-11-20: NO_TRADE"
+    ],
+    "MOMENTUM": [
+      "view"
+    ]
+  }
+}
