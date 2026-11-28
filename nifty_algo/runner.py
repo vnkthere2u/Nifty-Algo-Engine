@@ -17,9 +17,10 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .btc import BtcEngine, BtcFeed, btc_db_path
 from .config import IST, load_config, state_dir
@@ -90,6 +91,20 @@ def _sleep(step=30):
         time.sleep(min(1.0, target - time.time()))
 
 
+def publish(engines, cmd: str):
+    """Fold each journal's WAL into its .db file, then run the publish command (e.g. push to the state branch)."""
+    for e in engines:
+        try:
+            e.j.checkpoint()
+        except Exception:
+            pass
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=120)
+        log.info("publish: %s %s", r.returncode, (r.stdout or r.stderr).strip()[-200:])
+    except Exception as ex:
+        log.warning("publish failed: %s", ex)
+
+
 def write_status(engines, result):
     st = {"updated": datetime.now(IST).isoformat(timespec="seconds"), "host": os.environ.get("ALGO_HOST", os.uname().nodename),
           "last_result": {k: (v if isinstance(v, (list, str)) else str(v)) for k, v in result.items()}}
@@ -102,7 +117,10 @@ def main(argv=None):
     ap.add_argument("--config", default=None)
     ap.add_argument("--strategies", default="nifty,btc,momentum")
     ap.add_argument("--once", action="store_true")
-    ap.add_argument("--until", default=None, help="HH:MM IST")
+    ap.add_argument("--until", default=None, help="HH:MM IST (today); a late start never loops into the next day")
+    ap.add_argument("--for", dest="for_min", type=float, default=None, help="loop for N minutes")
+    ap.add_argument("--sync-every", type=float, default=0, help="minutes between --sync-cmd calls (0 = off)")
+    ap.add_argument("--sync-cmd", default=None, help="command that publishes the state (e.g. bash deploy/state.sh push)")
     ap.add_argument("--status", action="store_true")
     ap.add_argument("--reset-risk", action="store_true")
     ap.add_argument("--test-telegram", action="store_true")
@@ -133,12 +151,22 @@ def main(argv=None):
             if a.once:
                 res = tick_all(engines); print(json.dumps(res, default=str)); write_status(engines, res)
                 return 0
+            start = datetime.now(IST)
             end = None
             if a.until:
                 hh, mm = map(int, a.until.split(":"))
-                end = datetime.now(IST).replace(hour=hh, minute=mm, second=0, microsecond=0)
+                end = start.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if end <= start or (end - start).total_seconds() > 3 * 3600:
+                    end = start          # started too late/early (delayed trigger): one tick, then exit
+            if a.for_min:
+                fe = start + timedelta(minutes=a.for_min)
+                end = min(end, fe) if end else fe
+            last_sync = time.time()
             while not _STOP:
                 res = tick_all(engines); write_status(engines, res)
+                if a.sync_cmd and a.sync_every and time.time() - last_sync >= a.sync_every * 60:
+                    publish(engines, a.sync_cmd)
+                    last_sync = time.time()
                 if end and datetime.now(IST) >= end:
                     break
                 _sleep(30)
