@@ -123,9 +123,20 @@ class Engine:
         return (self.cfg.decision_min <= m <= self.cfg.late_decision_until_min
                 and not self.j.decision_exists(now.date().isoformat(), "DECISION"))
 
+    def _eod_day(self, now, m):
+        """Most recent session day whose end-of-day update has not been sent (today only after 15:35)."""
+        with self.j.conn() as c:
+            r = c.execute("SELECT trade_date FROM decisions WHERE phase='DECISION' AND action NOT IN "
+                          "('NO_SESSION','MISSED_NO_DATA','SKIPPED_STALE') ORDER BY trade_date DESC LIMIT 2").fetchall()
+        for row in r:
+            d = row["trade_date"]
+            if d == now.date().isoformat() and m < self.cfg.session_close_min + 5:
+                continue
+            return d if (self.j.get("eod_done") or "") < d else None
+        return None
+
     def _eod_due(self, now, m) -> bool:
-        return m >= self.cfg.session_close_min + 5 and self.j.get("eod_done") != now.date().isoformat() \
-            and self.j.decision_exists(now.date().isoformat(), "DECISION")
+        return self._eod_day(now, m) is not None
 
     # ================================================================ phases
     def monitor(self, now: datetime):
@@ -255,18 +266,44 @@ class Engine:
         self.n.send(msg)
 
     def eod(self, now: datetime):
-        d = now.date().isoformat()
-        with self.j.conn() as c:
-            r = c.execute("SELECT action, price, setup, reasons FROM decisions WHERE trade_date=? AND phase='DECISION'", (d,)).fetchone()
-        pos = self.j.open_position()
-        s = self.stats()
-        txt = (f"📒 <b>{esc(self.cfg.name)} EOD {d}</b>\nDecision: <b>{esc(r['action'])}</b> "
-               f"@ {r['price'] if r['price'] is not None else '-'}\n")
-        if pos:
-            txt += f"Open: LONG from {pos['entry_price']:,.2f} ({pos['entry_date']}), day {pos['days_held']}, last {pos['last_price']:,.2f}\n"
-        txt += f"Live record: {s['trades']} trades, win {s['win_pct']}%, net {s['net_pts']:+.1f} pts"
-        self.n.send(txt)
+        """Daily update for the most recent session: always sent while a trade is open or when it opened/closed."""
+        d = self._eod_day(now, _mins(now))
+        if d is None:
+            return
         self.j.set("eod_done", d)
+        with self.j.conn() as c:
+            r = c.execute("SELECT action, price FROM decisions WHERE trade_date=? AND phase='DECISION'", (d,)).fetchone()
+            closed = c.execute("SELECT * FROM positions WHERE status='CLOSED' AND exit_date=?", (d,)).fetchone()
+        pos = self.j.open_position()
+        p = self.cfg.strategy
+        late = "" if d == now.date().isoformat() else " (sent late: engine run was delayed)"
+        if pos:
+            price = r["price"] if r and r["price"] is not None else pos["last_price"]
+            ret = price / pos["entry_price"] - 1
+            next_target = None
+            try:
+                snap = self.feed.snapshot(now, self.cfg.session_open_min, None)
+                if snap.today is not None and snap.today.name.date().isoformat() == d:
+                    next_target = float(snap.today.High)
+                elif pd.Timestamp(d) in snap.daily.index:
+                    next_target = float(snap.daily.loc[pd.Timestamp(d), "High"])
+            except Exception:
+                pass
+            days = int(pos["days_held"] or 0)
+            txt = (f"📒 <b>{esc(self.cfg.name)} daily update — {d}</b>{late}\n"
+                   f"Status: <b>HOLDING</b> (no exit signal today)\n"
+                   f"Bought {pos['entry_date']} @ {pos['entry_price']:,.2f} · 15:25 price {price:,.2f}\n"
+                   f"P&L: <b>{100 * ret:+.2f}%</b> ({'₹'}{ret * self.cfg.capital_per_trade:+,.0f} on ₹1 L)\n"
+                   + (f"Next exit: 15:25 price above <b>{next_target:,.2f}</b> (today's high)\n" if next_target else "")
+                   + f"Time stop: day {days} of {p.max_hold_days}"
+                   + (f" · disaster stop {pos['disaster_stop']:,.2f}" if pos.get("disaster_stop") else ""))
+            self.n.send(txt)
+        elif closed is not None or (r and r["action"] == "EXIT"):
+            s = self.stats()
+            txt = (f"📒 <b>{esc(self.cfg.name)} daily update — {d}</b>{late}\nTrade closed today"
+                   + (f": {closed['entry_price']:,.2f} → {closed['exit_price']:,.2f}, net ₹{closed['net_inr']:+,.0f}" if closed is not None else "")
+                   + f"\nLive record: {s['trades']} trades, win {s['win_pct']}%")
+            self.n.send(txt)
 
     # ================================================================ helpers
     def _fresh(self, snap, now) -> bool:

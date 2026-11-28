@@ -312,6 +312,13 @@ class MomentumEngine:
             "holdings": hold_rows, "ranking": ranking, "warnings": warns,
             "if_rebalanced_today": {"buy": would_buy, "sell": would_sell},
             "pending": self.j.get("mom_pending") or []})
+        if hold_rows and self._session_closed(C, now) and self.j.get("mom_summary_day") != str(asof.date()):
+            self.j.set("mom_summary_day", str(asof.date()))
+            tot = sum(r["pnl"] for r in hold_rows)
+            best = max(hold_rows, key=lambda r: r["ret_pct"]); worst = min(hold_rows, key=lambda r: r["ret_pct"])
+            self.n.send(f"📊 <b>Stock Tracker daily update — {asof.date()}</b>\n{len(hold_rows)} holdings · open P&L <b>₹{tot:+,.0f}</b>\n"
+                        f"Best {best['symbol']} {best['ret_pct']:+.1f}% · worst {worst['symbol']} {worst['ret_pct']:+.1f}%\n"
+                        f"{len(warns)} watch item(s) · next rebalance {nxt.date()}")
         new_warn = sorted(set(warns) - set(self.j.get("mom_warned") or []))
         if new_warn and hold_rows:
             self.n.send("⚠️ <b>Stock Tracker watch</b> (no action until month-end):\n" + "\n".join(esc(w) for w in new_warn))
