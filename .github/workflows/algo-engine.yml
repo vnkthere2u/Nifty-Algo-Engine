@@ -7,14 +7,16 @@
 name: algo-engine
 
 on:
+  # Each run stays alive ~5.5 h (ticks every 30 s, publishes state every 15 min). Triggers every
+  # 2 h queue behind the running job, so coverage stays continuous even when GitHub drops some
+  # scheduled triggers. Missed days are still caught up by the engines themselves.
   schedule:
-    - cron: "13 9 * * 1-5"    # 14:43 IST  NIFTY session
-    - cron: "41 9 * * 1-5"    # 15:11 IST  NIFTY session (backup)
-    - cron: "17 * * * *"      # hourly     BTC + monitors + catch-up of any missed NIFTY day
+    - cron: "7 */2 * * *"
+    - cron: "41 9 * * 1-5"    # extra trigger before the 15:25 IST NIFTY decision
   workflow_dispatch:
     inputs:
       mode:
-        description: "once | session | test-telegram"
+        description: "once | loop | test-telegram"
         default: once
 
 permissions:
@@ -27,7 +29,7 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 80
+    timeout-minutes: 350
     env:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -50,10 +52,10 @@ jobs:
           SCHED="${{ github.event.schedule }}"
           if [ "$MODE" = "test-telegram" ]; then
             python -m nifty_algo.runner --test-telegram
-          elif [ "$MODE" = "session" ] || [ "$SCHED" = "13 9 * * 1-5" ] || [ "$SCHED" = "41 9 * * 1-5" ]; then
-            python -m nifty_algo.runner --until 15:40
-          else
+          elif [ "$MODE" = "once" ] && [ -n "$MODE" ] && [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             python -m nifty_algo.runner --once
+          else
+            python -m nifty_algo.runner --for 330 --sync-every 15 --sync-cmd "bash deploy/state.sh push"
           fi
       - name: Save state
         if: always()
