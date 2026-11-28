@@ -339,8 +339,12 @@ class BtcEngine:
             pend = self.j.get("btc_pending")
             self.n.send(f"📣 <b>BTC breakout signal</b> on {ds} close ₹{r.Close:,.0f}\n"
                         f"Paper BUY at next UTC open (05:30 IST). Stop distance {100 * pend['D'] / r.Close:.1f}%.")
-        elif ps is None and not self.j.get("btc_quiet_summaries"):
-            pass  # no message on no-signal days; the engine heartbeat is visible on the dashboard
+        elif ps is not None:
+            ret = r.Close / ps.entry - 1
+            self.n.send(f"₿ <b>BTC daily update — {ds}</b> (UTC close)\nStatus: <b>HOLDING</b> since {ps.entry_date} @ ₹{ps.entry:,.0f}\n"
+                        f"Close ₹{r.Close:,.0f} · P&L <b>{100 * ret:+.2f}%</b> (₹{ret * self.p.capital:+,.0f})\n"
+                        f"Target ₹{ps.tp:,.0f} · stop (close basis) ₹{ps.sl:,.0f}{' (break-even)' if ps.sl >= ps.entry else ''}"
+                        f" · hard stop ₹{ps.hard:,.0f}")
 
     def _live_counts(self):
         out = {"ALL": {"wins": 0, "losses": 0}, "BREAKOUT": {"wins": 0, "losses": 0}}

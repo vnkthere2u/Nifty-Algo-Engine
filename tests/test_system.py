@@ -350,3 +350,15 @@ def test_catchup_flags_days_without_data(tmp_path):
     with eng.j.conn() as c:
         assert c.execute("SELECT action FROM decisions WHERE trade_date=?", (d0.isoformat(),)).fetchone()[0] == "MISSED_NO_DATA"
     assert any("could not be recovered" in m for m in eng.n.sent)
+
+
+def test_daily_update_sent_next_morning_if_evening_run_missed(tmp_path):
+    daily, bars, d0, d1 = _scenario()
+    eng = _engine(tmp_path, ScriptedFeed(daily, bars))
+    eng.tick(_at(d0, 15, 25))                       # entry on d0; no run after the close on d0
+    assert eng.j.open_position() is not None
+    n_before = len(eng.n.sent)
+    assert "eod" in eng.tick(_at(d1, 9, 20))        # next morning: d0's update is sent, marked late
+    msg = eng.n.sent[n_before:]
+    assert any("daily update" in m and d0.isoformat() in m and "HOLDING" in m and "late" in m for m in msg)
+    assert "eod" not in eng.tick(_at(d1, 9, 25))    # only once
